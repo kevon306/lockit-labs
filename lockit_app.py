@@ -13,11 +13,13 @@ from zoneinfo import ZoneInfo
 import altair as alt
 import pandas as pd
 import streamlit as st
+from scipy import stats
 
 import box_scores
 import db
 import model
 import slip
+import team_model
 
 ET = ZoneInfo("America/New_York")
 MARKET_LABELS = {"player_points": "Points", "player_rebounds": "Rebounds",
@@ -464,6 +466,52 @@ def consensus_board(odds_event):
     return pd.DataFrame(rows)
 
 
+def game_market_rows(game_odds_event):
+    """One row per (market, side) for one game's spread/total/moneyline: the modal
+    line, best price across books, and the books' own no-vig probability for that
+    side - same idea as consensus_board, for team-level markets instead of player props."""
+    if game_odds_event.empty:
+        return pd.DataFrame()
+    latest = game_odds_event[game_odds_event["snapshot_time"] == game_odds_event["snapshot_time"].max()]
+    first = game_odds_event[game_odds_event["snapshot_time"] == game_odds_event["snapshot_time"].min()]
+
+    rows = []
+    probs = {}
+    for market in ["h2h", "spreads", "totals"]:
+        m = latest[latest["market"] == market]
+        if m.empty:
+            continue
+        pair_probs = {}
+        for _, b in m.groupby("bookmaker"):
+            if len(b) == 2 and b["price_american"].notna().all():
+                total_implied = sum(implied(x) for x in b["price_american"])
+                for _, row in b.iterrows():
+                    pair_probs.setdefault(row["side"], []).append(implied(row["price_american"]) / total_implied)
+        for side, vals in pair_probs.items():
+            probs[(market, side)] = round(100 * sum(vals) / len(vals), 1) if vals else None
+
+        for side, g in m.groupby("side"):
+            if market == "h2h":
+                line, at_line = None, g
+            else:
+                line = g["line"].mode().iloc[0]
+                at_line = g[g["line"] == line]
+            best = at_line.loc[at_line["price_american"].idxmax()]
+            opened = None
+            if market != "h2h":
+                o = first[(first["market"] == market) & (first["side"] == side)]["line"]
+                opened = o.mode().iloc[0] if len(o) else None
+            rows.append({
+                "market": market, "side": side, "line": line, "opened": opened,
+                "price": int(best["price_american"]), "book": book(best["bookmaker"]),
+                "books": at_line["bookmaker"].nunique(),
+            })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["no_vig_pct"] = df.apply(lambda r: probs.get((r["market"], r["side"])), axis=1)
+    return df
+
+
 def chart_style(chart):
     return (chart.configure_view(stroke=None)
             .configure_axis(labelColor=MUTED, gridColor=EDGE, domainColor=EDGE,
@@ -475,7 +523,7 @@ def topbar(odds, here="tonight"):
     fresh = f"Odds updated {ago(odds['snapshot_time'].max())}" if not odds.empty else "No odds yet"
     n = len(slip.load())
     links = [("./", "tonight", "Tonight"), ("./picks", "picks", "Top Picks"),
-             ("./trends", "trends", "Trends"),
+             ("./game-lines", "game_lines", "Game Lines"), ("./trends", "trends", "Trends"),
              ("./lines", "lines", "Lines"), ("./players", "players", "Players"),
              ("./bets", "bets", "My bets")]
     nav = "".join(
@@ -922,6 +970,105 @@ CONFIDENCE_NOTE = {
     "High": "High confidence means a long, stable track record in a stat the backtest "
             "found well-calibrated.",
 }
+
+
+def page_game_lines():
+    odds = load("odds_snapshots")
+    game_odds = load("game_odds_snapshots")
+    box = load("box_scores")
+    topbar(odds, "game_lines")
+    if game_odds.empty:
+        st.info("No spread/total/moneyline odds saved yet. In the terminal, run: "
+                "`python3 pull_props.py today --game 0 --game-markets`")
+        return
+
+    st.markdown(
+        f'<div class="hero">{COURT_SVG}<h1>Game Lines</h1>'
+        "<p>Real spread, total, and moneyline odds, next to the team model's own "
+        "projection. The model is built the same walk-forward way as the player "
+        "model and backtested for calibration (see <code>team_model.py</code>), but "
+        "like any box-score-only model it has no idea about trades, injuries, or "
+        "scheme changes a sportsbook already knows about.</p></div>",
+        unsafe_allow_html=True)
+
+    ev = events_table(game_odds)
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    day = today if (ev["date"] == today).any() else ev["date"].max()
+    slate = ev[ev["date"] == day]
+
+    if box.empty:
+        hint("No box scores saved - the model needs those to project anything. "
+             "Showing real market odds only.")
+        home_edge = sigma_margin = sigma_total = None
+    else:
+        home_edge, sigma_margin, sigma_total = team_model.fitted_params(box)
+        matchups = pd.DataFrame([
+            {"home_team": short(r.home), "away_team": short(r.away)} for r in slate.itertuples()])
+        try:
+            proj = team_model.project_tonight_teams(box, matchups, home_edge).set_index(
+                ["home_team", "away_team"])
+        except KeyError:
+            proj = pd.DataFrame()
+
+    for r in slate.itertuples():
+        rows = game_market_rows(game_odds[game_odds["event_id"] == r.event_id])
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">{escape(r.away)} at {escape(r.home)}</div>'
+            f'<span class="tipt">{r.tip:%-I:%M %p} ET</span></div>', unsafe_allow_html=True)
+
+        home_abbr, away_abbr = short(r.home), short(r.away)
+        model_row = None
+        if not box.empty and (home_abbr, away_abbr) in proj.index:
+            model_row = proj.loc[(home_abbr, away_abbr)]
+            strip([(f"{model_row.home_points:.1f}", f"{home_abbr} projected"),
+                  (f"{model_row.away_points:.1f}", f"{away_abbr} projected"),
+                  (f"{model_row.margin:+.1f}", f"projected margin ({home_abbr})"),
+                  (f"{model_row.total:.1f}", "projected total"),
+                  (int(min(model_row.home_games_before, model_row.away_games_before)), "games of history")])
+
+        c1, c2, c3 = st.columns(3)
+        for col, mkt, title in [(c1, "h2h", "Moneyline"), (c2, "spreads", "Spread"), (c3, "totals", "Total")]:
+            sub = rows[rows["market"] == mkt] if not rows.empty else rows
+            col.markdown(f'<div class="panel-title" style="font-size:1rem;">{title}</div>',
+                        unsafe_allow_html=True)
+            if sub.empty:
+                col.markdown('<p class="hint">Not posted yet.</p>', unsafe_allow_html=True)
+                continue
+            for x in sub.itertuples():
+                label = short(x.side) if mkt in ("h2h", "spreads") else x.side
+                line_txt = f" {x.line:+.1f}" if mkt == "spreads" else (f" {x.line:.1f}" if mkt == "totals" else "")
+                model_pct = None
+                if model_row is not None and mkt == "spreads":
+                    # A side with posted line L covers iff its own signed margin beats
+                    # -L (e.g. a -3.5 favorite covers by winning by more than 3.5; a
+                    # +3.5 underdog covers by losing by less than 3.5, or winning).
+                    is_home_side = (x.side == r.home)
+                    side_margin = model_row.margin if is_home_side else -model_row.margin
+                    model_pct = round(100 * stats.norm.sf(-x.line, side_margin, sigma_margin), 1)
+                elif model_row is not None and mkt == "totals":
+                    if x.side == "Over":
+                        model_pct = round(100 * stats.norm.sf(x.line, model_row.total, sigma_total), 1)
+                    else:
+                        model_pct = round(100 * stats.norm.cdf(x.line, model_row.total, sigma_total), 1)
+                edge_txt = ""
+                if model_pct is not None and x.no_vig_pct is not None:
+                    edge = model_pct - x.no_vig_pct
+                    flagged = abs(edge) > MAX_PLAUSIBLE_EDGE
+                    edge_txt = (f'<span class="hint">model {model_pct:.0f}%'
+                               f'{" (flagged, edge too large to be plausible)" if flagged else f", edge {edge:+.0f} pts"}'
+                               f'</span><br>')
+                col.markdown(
+                    f'<div class="row"><div><div class="who">{escape(str(label))}{line_txt}</div>'
+                    f'<div class="what">no-vig {x.no_vig_pct if x.no_vig_pct is not None else "–"}%</div>'
+                    f'{edge_txt}</div>'
+                    f'<div class="val">{fmt_price(x.price)}<small>{escape(x.book)}</small></div></div>',
+                    unsafe_allow_html=True)
+
+    hint("No-vig % is the books' own implied probability with their cut removed, not a LOCK IT "
+         "prediction. Model % is this app's own projection. Edges over "
+         f"{MAX_PLAUSIBLE_EDGE} points are flagged rather than shown as real value, same rule as "
+         "Top Picks: a model with no access to real-world news that disagrees with a sharp market "
+         "by a lot is more likely missing something than finding something.")
 
 
 def page_lines():
@@ -1501,6 +1648,7 @@ nav = st.navigation({
         st.Page(page_tonight, title="Tonight", icon=":material/sports_basketball:",
                 url_path="tonight", default=True),
         st.Page(page_top_picks, title="Top Picks", icon=":material/stars:", url_path="picks"),
+        st.Page(page_game_lines, title="Game Lines", icon=":material/scoreboard:", url_path="game-lines"),
         st.Page(page_trends, title="Trends", icon=":material/trending_up:", url_path="trends"),
         st.Page(page_lines, title="Lines", icon=":material/table_rows:", url_path="lines"),
         st.Page(page_players, title="Players", icon=":material/person:", url_path="players"),

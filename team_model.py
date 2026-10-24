@@ -101,6 +101,37 @@ def measure_home_edge(tg):
     return (home_resid.mean() - away_resid.mean()) / 2, g
 
 
+def fit_pairs(box):
+    """One row per historical game (not per team-game) with the model's projected
+    margin/total and what actually happened. Shared by the backtest and by
+    fitted_params(), so both use the exact same fit."""
+    tg = team_games(box)
+    home_edge, g = measure_home_edge(tg)
+    home_rows = g[g["is_home"] == 1].copy()
+    away_hats = g[g["is_home"] == 0][
+        ["game_id", "off_rtg_hat", "def_rtg_hat", "pace_hat", "points"]].rename(
+        columns={"off_rtg_hat": "away_off_hat", "def_rtg_hat": "away_def_hat",
+                "pace_hat": "away_pace_hat", "points": "away_points"})
+    pairs = home_rows.merge(away_hats, on="game_id", how="inner")
+    pace = (pairs["pace_hat"] + pairs["away_pace_hat"]) / 2
+    pairs["proj_home"] = (pairs["off_rtg_hat"] + pairs["away_def_hat"]) / 2 * (pace / 100) + home_edge
+    pairs["proj_away"] = (pairs["away_off_hat"] + pairs["def_rtg_hat"]) / 2 * (pace / 100) - home_edge
+    pairs["proj_margin"] = pairs["proj_home"] - pairs["proj_away"]
+    pairs["proj_total"] = pairs["proj_home"] + pairs["proj_away"]
+    pairs["actual_margin"] = pairs["points"] - pairs["away_points"]
+    pairs["actual_total"] = pairs["points"] + pairs["away_points"]
+    return pairs.dropna(subset=["proj_margin", "actual_margin"]), home_edge
+
+
+def fitted_params(box):
+    """(home_edge, sigma_margin, sigma_total) - the three numbers a live projection
+    needs, fit from history. Cheap (no calibration loop), safe to call per page load."""
+    pairs, home_edge = fit_pairs(box)
+    sigma_margin = (pairs["actual_margin"] - pairs["proj_margin"]).std()
+    sigma_total = (pairs["actual_total"] - pairs["proj_total"]).std()
+    return home_edge, sigma_margin, sigma_total
+
+
 def project_tonight_teams(box, matchups, home_edge):
     """matchups: DataFrame with home_team, away_team (abbreviations matching box_scores'
     team/opponent columns). Returns projected points for each side, margin, and total."""
@@ -147,28 +178,9 @@ def cmd_backtest():
         box = pd.read_sql(
             "SELECT game_id, game_date, team, opponent, points, fga, fta, oreb, "
             "turnovers, is_home FROM box_scores", conn)
-    tg = team_games(box)
-    home_edge, g = measure_home_edge(tg)
+    pairs, home_edge = fit_pairs(box)
     print(f"Measured home-court edge: {home_edge:+.2f} points per team "
           f"({2 * home_edge:.2f} point swing in the margin)\n")
-
-    # Pair each home team-game row with its away opponent's SAME-GAME row to get a
-    # true margin/total per game (not per team-game, so each real game counts once).
-    home_rows = g[g["is_home"] == 1].copy()
-    away_hats = g[g["is_home"] == 0][
-        ["game_id", "off_rtg_hat", "def_rtg_hat", "pace_hat", "points"]].rename(
-        columns={"off_rtg_hat": "away_off_hat", "def_rtg_hat": "away_def_hat",
-                "pace_hat": "away_pace_hat", "points": "away_points"})
-    pairs = home_rows.merge(away_hats, on="game_id", how="inner")
-    pace = (pairs["pace_hat"] + pairs["away_pace_hat"]) / 2
-    pairs["proj_home"] = (pairs["off_rtg_hat"] + pairs["away_def_hat"]) / 2 * (pace / 100) + home_edge
-    pairs["proj_away"] = (pairs["away_off_hat"] + pairs["def_rtg_hat"]) / 2 * (pace / 100) - home_edge
-    pairs["proj_margin"] = pairs["proj_home"] - pairs["proj_away"]
-    pairs["proj_total"] = pairs["proj_home"] + pairs["proj_away"]
-    pairs["actual_margin"] = pairs["points"] - pairs["away_points"]
-    pairs["actual_total"] = pairs["points"] + pairs["away_points"]
-    pairs = pairs.dropna(subset=["proj_margin", "actual_margin"])
-
     print(f"Games: {len(pairs):,} ({pairs['game_date'].min()} to {pairs['game_date'].max()})\n")
 
     for label, proj_col, actual_col in [("Margin", "proj_margin", "actual_margin"),
