@@ -183,6 +183,7 @@ div[data-baseweb="input"], div[data-baseweb="select"] > div {{ border-radius: 10
 .logo {{ font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800; font-size: 1.7rem;
   color: {TEXT}; letter-spacing: -0.03em; }}
 .logo b {{ color: {BLUE}; }}
+.top-right {{ display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }}
 .fresh {{ background: {PANEL}; border: 1px solid {EDGE}; color: {MUTED};
   border-radius: 999px; padding: .35rem .85rem; font-size: .85rem;
   box-shadow: 0 6px 18px -10px rgba(0,0,0,.5); }}
@@ -191,6 +192,12 @@ div[data-baseweb="input"], div[data-baseweb="select"] > div {{ border-radius: 10
   animation: pulse-dot 2.2s ease-out infinite; }}
 @keyframes pulse-dot {{ 0% {{ box-shadow: 0 0 0 0 rgba(25,195,125,.55); }}
   70% {{ box-shadow: 0 0 0 7px rgba(25,195,125,0); }} 100% {{ box-shadow: 0 0 0 0 rgba(25,195,125,0); }} }}
+.slip-pill {{ background: rgba(30,144,255,.14); border: 1px solid {BLUE}; color: #BFE0FF;
+  border-radius: 999px; padding: .35rem .85rem; font-size: .85rem; font-weight: 600;
+  text-decoration: none; display: inline-flex; align-items: center; }}
+.slip-pill i {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: {BLUE}; margin-right: .5rem; }}
+@media (hover: hover) {{ .slip-pill:hover {{ background: rgba(30,144,255,.24); }} }}
 
 .hero {{ position: relative; overflow: hidden; border-radius: 18px; padding: 1.6rem 1.8rem; margin-bottom: 1.2rem;
   background: radial-gradient(120% 140% at 85% 20%, #3FA9FF 0%, #1E6FE0 38%, #1240A8 100%);
@@ -471,8 +478,13 @@ def topbar(odds, here="tonight"):
     nav = "".join(
         f'<a href="{href}" target="_self" class="{"on" if key == here else ""}">{label}'
         f'{f"<i>{n}</i>" if key == "bets" and n else ""}</a>' for href, key, label in links)
+    # The draft slip only lives in the sidebar, which is collapsed by default on phones,
+    # so without this a mobile user has no way to tell they have picks queued up.
+    slip_pill = (f'<a href="./bets" target="_self" class="slip-pill">'
+                f'<i></i>{n} pick{"s" if n != 1 else ""} in your slip</a>') if n else ""
     st.markdown(f'<div class="topbar"><div class="logo">LOCK IT <b>Labs</b></div>'
-                f'<div class="fresh"><i></i>{escape(fresh)}</div></div>'
+                f'<div class="top-right">{slip_pill}'
+                f'<div class="fresh"><i></i>{escape(fresh)}</div></div></div>'
                 f'<nav class="botnav">{nav}</nav>', unsafe_allow_html=True)
 
 
@@ -1143,9 +1155,15 @@ def page_bets():
     sm = slip.summary(view)
     picks = int(legs["entry_id"].isin(view["id"]).sum()) if not legs.empty else 0
     strip([(sm["entries"], "entries"), (picks, "individual picks"), (sm["pending"], "pending"),
-           (f'{sm["won"]}-{sm["lost"]}', "won-lost"), (money(sm["staked"]), "cash staked, settled"),
+           (f'{sm["won"]}-{sm["lost"]}', "won-lost"),
+           (f'{sm["win_rate"]:.0f}%' if sm["win_rate"] is not None else "–", "win rate"),
+           (f"{sm['push']}/{sm['void']}", "push/void")])
+    strip([(money(sm["staked"]), "cash staked, settled"),
            (money(sm["net"], signed=True), "net profit"),
            (f'{sm["roi"]:+.1f}%' if sm["roi"] is not None else "–", "ROI")])
+    hint("Win rate and ROI are shown separately on purpose: a high win rate at bad odds can "
+         "still lose money, and the reverse can still profit. Push and void don't count as a "
+         "win or a loss.")
 
     settled = view[view["status"] != "pending"].copy()
     if not settled.empty:
@@ -1169,6 +1187,18 @@ def page_bets():
             x=alt.X("label:O", sort=order), y="running:Q")
         area = bars + run
         st.altair_chart(chart_style(area.properties(height=220)), use_container_width=True)
+
+    by_mkt = slip.by_market(legs, set(view["id"])) if not legs.empty else pd.DataFrame()
+    if not by_mkt.empty:
+        section("Results by market")
+        show_mkt = by_mkt.assign(Stat=by_mkt["market"].map(MARKET_LABELS)).rename(
+            columns={"n": "Picks", "win_rate": "Win rate", "avg_odds": "Avg odds"})
+        st.dataframe(show_mkt[["Stat", "Picks", "Win rate", "Avg odds"]],
+                     hide_index=True, width="stretch",
+                     column_config={
+                         "Win rate": st.column_config.ProgressColumn(
+                             min_value=0, max_value=100, format="%.0f%%"),
+                         "Avg odds": st.column_config.NumberColumn(format="%+d")})
 
     section("Entries")
     colors = {"pending": "b-wait", "won": "b-done", "lost": "b-miss"}

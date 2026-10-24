@@ -131,19 +131,42 @@ def entries_with_legs():
 
 
 def summary(entries):
-    """Money math. Net = amount returned minus stake. Free-bet stakes aren't counted as cash risked."""
+    """Money math. Net = amount returned minus stake. Free-bet stakes aren't counted as cash risked.
+
+    Win rate and ROI are kept separate on purpose: win rate is "how often did I win",
+    ROI is "how much money did that make relative to what I risked". A high win rate at
+    bad odds can still lose money, and a low win rate at good odds can still profit.
+    """
     settled = entries[entries["status"] != "pending"].copy()
     cash = settled[settled["is_free_bet"] == 0]
     staked = cash["stake"].sum()
     returned = settled["amount_returned"].fillna(0).sum()
     net = returned - staked
+    decided = settled[settled["status"].isin(["won", "lost"])]  # push/void aren't a win or a loss
+    won, lost = int((entries["status"] == "won").sum()), int((entries["status"] == "lost").sum())
     return {
         "entries": len(entries),
         "pending": int((entries["status"] == "pending").sum()),
-        "won": int((entries["status"] == "won").sum()),
-        "lost": int((entries["status"] == "lost").sum()),
+        "won": won,
+        "lost": lost,
+        "push": int((entries["status"] == "push").sum()),
+        "void": int((entries["status"] == "void").sum()),
+        "win_rate": (won / len(decided) * 100) if len(decided) else None,
         "staked": staked,
         "returned": returned,
         "net": net,
         "roi": (net / staked * 100) if staked else None,
     }
+
+
+def by_market(legs, entry_ids):
+    """Win rate per prop market (points/rebounds/assists), for legs whose entry has settled."""
+    scoped = legs[legs["entry_id"].isin(entry_ids) & legs["leg_result"].isin(["win", "loss"])]
+    if scoped.empty:
+        return pd.DataFrame(columns=["market", "n", "win_rate", "avg_odds"])
+    out = (scoped.groupby("market")
+           .agg(n=("leg_result", "size"),
+                win_rate=("leg_result", lambda s: (s == "win").mean() * 100),
+                avg_odds=("price_american", "mean"))
+           .reset_index())
+    return out
