@@ -8,10 +8,17 @@ Snapshot timing (change in your .env file if you want):
   CLOSE_SNAPSHOT=on      odds ~10-20 min before each tip      (3 credits per game)
   EARLY_SNAPSHOT_HOURS=0 set to 3 to also grab odds 3 hrs out (3 more per game)
   MIN_CREDITS=15         stop pulling when credits drop this low
+
+At the end of every snapshots run, if the database changed, it's committed and pushed
+to GitHub so the deployed Streamlit Cloud site reflects it (the site itself can't
+refresh data: it only reads what's in the repo). Each sync is a normal commit, so the
+repo grows over time - check in on its size occasionally (`du -sh .git`) and consider
+squashing old sync commits if it gets too big.
 """
 
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 
@@ -93,6 +100,29 @@ def snapshots():
             if rows:  # if books hadn't posted props yet, try again next run
                 state[key] = pp.iso(now)
                 save_state(state)
+
+    git_sync()
+
+
+def git_sync():
+    repo_dir = pp.DATA_DIR.parent
+
+    def run(*args):
+        return subprocess.run(["git", *args], cwd=repo_dir, capture_output=True, text=True)
+
+    run("add", "-f", "data/lockit.db")
+    if run("diff", "--cached", "--quiet", "data/lockit.db").returncode == 0:
+        return  # nothing changed since the last sync
+
+    committed = run("commit", "-m", f"Data sync {datetime.now():%Y-%m-%d %H:%M}")
+    if committed.returncode != 0:
+        log(f"git commit failed: {committed.stderr.strip()}")
+        return
+    pushed = run("push", "origin", "main")
+    if pushed.returncode != 0:
+        log(f"git push failed: {pushed.stderr.strip()}")
+    else:
+        log("Synced database to GitHub for the live site")
 
 
 if __name__ == "__main__":
