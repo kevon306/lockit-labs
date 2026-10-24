@@ -167,6 +167,45 @@ def quantile(q, mean, r, p, is_nb):
     return out
 
 
+# ---------- tonight's projections ----------
+
+def project_tonight(box, roster):
+    """Projected mean/variance for every player in `roster` (player_id, player_name,
+    team, opponent), using the exact same walk-forward model validated in `backtest`.
+
+    This works by appending one placeholder row per player for "tonight's game" with
+    every stat blank, then running add_projections on the combined frame. Each
+    player's placeholder row sorts after all his real games, so its rolling/shift
+    columns are computed from exactly his actual history, with no code duplicated
+    from add_projections and no special-casing for "a game that hasn't happened yet".
+    """
+    today = pd.Timestamp.now().strftime("%Y-%m-%d")
+    blank = {c: np.nan for c in box.columns if c not in
+             ("player_id", "player_name", "team", "opponent", "game_id", "game_date")}
+    placeholders = roster.assign(game_id="PROJECTION", game_date=today, **blank)
+    placeholders = placeholders[box.columns].astype(box.dtypes.to_dict(), errors="ignore")
+    combined = pd.concat([box, placeholders], ignore_index=True)
+    projected = add_projections(combined)
+    projected = projected[projected["game_id"] == "PROJECTION"]
+    cols = (["player_id", "player_name", "team", "opponent", "games_before"]
+            + [f"{s}_mean_hat" for s in STATS] + [f"{s}_var_hat" for s in STATS])
+    return projected[cols].reset_index(drop=True)
+
+
+def confidence_label(games_before, stat):
+    """How much to trust a projection, separate from the probability itself. Based on
+    what the backtest actually found: rebounds and assists calibrate well once there's
+    a real track record; points runs overconfident in its tails even with plenty of
+    history (see the module docstring), so it's capped at Medium regardless of sample
+    size until that's fixed with a better model, not just more data.
+    """
+    if games_before < 15:
+        return "Low"
+    if stat == "points":
+        return "Medium"
+    return "High" if games_before >= 30 else "Medium"
+
+
 # ---------- backtest ----------
 
 def cmd_backtest():

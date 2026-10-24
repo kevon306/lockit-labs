@@ -5,6 +5,7 @@ Run it with:   streamlit run lockit_app.py
 Press Control+C in the terminal to stop it.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ import streamlit as st
 
 import box_scores
 import db
+import model
 import slip
 
 ET = ZoneInfo("America/New_York")
@@ -472,7 +474,8 @@ def chart_style(chart):
 def topbar(odds, here="tonight"):
     fresh = f"Odds updated {ago(odds['snapshot_time'].max())}" if not odds.empty else "No odds yet"
     n = len(slip.load())
-    links = [("./", "tonight", "Tonight"), ("./trends", "trends", "Trends"),
+    links = [("./", "tonight", "Tonight"), ("./picks", "picks", "Top Picks"),
+             ("./trends", "trends", "Trends"),
              ("./lines", "lines", "Lines"), ("./players", "players", "Players"),
              ("./bets", "bets", "My bets")]
     nav = "".join(
@@ -682,6 +685,243 @@ def page_tonight():
             for x in moved.itertuples()) or '<p class="hint">No moves yet. They appear once a game is captured more than once.</p>'
         st.markdown(f'<div class="panel"><div class="panel-title">Line moves</div>{rows}</div>',
                     unsafe_allow_html=True)
+
+
+# ---------- Top Picks ----------
+
+EDGE_THRESHOLD = 8    # minimum gap, in percentage points, between the model's probability
+                      # and the market's, before a prop is even considered a "pick". Made a
+                      # named constant on purpose, not hardcoded inline, since it's a real
+                      # judgment call that should be easy to find and reconsider later.
+# The model only knows box-score history - it has never seen an injury report, a
+# minutes-restriction note, or a beat-writer tweet. A real sportsbook has. So when the
+# gap between the model and a sharp, liquid market gets implausibly large, the far more
+# likely explanation is "the model is missing real-world context" than "the model found
+# an edge no book noticed". Confirmed on real data: a 47-point "edge" on a low-minutes
+# rookie, and a 27-point one on a star whose market line was well below his box-score
+# average (almost certainly a role/health signal the model can't see). Treating a huge
+# gap as the best pick would reward exactly that blind spot. Flagged, not shown as picks.
+MAX_PLAUSIBLE_EDGE = 20
+TOP_PICKS_MAX = 5
+
+
+def build_roster(box, odds):
+    """player_id/team/opponent for everyone with an active line on tonight's board, built
+    the same way the H2H opponent default is on the Players page."""
+    ev = events_table(odds)
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    day = today if (ev["date"] == today).any() else ev["date"].max()
+    slate = ev[ev["date"] == day]
+    slate_odds = odds[odds["event_id"].isin(slate["event_id"])]
+
+    latest = slate_odds[slate_odds["snapshot_time"]
+                        == slate_odds.groupby("event_id")["snapshot_time"].transform("max")]
+    names = latest[["player", "home_team", "away_team"]].drop_duplicates(subset="player").copy()
+    names["key"] = names["player"].map(box_scores.normalize_name)
+    box_keyed = box.assign(key=box["player_name"].map(box_scores.normalize_name)).sort_values("game_date")
+    last_team = box_keyed.groupby("key")["team"].last()
+    last_id = box_keyed.groupby("key")["player_id"].last()
+    names["team"] = names["key"].map(last_team)
+    names["home_abbr"] = names["home_team"].map(TEAM_SHORT)
+    names["away_abbr"] = names["away_team"].map(TEAM_SHORT)
+    names["opponent"] = names.apply(
+        lambda r: r.away_abbr if r.team == r.home_abbr else r.home_abbr, axis=1)
+    names["player_id"] = names["key"].map(last_id)
+    names["player_name"] = names["player"]
+    roster = names.dropna(subset=["player_id", "team", "opponent"])
+    return roster[["key", "player_id", "player_name", "team", "opponent"]], slate, slate_odds
+
+
+def compute_picks(box, odds):
+    """Every active prop line with a model projection, with the model's probability,
+    the market's, and the gap between them. Not yet filtered to "qualifying" picks."""
+    roster, slate, slate_odds = build_roster(box, odds)
+    if roster.empty or slate.empty:
+        return pd.DataFrame(), None
+
+    proj = model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent"]])
+
+    boards = []
+    for r in slate.itertuples():
+        b = consensus_board(slate_odds[slate_odds["event_id"] == r.event_id])
+        b["Game"] = f"{short(r.away)} at {short(r.home)}"
+        boards.append(b)
+    allb = pd.concat(boards, ignore_index=True) if boards else pd.DataFrame()
+    allb = allb[allb["market"].isin(box_scores.MARKET_TO_STAT)].copy()
+    if allb.empty:
+        return pd.DataFrame(), slate_odds["snapshot_time"].max()
+
+    allb["key"] = allb["Player"].map(box_scores.normalize_name)
+    allb = allb.merge(roster[["key", "player_id"]], on="key", how="left")
+    allb = allb.merge(proj, on="player_id", how="left", suffixes=("", "_proj"))
+
+    rows = []
+    for market, stat in box_scores.MARKET_TO_STAT.items():
+        sub = allb[allb["market"] == market].copy()
+        if sub.empty:
+            continue
+        mean, var = sub[f"{stat}_mean_hat"], sub[f"{stat}_var_hat"]
+        is_nb, r, p = model.fit_dist(mean, var)
+        model_p_over = model.p_over(sub["Line"].to_numpy(), mean, r, p, is_nb)
+        sub["model_p_over"] = model_p_over * 100
+        sub["stat"] = stat
+        rows.append(sub)
+    picks = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    picks = picks.dropna(subset=["model_p_over", "Market Over %"])
+    if picks.empty:
+        return picks, slate_odds["snapshot_time"].max()
+
+    picks["edge_over"] = picks["model_p_over"] - picks["Market Over %"]
+    picks["side"] = picks["edge_over"].map(lambda e: "Over" if e > 0 else "Under")
+    picks["model_p"] = picks.apply(
+        lambda r: r["model_p_over"] if r["side"] == "Over" else 100 - r["model_p_over"], axis=1)
+    picks["market_p"] = picks.apply(
+        lambda r: r["Market Over %"] if r["side"] == "Over" else 100 - r["Market Over %"], axis=1)
+    picks["edge"] = picks["model_p"] - picks["market_p"]
+    picks["confidence"] = picks.apply(
+        lambda r: model.confidence_label(r["games_before"], r["stat"]), axis=1)
+    picks["price"] = picks.apply(
+        lambda r: r["over_price"] if r["side"] == "Over" else r["under_price"], axis=1)
+    picks["book"] = picks.apply(
+        lambda r: r["over_book"] if r["side"] == "Over" else r["under_book"], axis=1)
+    return picks, slate_odds["snapshot_time"].max()
+
+
+def page_top_picks():
+    box, odds = load("box_scores"), load("odds_snapshots")
+    topbar(odds, "picks")
+    if box.empty or odds.empty:
+        st.info("Need box scores and odds saved before picks can be computed. In the "
+                "terminal, run `python3 box_scores.py pull` and `python3 pull_props.py today`.")
+        return
+
+    st.markdown(
+        f'<div class="hero">{COURT_SVG}<h1>Top Picks</h1>'
+        "<p>Where the model's own probability and the market's disagree by the most, "
+        "using the walk-forward model validated in <code>model.py</code>. Never forces "
+        "a fixed number of picks - some nights there may be none.</p></div>",
+        unsafe_allow_html=True)
+
+    picks, last_snap = compute_picks(box, odds)
+    if picks.empty:
+        hint("No active lines could be projected yet, probably because tonight's players "
+             "don't have enough box-score history saved. This isn't the same as "
+             "'no picks qualify' below.")
+        return
+
+    flagged = picks[picks["edge"].abs() > MAX_PLAUSIBLE_EDGE]
+    in_range = picks[picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
+    qualified = in_range[(in_range["edge"].abs() >= EDGE_THRESHOLD) & (in_range["confidence"] != "Low")]
+    qualifying = qualified.reindex(
+        qualified["edge"].abs().sort_values(ascending=False).index).head(TOP_PICKS_MAX)
+
+    strip([(len(picks), "lines projected"), (len(qualifying), "qualify as picks"),
+          (f"{EDGE_THRESHOLD}-{MAX_PLAUSIBLE_EDGE} pts", "edge range to qualify"),
+          (len(flagged), "flagged, not shown"),
+          (ago(last_snap) if last_snap is not None else "–", "odds last captured")])
+
+    if not flagged.empty:
+        with st.expander(f"{len(flagged)} line(s) flagged and excluded - edge too large to be plausible"):
+            st.dataframe(
+                flagged.assign(Edge=flagged["edge"].round(0))[
+                    ["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "Edge"]]
+                .rename(columns={"side": "Side", "model_p": "Model %", "market_p": "Market %"}),
+                hide_index=True, width="stretch")
+            hint(f"An edge over {MAX_PLAUSIBLE_EDGE} points against a real, liquid market almost "
+                 "always means the model is missing something real-world (an injury, a minutes "
+                 "restriction, a role change) rather than finding value no book noticed. Shown "
+                 "for transparency, not ranked as picks.")
+
+    if qualifying.empty:
+        st.markdown(
+            '<div class="panel"><div class="panel-title">No picks qualify tonight</div>'
+            '<p class="hint">Nothing cleared an edge of {:.0f} points (and under the {:.0f}-point '
+            "plausibility cap) with at least Medium confidence. That's a real result, not an "
+            "error - the model and the market mostly agreeing is normal, and forcing picks when "
+            "they don't disagree would defeat the point of this page.</p></div>"
+            .format(EDGE_THRESHOLD, MAX_PLAUSIBLE_EDGE),
+            unsafe_allow_html=True)
+        return
+
+    conf_class = {"High": "b-done", "Medium": "b-wait", "Low": "b-miss"}
+    for rank, r in enumerate(qualifying.itertuples(), 1):
+        st.markdown(
+            f'<div class="panel">'
+            f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.8rem;flex-wrap:wrap;">'
+            f'<div><div class="panel-title">#{rank} {escape(r.Player)}'
+            f'<span class="badge {conf_class[r.confidence]}" style="margin-left:.5rem;">{r.confidence} confidence</span></div>'
+            f'<div class="hint" style="margin:0;">{escape(r.Game)} &middot; {escape(r.Stat)} '
+            f'{escape(r.side)} {r.Line:.1f}</div></div>'
+            f'<div style="text-align:right;">'
+            f'<div style="font-family:\'Bricolage Grotesque\',sans-serif;font-size:1.8rem;'
+            f'font-weight:700;color:{GREEN if r.side=="Over" else RED};">{r.model_p:.0f}%</div>'
+            f'<div class="hint" style="margin:0;">model estimate</div></div></div>'
+            f'<div class="strip" style="margin-top:.8rem;">'
+            f'<div><b>{r.market_p:.0f}%</b><span>market-implied</span></div>'
+            f'<div><b>{r.edge:+.0f} pts</b><span>edge</span></div>'
+            f'<div><b>{fmt_price(r.price)}</b><span>{escape(book(r.book) if pd.notna(r.book) else "-")}</span></div>'
+            f'<div><b>{int(r.games_before)}</b><span>games of history</span></div></div>'
+            f'<p class="hint" style="margin-top:.6rem;">Projected at {getattr(r, f"{r.stat}_mean_hat"):.1f} '
+            f'{r.Stat.lower()} per game by the model. The market\'s no-vig price implies '
+            f'{r.market_p:.0f}% on {escape(r.side)}; the model estimates {r.model_p:.0f}%, a gap of '
+            f'{r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
+            f'</div>', unsafe_allow_html=True)
+
+    hint("Estimated probability is not the same as betting value, and value isn't the same "
+         "as a guaranteed outcome. A likely result at bad odds can still be a poor bet. "
+         "Confidence reflects how much track record and calibration back the estimate, not "
+         "how big the edge looks. Points-based picks are capped at Medium confidence: the "
+         "backtest in model.py found the model runs overconfident in points' extreme tails "
+         "even with a long track record, a known, documented limitation, not an oversight.")
+
+    with st.expander(f"All {len(picks)} projected lines, qualifying or not"):
+        show = picks.assign(Edge=picks["edge"].round(0)).sort_values("edge", key=abs, ascending=False)
+        st.dataframe(
+            show[["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "Edge", "confidence"]]
+            .rename(columns={"side": "Side", "model_p": "Model %", "market_p": "Market %",
+                             "confidence": "Confidence"}),
+            hide_index=True, width="stretch")
+
+    if st.button("Save these picks to the prediction ledger", type="primary"):
+        with db.connect() as conn:
+            existing = pd.read_sql(
+                "SELECT event_id, player, market FROM predictions", conn)
+        have = set(zip(existing["event_id"], existing["player"], existing["market"]))
+        new_rows = [r for r in qualifying.itertuples()
+                   if (r.event_id, r.Player, r.market) not in have]
+        if not new_rows:
+            st.toast("Every current pick is already in the ledger.")
+        else:
+            with db.connect() as conn:
+                for r in new_rows:
+                    snap_id = conn.execute(
+                        "SELECT id FROM odds_snapshots WHERE event_id=? AND player=? AND "
+                        "market=? AND line=? ORDER BY snapshot_time DESC LIMIT 1",
+                        (r.event_id, r.Player, r.market, r.Line)).fetchone()
+                    p_over_val = r.model_p_over / 100
+                    inputs = json.dumps({
+                        "mean": round(getattr(r, f"{r.stat}_mean_hat"), 2),
+                        "games_before": int(r.games_before), "confidence": r.confidence,
+                        "market_p_over": round(r.model_p_over - r.edge_over, 2),
+                        "edge_threshold": EDGE_THRESHOLD})
+                    conn.execute(
+                        "INSERT INTO predictions (created_at, model_version, event_id, player, "
+                        "market, line, p_over, p_under, p_push, odds_snapshot_id, inputs_json) "
+                        "VALUES (?, 'walk-forward-v1', ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                        (db.now_utc(), r.event_id, r.Player, r.market, r.Line, p_over_val,
+                         1 - p_over_val, snap_id[0] if snap_id else None, inputs))
+            st.cache_data.clear()
+            st.toast(f"Saved {len(new_rows)} prediction{'s' if len(new_rows) != 1 else ''} "
+                     "to the locked ledger.")
+            st.rerun()
+
+
+CONFIDENCE_NOTE = {
+    "Medium": "Medium confidence means a real but moderate track record, or (for points) "
+              "the model's known tail-overconfidence cap.",
+    "High": "High confidence means a long, stable track record in a stat the backtest "
+            "found well-calibrated.",
+}
 
 
 def page_lines():
@@ -1260,6 +1500,7 @@ nav = st.navigation({
     "Research": [
         st.Page(page_tonight, title="Tonight", icon=":material/sports_basketball:",
                 url_path="tonight", default=True),
+        st.Page(page_top_picks, title="Top Picks", icon=":material/stars:", url_path="picks"),
         st.Page(page_trends, title="Trends", icon=":material/trending_up:", url_path="trends"),
         st.Page(page_lines, title="Lines", icon=":material/table_rows:", url_path="lines"),
         st.Page(page_players, title="Players", icon=":material/person:", url_path="players"),
