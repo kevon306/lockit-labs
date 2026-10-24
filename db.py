@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS box_scores (
     fouls        INTEGER,
     oreb         INTEGER,
     dreb         INTEGER,
+    is_home      INTEGER,          -- 1 if this team hosted the game, 0 if away
     PRIMARY KEY (game_id, player_id)
 );
 
@@ -225,7 +226,7 @@ def now_utc():
 NEW_BOX_SCORE_COLUMNS = {"fgm": "INTEGER", "fga": "INTEGER", "fg3a": "INTEGER",
                          "ftm": "INTEGER", "fta": "INTEGER", "steals": "INTEGER",
                          "blocks": "INTEGER", "turnovers": "INTEGER", "fouls": "INTEGER",
-                         "oreb": "INTEGER", "dreb": "INTEGER"}
+                         "oreb": "INTEGER", "dreb": "INTEGER", "is_home": "INTEGER"}
 NEW_PERIOD_BOX_SCORE_COLUMNS = {"q1_steals": "INTEGER", "q1_blocks": "INTEGER",
                                 "q1_turnovers": "INTEGER", "h1_steals": "INTEGER",
                                 "h1_blocks": "INTEGER", "h1_turnovers": "INTEGER"}

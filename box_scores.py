@@ -108,8 +108,9 @@ def clean_game_log(raw):
         "player_id": raw["PLAYER_ID"].astype(str),
         "player_name": raw["PLAYER_NAME"],
         "team": raw["TEAM_ABBREVIATION"],
-        # MATCHUP looks like 'BOS vs. NYK' or 'BOS @ NYK'; opponent is the last word
+        # MATCHUP looks like 'BOS vs. NYK' (home) or 'BOS @ NYK' (away)
         "opponent": raw["MATCHUP"].str.split().str[-1],
+        "is_home": raw["MATCHUP"].str.contains("vs.", regex=False).astype(int),
         "minutes": raw["MIN"].map(to_minutes),
         "points": raw["PTS"],
         "rebounds": raw["REB"],
