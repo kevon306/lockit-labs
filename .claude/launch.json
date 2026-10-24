@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "lockit-dashboard",
+      "runtimeExecutable": ".venv/bin/streamlit",
+      "runtimeArgs": ["run", "lockit_app.py"],
+      "port": 8501
+    }
+  ]
+}
