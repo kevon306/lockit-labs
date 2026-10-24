@@ -167,7 +167,11 @@ def project_tonight_teams(box, matchups, home_edge):
             "home_points": home_pts, "away_points": away_pts,
             "margin": home_pts - away_pts, "total": home_pts + away_pts,
             "home_games_before": int(home["games_before"]), "away_games_before": int(away["games_before"]),
-            "pace": pace})
+            "pace": pace,
+            "home_off_hat": home["off_rtg_hat"], "home_def_hat": home["def_rtg_hat"],
+            "home_pace_hat": home["pace_hat"],
+            "away_off_hat": away["off_rtg_hat"], "away_def_hat": away["def_rtg_hat"],
+            "away_pace_hat": away["pace_hat"]})
     return pd.DataFrame(out)
 
 

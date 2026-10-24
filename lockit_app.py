@@ -907,8 +907,93 @@ def compute_game_picks(box, game_odds):
                 "confidence": confidence, "price": x.price, "book": x.book,
                 "event_id": r.event_id, "market": x.market, "games_before": games_before,
                 "kind": "game", "note": score_note,
+                "home_abbr": home_abbr, "away_abbr": away_abbr,
+                "home_pts": model_row.home_points, "away_pts": model_row.away_points,
+                "margin": model_row.margin, "total": model_row.total, "pace": model_row.pace,
+                "home_off_hat": model_row.home_off_hat, "home_def_hat": model_row.home_def_hat,
+                "away_off_hat": model_row.away_off_hat, "away_def_hat": model_row.away_def_hat,
+                "home_edge": home_edge,
+                "sigma": sigma_total if x.market == "totals" else sigma_margin,
             })
     return pd.DataFrame(rows), game_odds["snapshot_time"].max()
+
+
+def player_why_html(r, box_keyed):
+    """The 'Why we like it' panel for a player-prop pick, built entirely from numbers
+    already computed for this row plus this player's own saved game log - no new
+    narrative content, just the model's real inputs laid out."""
+    mean = getattr(r, f"{r.stat}_mean_hat")
+    var = getattr(r, f"{r.stat}_var_hat")
+    std = var ** 0.5
+    is_nb, _, _ = model.fit_dist(pd.Series([mean]), pd.Series([var]))
+    dist_name = ("Negative Binomial (this player's own games run more spread out than a "
+                 "plain Poisson count would expect)") if bool(is_nb.iloc[0]) else "Poisson"
+    stat_lower = r.Stat.lower()
+    pbox = box_keyed[box_keyed["key"] == r.key]
+    l5 = hit_rate(pbox.tail(5), r.stat, r.Line, r.side)
+    l10 = hit_rate(pbox.tail(10), r.stat, r.Line, r.side)
+    l20 = hit_rate(pbox.tail(20), r.stat, r.Line, r.side)
+    h2h = hit_rate(pbox[pbox["opponent"] == r.opponent], r.stat, r.Line, r.side)
+    chips = (split_chip("L5", *l5) + split_chip("L10", *l10) + split_chip("L20", *l20)
+            + split_chip(f"vs {r.opponent}", *h2h))
+    low, high = max(mean - std, 0), mean + std
+    points_caveat = (" Points specifically still runs a bit overconfident in the tails even with "
+                     "a long track record, which is why it's capped at Medium confidence "
+                     "regardless of sample size (see model.py).") if r.stat == "points" else ""
+    matchup = (f"Against {escape(str(r.opponent))} specifically, this side has hit in "
+              f"{h2h[0]}% of {h2h[1]} meeting(s) with a box score on file."
+              if h2h[0] is not None else
+              f"No completed meetings against {escape(str(r.opponent))} are on file yet for "
+              "this player, so this pick leans on overall recent form rather than "
+              "opponent-specific history.")
+    return (
+        f'<p><b>Summary.</b> The model projects {escape(str(r.Player))} to go {escape(str(r.side))} '
+        f'{r.Line:.1f} {escape(stat_lower)}, estimating {r.model_p:.0f}% against the market\'s '
+        f'no-vig {r.market_p:.0f}%, a {r.edge:+.0f} point gap, from {int(r.games_before)} games '
+        f'of this player\'s own saved history.</p>'
+        f'<p><b>Statistical evidence.</b> Projected mean is {mean:.1f} {escape(stat_lower)} '
+        f'(std dev {std:.1f}), modeled as a {dist_name} distribution. Hit-rate splits for this '
+        'exact side and line, from this player\'s own saved games:</p>'
+        f'<div class="strip" style="margin:.4rem 0 .8rem;">{chips}</div>'
+        f'<p><b>Matchup analysis.</b> {matchup}</p>'
+        f'<p><b>Why it might not hit.</b> Within one standard deviation, a typical outcome lands '
+        f'between {low:.1f} and {high:.1f} {escape(stat_lower)} - the model and the market can '
+        'both be reasonable about the distribution and still land on opposite sides of the line '
+        'by chance. The model also has no visibility into injury reports, minutes restrictions, '
+        f'or role changes a sportsbook may already be pricing in.{points_caveat}</p>'
+        f'<p><b>Final assessment.</b> {r.confidence} confidence, a {r.edge:+.0f} point edge '
+        'against a real market price. A probability estimate, not a recommendation to bet.</p>')
+
+
+def game_why_html(r):
+    """The 'Why we like it' panel for a spread/total/moneyline pick, built from the
+    same team ratings and measured error (sigma) the pick itself was computed from."""
+    is_total = r.market == "totals"
+    center, unit = (r.total, "total points") if is_total else (
+        r.margin, f"margin ({r.home_abbr} minus {r.away_abbr})")
+    low, high = center - r.sigma, center + r.sigma
+    return (
+        f'<p><b>Summary.</b> {escape(r.note)} The model estimates {r.model_p:.0f}% on '
+        f'{escape(str(r.side))} against the market\'s no-vig {r.market_p:.0f}%, a '
+        f'{r.edge:+.0f} point gap, from {int(r.games_before)} games of saved history for the '
+        'shorter-tracked of the two teams.</p>'
+        f'<p><b>Statistical evidence.</b> Projected pace is {r.pace:.1f} possessions/team. '
+        f'{escape(r.home_abbr)} offensive rating {r.home_off_hat:.1f}/100 vs {escape(r.away_abbr)} '
+        f'defensive rating {r.away_def_hat:.1f}/100 allowed; {escape(r.away_abbr)} offensive '
+        f'rating {r.away_off_hat:.1f}/100 vs {escape(r.home_abbr)} defensive rating '
+        f'{r.home_def_hat:.1f}/100 allowed. A home-court edge of {r.home_edge:+.2f} points/team '
+        '(measured from this data\'s own home/away scoring gap, not assumed) is already '
+        'included.</p>'
+        f'<p><b>Matchup analysis.</b> Projected score: {escape(r.home_abbr)} {r.home_pts:.1f} - '
+        f'{escape(r.away_abbr)} {r.away_pts:.1f} (margin {r.margin:+.1f}, total {r.total:.1f}).</p>'
+        f'<p><b>Why it might not hit.</b> The model\'s own measured error for this market has a '
+        f'standard deviation of {r.sigma:.1f} points, so a typical result lands between '
+        f'{low:.1f} and {high:.1f} on the {unit}. Like the player model, this has no visibility '
+        'into trades, injuries, rest decisions, or lineup changes a sportsbook already knows '
+        'about.</p>'
+        f'<p><b>Final assessment.</b> {r.confidence} confidence (based on {int(r.games_before)} '
+        f'games of saved history for both teams), a {r.edge:+.0f} point edge against a real '
+        'market price. A probability estimate, not a recommendation to bet.</p>')
 
 
 def page_top_picks():
@@ -979,6 +1064,7 @@ def page_top_picks():
         return
 
     conf_class = {"High": "b-done", "Medium": "b-wait", "Low": "b-miss"}
+    box_keyed = box.assign(key=box["player_name"].map(box_scores.normalize_name)).sort_values("game_date")
     for rank, r in enumerate(qualifying.itertuples(), 1):
         line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
         # Over/Under have a real green/red convention; a team-name side (spread,
@@ -1004,6 +1090,9 @@ def page_top_picks():
             f'price implies {r.market_p:.0f}% on {escape(str(r.side))}; the model estimates '
             f'{r.model_p:.0f}%, a gap of {r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
             f'</div>', unsafe_allow_html=True)
+        with st.expander("Why we like it"):
+            why_html = player_why_html(r, box_keyed) if r.kind == "player" else game_why_html(r)
+            st.markdown(why_html, unsafe_allow_html=True)
 
     hint("Estimated probability is not the same as betting value, and value isn't the same "
          "as a guaranteed outcome. A likely result at bad odds can still be a poor bet. "
