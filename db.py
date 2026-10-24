@@ -45,6 +45,26 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
     UNIQUE (snapshot_time, event_id, bookmaker, market, player, side, line)
 );
 
+-- Game-level markets (spread, total, moneyline), not player props. Separate table
+-- because the shape is different: no player, and side is a team name or Over/Under
+-- rather than always Over/Under.
+CREATE TABLE IF NOT EXISTS game_odds_snapshots (
+    id               INTEGER PRIMARY KEY,
+    snapshot_time    TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    event_id         TEXT NOT NULL,
+    commence_time    TEXT NOT NULL,
+    home_team        TEXT,
+    away_team        TEXT,
+    bookmaker        TEXT NOT NULL,
+    market           TEXT NOT NULL,   -- h2h, spreads, totals
+    side             TEXT NOT NULL,   -- team name (h2h/spreads) or Over/Under (totals)
+    line             REAL,            -- spread points or total points; NULL for h2h
+    price_american   INTEGER,
+    book_last_update TEXT,
+    UNIQUE (snapshot_time, event_id, bookmaker, market, side, line)
+);
+
 CREATE TABLE IF NOT EXISTS box_scores (
     game_id      TEXT NOT NULL,
     game_date    TEXT NOT NULL,
@@ -193,6 +213,9 @@ CREATE TABLE IF NOT EXISTS corrections (
 ODDS_COLUMNS = ["snapshot_time", "source", "event_id", "commence_time", "home_team",
                 "away_team", "bookmaker", "market", "player", "side", "line",
                 "price_american", "book_last_update"]
+GAME_ODDS_COLUMNS = ["snapshot_time", "source", "event_id", "commence_time", "home_team",
+                     "away_team", "bookmaker", "market", "side", "line",
+                     "price_american", "book_last_update"]
 
 
 def now_utc():
@@ -238,6 +261,20 @@ def save_odds(rows):
             f"INSERT OR IGNORE INTO odds_snapshots ({', '.join(ODDS_COLUMNS)}) "
             f"VALUES ({', '.join('?' for _ in ODDS_COLUMNS)})",
             [tuple(r.get(c) for c in ODDS_COLUMNS) for r in rows],
+        )
+        return conn.total_changes - before
+
+
+def save_game_odds(rows):
+    """Insert game-level odds rows (spread/total/moneyline). Same pattern as save_odds."""
+    if not rows:
+        return 0
+    with connect() as conn:
+        before = conn.total_changes
+        conn.executemany(
+            f"INSERT OR IGNORE INTO game_odds_snapshots ({', '.join(GAME_ODDS_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in GAME_ODDS_COLUMNS)})",
+            [tuple(r.get(c) for c in GAME_ODDS_COLUMNS) for r in rows],
         )
         return conn.total_changes - before
 
@@ -291,8 +328,9 @@ def cmd_import_csv():
 def cmd_summary():
     with connect() as conn:
         print(f"Database: {DB_PATH}\n")
-        for table in ["odds_snapshots", "box_scores", "period_box_scores", "players",
-                      "predictions", "entries", "entry_legs", "corrections"]:
+        for table in ["odds_snapshots", "game_odds_snapshots", "box_scores",
+                      "period_box_scores", "players", "predictions", "entries",
+                      "entry_legs", "corrections"]:
             n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             print(f"  {table:<15} {n:>7} rows")
         stats = conn.execute(

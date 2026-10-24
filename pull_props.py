@@ -1,5 +1,5 @@
 """
-pull_props.py  -  Step 1 of the prop engine: get player prop odds and save them.
+pull_props.py  -  Step 1 of the prop engine: get odds and save them.
 
 Two modes:
   python pull_props.py today              -> list today's NBA games (free)
@@ -8,10 +8,17 @@ Two modes:
   python pull_props.py history 2025-01-15 --game 0
                                           -> pull closing props for game #0 (30 credits)
 
+Add --game-markets to either pull to also grab spread, total, and moneyline odds in
+the same request (same credit cost either way - markets x regions - so this doubles
+the credits for that pull, from 3 to 6 for a live game). Off by default so it doesn't
+silently change the cost of existing scripts and scheduled jobs.
+
 Every pull saves to three places in the data/ folder:
   raw/...json   the exact API response, untouched (our audit trail)
   props/...csv  one tidy row per player / market / book / side
-  lockit.db     the same rows, added to the database (see db.py)
+  lockit.db     the same rows, added to the database (see db.py) - player props go to
+                odds_snapshots, game markets (with --game-markets) go to
+                game_odds_snapshots
 """
 
 import argparse
@@ -31,6 +38,7 @@ import db
 BASE_URL = "https://api.the-odds-api.com/v4"
 SPORT = "basketball_nba"
 MARKETS = "player_points,player_rebounds,player_assists"
+GAME_MARKETS = "h2h,spreads,totals"  # moneyline, spread, game total - no player involved
 REGIONS = "us"
 CLOSE_MINUTES_BEFORE_TIP = 10  # "closing line" snapshot = 10 min before tipoff
 
@@ -80,10 +88,12 @@ def parse_time(s):
 
 
 def flatten_event(event, snapshot_time, source):
-    """Turn one event's nested odds into flat rows."""
+    """Turn one event's nested odds into flat player-prop rows (player_points, etc)."""
     rows = []
     for book in event.get("bookmakers", []):
         for market in book.get("markets", []):
+            if market["key"] not in MARKETS.split(","):
+                continue
             for outcome in market.get("outcomes", []):
                 rows.append({
                     "snapshot_time": snapshot_time,
@@ -97,6 +107,32 @@ def flatten_event(event, snapshot_time, source):
                     "player": outcome.get("description"),
                     "side": outcome.get("name"),  # Over / Under
                     "line": outcome.get("point"),
+                    "price_american": outcome.get("price"),
+                    "book_last_update": market.get("last_update", book.get("last_update")),
+                })
+    return rows
+
+
+def flatten_game_odds(event, snapshot_time, source):
+    """Turn one event's nested odds into flat game-market rows (h2h/spreads/totals).
+    No player involved: side is a team name (h2h/spreads) or Over/Under (totals)."""
+    rows = []
+    for book in event.get("bookmakers", []):
+        for market in book.get("markets", []):
+            if market["key"] not in GAME_MARKETS.split(","):
+                continue
+            for outcome in market.get("outcomes", []):
+                rows.append({
+                    "snapshot_time": snapshot_time,
+                    "source": source,
+                    "event_id": event["id"],
+                    "commence_time": event["commence_time"],
+                    "home_team": event["home_team"],
+                    "away_team": event["away_team"],
+                    "bookmaker": book["key"],
+                    "market": market["key"],
+                    "side": outcome.get("name"),  # team name, or Over/Under for totals
+                    "line": outcome.get("point"),  # spread or total; None for h2h
                     "price_american": outcome.get("price"),
                     "book_last_update": market.get("last_update", book.get("last_update")),
                 })
@@ -136,6 +172,19 @@ def save(raw, rows, label):
           .head(8).to_string(index=False))
 
 
+def save_game_odds(rows, label):
+    """Same idea as save(), for spread/total/moneyline rows (no raw/csv files - those
+    come from the same API response already saved by save() in the same pull)."""
+    if not rows:
+        print("No game-market rows (spread/total/moneyline not posted yet).")
+        return
+    new_in_db = db.save_game_odds(rows)
+    df = pd.DataFrame(rows)
+    print(f"\nGame markets: {new_in_db} new rows added to {db.DB_PATH.name}")
+    print(df[["market", "bookmaker", "side", "line", "price_american"]]
+          .head(8).to_string(index=False))
+
+
 def print_games(events):
     if not events:
         print("No NBA games found.")
@@ -156,19 +205,22 @@ def pick(events, n):
 
 # ---------- modes ----------
 
-def run_today(game):
+def run_today(game, game_markets=False):
     events = call_api(f"/sports/{SPORT}/events", {})  # free
     if game is None:
         print_games(events)
         return
     event = pick(events, game)
+    markets = f"{MARKETS},{GAME_MARKETS}" if game_markets else MARKETS
     data = call_api(f"/sports/{SPORT}/events/{event['id']}/odds",
-                    {"regions": REGIONS, "markets": MARKETS, "oddsFormat": "american"})
+                    {"regions": REGIONS, "markets": markets, "oddsFormat": "american"})
     snapshot = iso(datetime.now(timezone.utc))
     save(data, flatten_event(data, snapshot, "live"), f"live_{event['id']}")
+    if game_markets:
+        save_game_odds(flatten_game_odds(data, snapshot, "live"), f"live_{event['id']}")
 
 
-def run_history(date_str, game):
+def run_history(date_str, game, game_markets=False):
     try:
         day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
@@ -186,12 +238,16 @@ def run_history(date_str, game):
         return
     event = pick(events, game)
     close_time = parse_time(event["commence_time"]) - timedelta(minutes=CLOSE_MINUTES_BEFORE_TIP)
+    markets = f"{MARKETS},{GAME_MARKETS}" if game_markets else MARKETS
     resp = call_api(f"/historical/sports/{SPORT}/events/{event['id']}/odds",
                     {"date": iso(close_time), "regions": REGIONS,
-                     "markets": MARKETS, "oddsFormat": "american"})
+                     "markets": markets, "oddsFormat": "american"})
     snapshot = resp.get("timestamp", iso(close_time))
     save(resp, flatten_event(resp["data"], snapshot, "historical"),
          f"hist_{date_str}_{event['id']}")
+    if game_markets:
+        save_game_odds(flatten_game_odds(resp["data"], snapshot, "historical"),
+                       f"hist_{date_str}_{event['id']}")
 
 
 if __name__ == "__main__":
@@ -200,13 +256,17 @@ if __name__ == "__main__":
 
     t = sub.add_parser("today", help="today's games (free to list)")
     t.add_argument("--game", type=int, help="game number from the list")
+    t.add_argument("--game-markets", action="store_true",
+                   help="also pull spread/total/moneyline (doubles credits for this pull)")
 
     h = sub.add_parser("history", help="a past date (paid plan)")
     h.add_argument("date", help="YYYY-MM-DD")
     h.add_argument("--game", type=int, help="game number from the list")
+    h.add_argument("--game-markets", action="store_true",
+                   help="also pull spread/total/moneyline (doubles credits for this pull)")
 
     args = parser.parse_args()
     if args.mode == "today":
-        run_today(args.game)
+        run_today(args.game, args.game_markets)
     else:
-        run_history(args.date, args.game)
+        run_history(args.date, args.game, args.game_markets)
