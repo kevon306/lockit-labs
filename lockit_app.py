@@ -832,11 +832,88 @@ def compute_picks(box, odds):
         lambda r: r["over_price"] if r["side"] == "Over" else r["under_price"], axis=1)
     picks["book"] = picks.apply(
         lambda r: r["over_book"] if r["side"] == "Over" else r["under_book"], axis=1)
+    picks["kind"] = "player"
+
+    def player_note(r):
+        mean = r[f"{r['stat']}_mean_hat"]
+        return f"Projected at {mean:.1f} {r['Stat'].lower()} per game by the model."
+
+    picks["note"] = picks.apply(player_note, axis=1)
     return picks, slate_odds["snapshot_time"].max()
+
+
+def compute_game_picks(box, game_odds):
+    """Every active spread/total/moneyline line with a model projection, in the same
+    shape as compute_picks() so the two can be ranked together."""
+    if box.empty or game_odds.empty:
+        return pd.DataFrame(), None
+
+    ev = events_table(game_odds)
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    day = today if (ev["date"] == today).any() else ev["date"].max()
+    slate = ev[ev["date"] == day]
+    if slate.empty:
+        return pd.DataFrame(), None
+
+    home_edge, sigma_margin, sigma_total = team_model.fitted_params(box)
+    matchups = pd.DataFrame([
+        {"home_team": short(r.home), "away_team": short(r.away)} for r in slate.itertuples()])
+    try:
+        proj = team_model.project_tonight_teams(box, matchups, home_edge).set_index(
+            ["home_team", "away_team"])
+    except KeyError:
+        return pd.DataFrame(), game_odds["snapshot_time"].max()
+
+    stat_label = {"spreads": "Spread", "totals": "Total", "h2h": "Moneyline"}
+    rows = []
+    for r in slate.itertuples():
+        home_abbr, away_abbr = short(r.home), short(r.away)
+        if (home_abbr, away_abbr) not in proj.index:
+            continue
+        model_row = proj.loc[(home_abbr, away_abbr)]
+        game_label = f"{away_abbr} at {home_abbr}"
+        board = game_market_rows(game_odds[game_odds["event_id"] == r.event_id])
+        if board.empty:
+            continue
+        games_before = int(min(model_row.home_games_before, model_row.away_games_before))
+        confidence = "High" if games_before >= 30 else ("Medium" if games_before >= 15 else "Low")
+        score_note = (f"Model projects {home_abbr} {model_row.home_points:.1f} - "
+                      f"{away_abbr} {model_row.away_points:.1f} (margin {model_row.margin:+.1f}, "
+                      f"total {model_row.total:.1f}).")
+
+        for x in board.itertuples():
+            if x.no_vig_pct is None:
+                continue
+            is_home_side = (x.side == r.home)
+            if x.market == "spreads":
+                side_margin = model_row.margin if is_home_side else -model_row.margin
+                model_p = round(100 * stats.norm.sf(-x.line, side_margin, sigma_margin), 1)
+                line_display = x.line
+            elif x.market == "totals":
+                if x.side == "Over":
+                    model_p = round(100 * stats.norm.sf(x.line, model_row.total, sigma_total), 1)
+                else:
+                    model_p = round(100 * stats.norm.cdf(x.line, model_row.total, sigma_total), 1)
+                line_display = x.line
+            else:  # h2h / moneyline: win probability is just the spread formula at line 0
+                side_margin = model_row.margin if is_home_side else -model_row.margin
+                model_p = round(100 * stats.norm.sf(0, side_margin, sigma_margin), 1)
+                line_display = 0.0
+            label = x.side if x.market == "totals" else short(x.side)
+            rows.append({
+                "Player": label, "Game": game_label, "Stat": stat_label[x.market],
+                "Line": line_display, "side": label, "model_p": model_p,
+                "market_p": x.no_vig_pct, "edge": model_p - x.no_vig_pct,
+                "confidence": confidence, "price": x.price, "book": x.book,
+                "event_id": r.event_id, "market": x.market, "games_before": games_before,
+                "kind": "game", "note": score_note,
+            })
+    return pd.DataFrame(rows), game_odds["snapshot_time"].max()
 
 
 def page_top_picks():
     box, odds = load("box_scores"), load("odds_snapshots")
+    game_odds = load("game_odds_snapshots")
     topbar(odds, "picks")
     if box.empty or odds.empty:
         st.info("Need box scores and odds saved before picks can be computed. In the "
@@ -846,24 +923,34 @@ def page_top_picks():
     st.markdown(
         f'<div class="hero">{COURT_SVG}<h1>Top Picks</h1>'
         "<p>Where the model's own probability and the market's disagree by the most, "
-        "using the walk-forward model validated in <code>model.py</code>. Never forces "
-        "a fixed number of picks - some nights there may be none.</p></div>",
+        "across player props, spreads, totals, and moneylines. Never forces a fixed "
+        "number of picks - some nights there may be none.</p></div>",
         unsafe_allow_html=True)
 
-    picks, last_snap = compute_picks(box, odds)
+    player_picks, last_snap_p = compute_picks(box, odds)
+    game_picks, last_snap_g = compute_game_picks(box, game_odds)
+    picks = pd.concat([player_picks, game_picks], ignore_index=True) if not game_picks.empty else player_picks
+    last_snap = max(t for t in [last_snap_p, last_snap_g] if t is not None) \
+        if (last_snap_p or last_snap_g) else None
     if picks.empty:
         hint("No active lines could be projected yet, probably because tonight's players "
-             "don't have enough box-score history saved. This isn't the same as "
+             "or teams don't have enough box-score history saved. This isn't the same as "
              "'no picks qualify' below.")
         return
 
-    flagged = picks[picks["edge"].abs() > MAX_PLAUSIBLE_EDGE]
-    in_range = picks[picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
+    market_choice = st.pills("Market", ["All", "Player Props", "Spread", "Total", "Moneyline"],
+                             default="All", label_visibility="collapsed") or "All"
+    market_filter = {"Player Props": picks["kind"] == "player", "Spread": picks["Stat"] == "Spread",
+                     "Total": picks["Stat"] == "Total", "Moneyline": picks["Stat"] == "Moneyline"}
+    view = picks[market_filter[market_choice]] if market_choice != "All" else picks
+
+    flagged = view[view["edge"].abs() > MAX_PLAUSIBLE_EDGE]
+    in_range = view[view["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
     qualified = in_range[(in_range["edge"].abs() >= EDGE_THRESHOLD) & (in_range["confidence"] != "Low")]
     qualifying = qualified.reindex(
         qualified["edge"].abs().sort_values(ascending=False).index).head(TOP_PICKS_MAX)
 
-    strip([(len(picks), "lines projected"), (len(qualifying), "qualify as picks"),
+    strip([(len(view), "lines projected"), (len(qualifying), "qualify as picks"),
           (f"{EDGE_THRESHOLD}-{MAX_PLAUSIBLE_EDGE} pts", "edge range to qualify"),
           (len(flagged), "flagged, not shown"),
           (ago(last_snap) if last_snap is not None else "–", "odds last captured")])
@@ -877,8 +964,8 @@ def page_top_picks():
                 hide_index=True, width="stretch")
             hint(f"An edge over {MAX_PLAUSIBLE_EDGE} points against a real, liquid market almost "
                  "always means the model is missing something real-world (an injury, a minutes "
-                 "restriction, a role change) rather than finding value no book noticed. Shown "
-                 "for transparency, not ranked as picks.")
+                 "restriction, a role change, a trade) rather than finding value no book noticed. "
+                 "Shown for transparency, not ranked as picks.")
 
     if qualifying.empty:
         st.markdown(
@@ -893,37 +980,40 @@ def page_top_picks():
 
     conf_class = {"High": "b-done", "Medium": "b-wait", "Low": "b-miss"}
     for rank, r in enumerate(qualifying.itertuples(), 1):
+        line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
+        # Over/Under have a real green/red convention; a team-name side (spread,
+        # moneyline) doesn't, so it just gets the same "picked" green.
+        color = RED if r.side == "Under" else GREEN
         st.markdown(
             f'<div class="panel">'
             f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.8rem;flex-wrap:wrap;">'
-            f'<div><div class="panel-title">#{rank} {escape(r.Player)}'
+            f'<div><div class="panel-title">#{rank} {escape(str(r.Player))}'
             f'<span class="badge {conf_class[r.confidence]}" style="margin-left:.5rem;">{r.confidence} confidence</span></div>'
             f'<div class="hint" style="margin:0;">{escape(r.Game)} &middot; {escape(r.Stat)} '
-            f'{escape(r.side)} {r.Line:.1f}</div></div>'
+            f'{escape(str(r.side))}{line_txt}</div></div>'
             f'<div style="text-align:right;">'
             f'<div style="font-family:\'Bricolage Grotesque\',sans-serif;font-size:1.8rem;'
-            f'font-weight:700;color:{GREEN if r.side=="Over" else RED};">{r.model_p:.0f}%</div>'
+            f'font-weight:700;color:{color};">{r.model_p:.0f}%</div>'
             f'<div class="hint" style="margin:0;">model estimate</div></div></div>'
             f'<div class="strip" style="margin-top:.8rem;">'
             f'<div><b>{r.market_p:.0f}%</b><span>market-implied</span></div>'
             f'<div><b>{r.edge:+.0f} pts</b><span>edge</span></div>'
             f'<div><b>{fmt_price(r.price)}</b><span>{escape(book(r.book) if pd.notna(r.book) else "-")}</span></div>'
             f'<div><b>{int(r.games_before)}</b><span>games of history</span></div></div>'
-            f'<p class="hint" style="margin-top:.6rem;">Projected at {getattr(r, f"{r.stat}_mean_hat"):.1f} '
-            f'{r.Stat.lower()} per game by the model. The market\'s no-vig price implies '
-            f'{r.market_p:.0f}% on {escape(r.side)}; the model estimates {r.model_p:.0f}%, a gap of '
-            f'{r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
+            f'<p class="hint" style="margin-top:.6rem;">{escape(r.note)} The market\'s no-vig '
+            f'price implies {r.market_p:.0f}% on {escape(str(r.side))}; the model estimates '
+            f'{r.model_p:.0f}%, a gap of {r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
             f'</div>', unsafe_allow_html=True)
 
     hint("Estimated probability is not the same as betting value, and value isn't the same "
          "as a guaranteed outcome. A likely result at bad odds can still be a poor bet. "
          "Confidence reflects how much track record and calibration back the estimate, not "
-         "how big the edge looks. Points-based picks are capped at Medium confidence: the "
-         "backtest in model.py found the model runs overconfident in points' extreme tails "
-         "even with a long track record, a known, documented limitation, not an oversight.")
+         "how big the edge looks. Player points picks are capped at Medium confidence (a known "
+         "tail-overconfidence issue, see model.py); team picks use games of history only, since "
+         "the team model's backtest found no stat-specific issue like that.")
 
-    with st.expander(f"All {len(picks)} projected lines, qualifying or not"):
-        show = picks.assign(Edge=picks["edge"].round(0)).sort_values("edge", key=abs, ascending=False)
+    with st.expander(f"All {len(view)} projected lines, qualifying or not"):
+        show = view.assign(Edge=view["edge"].round(0)).sort_values("edge", key=abs, ascending=False)
         st.dataframe(
             show[["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "Edge", "confidence"]]
             .rename(columns={"side": "Side", "model_p": "Model %", "market_p": "Market %",
@@ -942,22 +1032,28 @@ def page_top_picks():
         else:
             with db.connect() as conn:
                 for r in new_rows:
+                    line_for_lookup = None if r.Stat == "Moneyline" else r.Line
+                    snap_table = "odds_snapshots" if r.kind == "player" else "game_odds_snapshots"
+                    player_col = "AND player=?" if r.kind == "player" else ""
+                    params = [r.event_id] + ([r.Player] if r.kind == "player" else []) + [r.market, line_for_lookup]
                     snap_id = conn.execute(
-                        "SELECT id FROM odds_snapshots WHERE event_id=? AND player=? AND "
-                        "market=? AND line=? ORDER BY snapshot_time DESC LIMIT 1",
-                        (r.event_id, r.Player, r.market, r.Line)).fetchone()
-                    p_over_val = r.model_p_over / 100
+                        f"SELECT id FROM {snap_table} WHERE event_id=? {player_col} AND "
+                        "market=? AND line IS ? ORDER BY snapshot_time DESC LIMIT 1",
+                        params).fetchone()
+                    # p_over here means "probability of the recommended side", not literally
+                    # Over for spread/moneyline picks - true for every kind this page produces.
+                    p_val = r.model_p / 100
                     inputs = json.dumps({
-                        "mean": round(getattr(r, f"{r.stat}_mean_hat"), 2),
-                        "games_before": int(r.games_before), "confidence": r.confidence,
-                        "market_p_over": round(r.model_p_over - r.edge_over, 2),
-                        "edge_threshold": EDGE_THRESHOLD})
+                        "note": r.note, "games_before": int(r.games_before),
+                        "confidence": r.confidence, "market_p": round(r.market_p, 2),
+                        "edge_threshold": EDGE_THRESHOLD, "kind": r.kind})
                     conn.execute(
                         "INSERT INTO predictions (created_at, model_version, event_id, player, "
                         "market, line, p_over, p_under, p_push, odds_snapshot_id, inputs_json) "
                         "VALUES (?, 'walk-forward-v1', ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-                        (db.now_utc(), r.event_id, r.Player, r.market, r.Line, p_over_val,
-                         1 - p_over_val, snap_id[0] if snap_id else None, inputs))
+                        (db.now_utc(), r.event_id, r.Player, r.market,
+                         0.0 if r.Stat == "Moneyline" else r.Line, p_val, 1 - p_val,
+                         snap_id[0] if snap_id else None, inputs))
             st.cache_data.clear()
             st.toast(f"Saved {len(new_rows)} prediction{'s' if len(new_rows) != 1 else ''} "
                      "to the locked ledger.")
