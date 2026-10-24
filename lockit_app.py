@@ -260,6 +260,17 @@ div[data-baseweb="input"], div[data-baseweb="select"] > div {{ border-radius: 10
 .chip .px {{ font-size: .78rem; font-variant-numeric: tabular-nums; margin-top: .15rem; }}
 .chip .px .o {{ color: {GREEN}; }}
 .chip .px .u {{ color: {RED}; }}
+.chip .model {{ font-size: .72rem; font-weight: 700; margin-top: .25rem;
+  font-variant-numeric: tabular-nums; }}
+
+.gauge {{ position: relative; width: 60px; height: 60px; border-radius: 50%; flex-shrink: 0;
+  background: conic-gradient(var(--gauge-color, {BLUE}) calc(var(--pct, 50) * 1%), {EDGE} 0);
+  display: flex; align-items: center; justify-content: center; }}
+.gauge::before {{ content: ""; position: absolute; inset: 5px; border-radius: 50%; background: {PANEL}; }}
+.gauge span {{ position: relative; font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700;
+  font-size: .92rem; color: {TEXT}; }}
+.market-label {{ color: {MUTED}; font-size: .78rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; margin: .2rem 0 .5rem 0; }}
 
 @keyframes rise {{ from {{ opacity: 0; transform: translateY(8px); }} to {{ opacity: 1; transform: translateY(0); }} }}
 @media (prefers-reduced-motion: reduce) {{ .game, .trend-card {{ animation: none; }} }}
@@ -1195,62 +1206,80 @@ def page_game_lines():
         except KeyError:
             proj = pd.DataFrame()
 
+    market_title = {"h2h": "Moneyline", "spreads": "Spread", "totals": "Total"}
     for r in slate.itertuples():
         rows = game_market_rows(game_odds[game_odds["event_id"] == r.event_id])
-        st.markdown(
-            f'<div class="panel"><div class="panel-title">{escape(r.away)} at {escape(r.home)}</div>'
-            f'<span class="tipt">{r.tip:%-I:%M %p} ET</span></div>', unsafe_allow_html=True)
-
         home_abbr, away_abbr = short(r.home), short(r.away)
         model_row = None
+        gauge_html = fav_line = ""
         if not box.empty and (home_abbr, away_abbr) in proj.index:
             model_row = proj.loc[(home_abbr, away_abbr)]
-            strip([(f"{model_row.home_points:.1f}", f"{home_abbr} projected"),
-                  (f"{model_row.away_points:.1f}", f"{away_abbr} projected"),
-                  (f"{model_row.margin:+.1f}", f"projected margin ({home_abbr})"),
-                  (f"{model_row.total:.1f}", "projected total"),
-                  (int(min(model_row.home_games_before, model_row.away_games_before)), "games of history")])
+            home_wp = 100 * stats.norm.sf(0, model_row.margin, sigma_margin)
+            fav_abbr, fav_wp = (home_abbr, home_wp) if home_wp >= 50 else (away_abbr, 100 - home_wp)
+            gauge_html = (f'<div class="gauge" style="--pct:{fav_wp:.0f};--gauge-color:{BLUE};">'
+                         f'<span>{fav_wp:.0f}%</span></div>')
+            fav_line = (f'<div class="hint" style="margin-top:.3rem;">Model favors '
+                       f'{escape(fav_abbr)} to win, {model_row.home_points:.0f}-'
+                       f'{model_row.away_points:.0f} projected '
+                       f'({escape(home_abbr)}-{escape(away_abbr)}).</div>')
+
+        st.markdown(
+            '<div class="panel"><div style="display:flex;justify-content:space-between;'
+            'align-items:center;gap:1rem;flex-wrap:wrap;">'
+            f'<div><div class="panel-title" style="margin-bottom:.15rem;">'
+            f'{escape(r.away)} at {escape(r.home)}</div>'
+            f'<span class="tipt">{r.tip:%-I:%M %p} ET</span>{fav_line}</div>'
+            f'{gauge_html}</div></div>', unsafe_allow_html=True)
 
         c1, c2, c3 = st.columns(3)
-        for col, mkt, title in [(c1, "h2h", "Moneyline"), (c2, "spreads", "Spread"), (c3, "totals", "Total")]:
+        for col, mkt in [(c1, "h2h"), (c2, "spreads"), (c3, "totals")]:
             sub = rows[rows["market"] == mkt] if not rows.empty else rows
-            col.markdown(f'<div class="panel-title" style="font-size:1rem;">{title}</div>',
-                        unsafe_allow_html=True)
-            if sub.empty:
-                col.markdown('<p class="hint">Not posted yet.</p>', unsafe_allow_html=True)
-                continue
+            chips = []
             for x in sub.itertuples():
                 label = short(x.side) if mkt in ("h2h", "spreads") else x.side
                 line_txt = f" {x.line:+.1f}" if mkt == "spreads" else (f" {x.line:.1f}" if mkt == "totals" else "")
+
                 model_pct = None
-                if model_row is not None and mkt == "spreads":
-                    # A side with posted line L covers iff its own signed margin beats
-                    # -L (e.g. a -3.5 favorite covers by winning by more than 3.5; a
-                    # +3.5 underdog covers by losing by less than 3.5, or winning).
+                if model_row is not None:
                     is_home_side = (x.side == r.home)
                     side_margin = model_row.margin if is_home_side else -model_row.margin
-                    model_pct = round(100 * stats.norm.sf(-x.line, side_margin, sigma_margin), 1)
-                elif model_row is not None and mkt == "totals":
-                    if x.side == "Over":
+                    if mkt == "h2h":
+                        model_pct = round(100 * stats.norm.sf(0, side_margin, sigma_margin), 1)
+                    elif mkt == "spreads":
+                        # A side with posted line L covers iff its own signed margin beats
+                        # -L (e.g. a -3.5 favorite covers by winning by more than 3.5; a
+                        # +3.5 underdog covers by losing by less than 3.5, or winning).
+                        model_pct = round(100 * stats.norm.sf(-x.line, side_margin, sigma_margin), 1)
+                    elif x.side == "Over":
                         model_pct = round(100 * stats.norm.sf(x.line, model_row.total, sigma_total), 1)
                     else:
                         model_pct = round(100 * stats.norm.cdf(x.line, model_row.total, sigma_total), 1)
-                edge_txt = ""
+
+                model_line = ""
                 if model_pct is not None and x.no_vig_pct is not None:
                     edge = model_pct - x.no_vig_pct
-                    flagged = abs(edge) > MAX_PLAUSIBLE_EDGE
-                    edge_txt = (f'<span class="hint">model {model_pct:.0f}%'
-                               f'{" (flagged, edge too large to be plausible)" if flagged else f", edge {edge:+.0f} pts"}'
-                               f'</span><br>')
-                col.markdown(
-                    f'<div class="row"><div><div class="who">{escape(str(label))}{line_txt}</div>'
-                    f'<div class="what">no-vig {x.no_vig_pct if x.no_vig_pct is not None else "–"}%</div>'
-                    f'{edge_txt}</div>'
-                    f'<div class="val">{fmt_price(x.price)}<small>{escape(x.book)}</small></div></div>',
-                    unsafe_allow_html=True)
+                    if abs(edge) > MAX_PLAUSIBLE_EDGE:
+                        model_line = f'<div class="model" style="color:{AMBER};">model {model_pct:.0f}% (flagged)</div>'
+                    else:
+                        color = GREEN if edge > 0 else (RED if edge < 0 else MUTED)
+                        model_line = f'<div class="model" style="color:{color};">model {model_pct:.0f}% ({edge:+.0f})</div>'
+                elif model_pct is not None:
+                    model_line = f'<div class="model" style="color:{MUTED};">model {model_pct:.0f}%</div>'
+
+                chips.append(
+                    f'<div class="chip"><div class="ln">{escape(str(label))}{line_txt}</div>'
+                    f'<div class="pl">no-vig {x.no_vig_pct if x.no_vig_pct is not None else "–"}%</div>'
+                    f'<div class="px">{fmt_price(x.price)}<small>{escape(x.book)}</small></div>'
+                    f'{model_line}</div>')
+            col.markdown(
+                f'<div class="market-label">{market_title[mkt]}</div>'
+                f'<div class="chips" style="justify-content:flex-start;">'
+                + ("".join(chips) if chips else '<span class="hint">Not posted yet.</span>') + '</div>',
+                unsafe_allow_html=True)
 
     hint("No-vig % is the books' own implied probability with their cut removed, not a LOCK IT "
-         "prediction. Model % is this app's own projection. Edges over "
+         "prediction. Model % is this app's own projection. The number in parentheses is the "
+         "gap between them, in points. Edges over "
          f"{MAX_PLAUSIBLE_EDGE} points are flagged rather than shown as real value, same rule as "
          "Top Picks: a model with no access to real-world news that disagrees with a sharp market "
          "by a lot is more likely missing something than finding something.")
