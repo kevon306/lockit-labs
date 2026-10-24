@@ -823,68 +823,72 @@ def page_players():
                (f"{hit:.0f}%" if hit is not None else "–", f"over {line_name}"),
                (len(games), f"games, {split.lower()}")])
 
-    section(f"{stat_label}, {split}" + (f" vs {opponent}" if split == "H2H" else ""))
-    if games.empty:
-        hint(f"No games in this split yet ({split}" +
-             (f" vs {opponent}" if split == "H2H" else "") + ").")
-    else:
-        data = games.assign(over=(games["value"] > line) if line is not None else False,
-                            day=pd.to_datetime(games["game_date"]).dt.strftime("%b %-d") + " "
-                            + games["opponent"])
-        chart = labeled_bar_chart(data, "value", stat_label, line)
-        st.altair_chart(chart_style(chart.properties(height=320)), use_container_width=True)
-        if is_binary:
-            hint(f"1 means he got the {stat_label.lower()} that game, 0 means he didn't. The gold "
-                 "line is his own hit rate in this split, not a LOCK IT prediction. Small samples "
-                 "(H2H, last season) can be noisy.")
+    tab_stats, tab_support, tab_matchup, tab_log = st.tabs(
+        ["Statistics", "Supporting stats", f"vs {opponent}", "Game log"])
+
+    with tab_stats:
+        if games.empty:
+            hint(f"No games in this split yet ({split}" +
+                 (f" vs {opponent}" if split == "H2H" else "") + ").")
         else:
-            hint(f"Green bars cleared {line_name}{', marked in gold' if line is not None else ''}. "
-                 f"{'A real sportsbook line' if line_is_market else 'No sportsbook line for this stat yet, so this is his own average'}"
-                 ", not a LOCK IT prediction. Small samples (H2H, last season) can be noisy.")
+            data = games.assign(over=(games["value"] > line) if line is not None else False,
+                                day=pd.to_datetime(games["game_date"]).dt.strftime("%b %-d") + " "
+                                + games["opponent"])
+            chart = labeled_bar_chart(data, "value", stat_label, line)
+            st.altair_chart(chart_style(chart.properties(height=320)), use_container_width=True)
+            if is_binary:
+                hint(f"1 means he got the {stat_label.lower()} that game, 0 means he didn't. The "
+                     "gold line is his own hit rate in this split, not a LOCK IT prediction. Small "
+                     "samples (H2H, last season) can be noisy.")
+            else:
+                hint(f"Green bars cleared {line_name}{', marked in gold' if line is not None else ''}. "
+                     f"{'A real sportsbook line' if line_is_market else 'No sportsbook line for this stat yet, so this is his own average'}"
+                     ", not a LOCK IT prediction. Small samples (H2H, last season) can be noisy.")
 
-    section("Supporting stats")
-    SUPPORTING = {"Minutes": (["minutes"], None), "Fouls": (["fouls"], None),
-                  "Field Goals": (["fgm"], "fga"), "3PT": (["fg3m"], "fg3a")}
-    sup_choice = st.segmented_control("Supporting stat", list(SUPPORTING), default="Minutes",
-                                      label_visibility="collapsed") or "Minutes"
-    made_cols, att_col = SUPPORTING[sup_choice]
-    if games.empty:
-        hint("No games in this split yet.")
-    else:
-        made = games[made_cols].sum(axis=1)
-        sup_items = [(f"{made.mean():.1f}", "average"), (f"{made.median():.1f}", "median")]
-        if att_col:
-            att = games[att_col]
-            pct = (made.sum() / att.sum() * 100) if att.sum() else 0
-            sup_items += [(f"{att.mean():.1f}", "attempted per game"), (f"{pct:.0f}%", "shooting")]
-        strip(sup_items)
-        sdata = games.assign(day=pd.to_datetime(games["game_date"]).dt.strftime("%b %-d") + " "
-                             + games["opponent"], sval=made)
-        schart = labeled_bar_chart(sdata, "sval", sup_choice, line=None, color=BLUE)
-        st.altair_chart(chart_style(schart.properties(height=200)), use_container_width=True)
+    with tab_support:
+        SUPPORTING = {"Minutes": (["minutes"], None), "Fouls": (["fouls"], None),
+                      "Field Goals": (["fgm"], "fga"), "3PT": (["fg3m"], "fg3a")}
+        sup_choice = st.segmented_control("Supporting stat", list(SUPPORTING), default="Minutes",
+                                          label_visibility="collapsed") or "Minutes"
+        made_cols, att_col = SUPPORTING[sup_choice]
+        if games.empty:
+            hint("No games in this split yet.")
+        else:
+            made = games[made_cols].sum(axis=1)
+            sup_items = [(f"{made.mean():.1f}", "average"), (f"{made.median():.1f}", "median")]
+            if att_col:
+                att = games[att_col]
+                pct = (made.sum() / att.sum() * 100) if att.sum() else 0
+                sup_items += [(f"{att.mean():.1f}", "attempted per game"), (f"{pct:.0f}%", "shooting")]
+            strip(sup_items)
+            sdata = games.assign(day=pd.to_datetime(games["game_date"]).dt.strftime("%b %-d") + " "
+                                 + games["opponent"], sval=made)
+            schart = labeled_bar_chart(sdata, "sval", sup_choice, line=None, color=BLUE)
+            st.altair_chart(chart_style(schart.properties(height=200)), use_container_width=True)
 
-    section(f"{stat_label} vs {opponent}")
-    pos_choice = st.pills("Position", ["All", "G", "F", "C"], default="All",
-                          label_visibility="collapsed") or "All"
-    vs_opp = box[(box["opponent"] == opponent) & (box["player_id"] != player_id)].copy()
-    vs_opp["position"] = vs_opp["player_id"].map(pos_lookup) if not players.empty else None
-    if pos_choice != "All":
-        vs_opp = vs_opp[vs_opp["position"].fillna("").str.contains(pos_choice)]
-    vs_opp = vs_opp.assign(value=stat_value(vs_opp, stat_label)).sort_values("game_date", ascending=False).head(15)
-    if vs_opp.empty:
-        hint(f"No recent games found against {opponent}" +
-             (f" at {pos_choice}" if pos_choice != "All" else "") + ".")
-    else:
-        show = vs_opp[["game_date", "player_name", "team", "position", "value"]].rename(
-            columns={"game_date": "Date", "player_name": "Player", "team": "Team",
-                     "position": "Pos", "value": stat_label})
-        st.dataframe(show, hide_index=True, width="stretch")
-    hint(f"Real box scores from other players' games against {opponent}, not sportsbook lines "
-         "we don't have history for. Position is pulled from today's roster, not the game date, "
-         "and is only as fine-grained as G / F / C" +
-         (f" ({player_pos})" if player_pos else "") + ".")
+    with tab_matchup:
+        pos_choice = st.pills("Position", ["All", "G", "F", "C"], default="All",
+                              label_visibility="collapsed") or "All"
+        vs_opp = box[(box["opponent"] == opponent) & (box["player_id"] != player_id)].copy()
+        vs_opp["position"] = vs_opp["player_id"].map(pos_lookup) if not players.empty else None
+        if pos_choice != "All":
+            vs_opp = vs_opp[vs_opp["position"].fillna("").str.contains(pos_choice)]
+        vs_opp = (vs_opp.assign(value=stat_value(vs_opp, stat_label))
+                  .sort_values("game_date", ascending=False).head(15))
+        if vs_opp.empty:
+            hint(f"No recent games found against {opponent}" +
+                 (f" at {pos_choice}" if pos_choice != "All" else "") + ".")
+        else:
+            show = vs_opp[["game_date", "player_name", "team", "position", "value"]].rename(
+                columns={"game_date": "Date", "player_name": "Player", "team": "Team",
+                         "position": "Pos", "value": stat_label})
+            st.dataframe(show, hide_index=True, width="stretch")
+        hint(f"Real box scores from other players' games against {opponent}, not sportsbook lines "
+             "we don't have history for. Position is pulled from today's roster, not the game date, "
+             "and is only as fine-grained as G / F / C" +
+             (f" ({player_pos})" if player_pos else "") + ".")
 
-    with st.expander("Full game log"):
+    with tab_log:
         st.dataframe(games_all.sort_values("game_date", ascending=False)
                      [["game_date", "team", "opponent", "minutes", "points", "rebounds", "oreb", "dreb",
                        "assists", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "steals", "blocks",
