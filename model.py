@@ -192,18 +192,95 @@ def project_tonight(box, roster):
     return projected[cols].reset_index(drop=True)
 
 
-def confidence_label(games_before, stat):
-    """How much to trust a projection, separate from the probability itself. Based on
-    what the backtest actually found: rebounds and assists calibrate well once there's
-    a real track record; points runs overconfident in its tails even with plenty of
-    history (see the module docstring), so it's capped at Medium regardless of sample
-    size until that's fixed with a better model, not just more data.
+def confidence_label(games_before, stat, backtest=None):
+    """How much to trust a projection, separate from the probability itself.
+
+    High now requires two things, not just sample size: at least 30 games of history,
+    *and* closing_line_log_loss() showing this stat's model beats the no-vig closing
+    line on log loss - being well-calibrated against reality isn't the same as being
+    sharper than a real market, and only the second one means the model is actually
+    adding information. backtest=None (or a stat with no settled closing-line games
+    yet) means that hasn't been shown, so High is never awarded on sample size alone.
+    Points stays capped at Medium regardless - a known tail-overconfidence issue (see
+    the module docstring) that beating the market on log loss wouldn't fix.
     """
     if games_before < 15:
         return "Low"
     if stat == "points":
         return "Medium"
-    return "High" if games_before >= 30 else "Medium"
+    beats_market = bool(backtest and backtest.get(stat, {}).get("model_wins"))
+    return "High" if (games_before >= 30 and beats_market) else "Medium"
+
+
+def _implied(price):
+    return -price / (-price + 100) if price < 0 else 100 / (price + 100)
+
+
+def closing_line_log_loss(box, odds_resolved):
+    """For every settled game where we also saved a player-prop odds snapshot at or
+    before tip (the closest thing we have to a closing line), compares the model's own
+    walk-forward probability to the books' no-vig probability on log loss, per stat.
+
+    odds_resolved must already have player_id/game_date columns added (name-matching
+    and date lookups live in lockit_app.py, not here).
+
+    Returns {'points': {...}, 'rebounds': {...}, 'assists': {...}}, each a dict with n
+    (games covered), model_log_loss, market_log_loss, model_wins (model_log_loss <
+    market_log_loss). n=0 means no settled game has a saved closing-ish line yet for
+    that stat - that's "not enough data", not a result of 0.
+    """
+    empty = {"n": 0, "model_log_loss": None, "market_log_loss": None, "model_wins": None}
+    results = {s: dict(empty) for s in STATS}
+    if box.empty or odds_resolved.empty:
+        return results
+
+    proj = add_projections(box.sort_values(["player_id", "game_date"]).reset_index(drop=True))
+    proj = proj.set_index(["player_id", "game_date"])
+    market_for_stat = {"player_points": "points", "player_rebounds": "rebounds", "player_assists": "assists"}
+
+    eps = 1e-6
+    for market, stat in market_for_stat.items():
+        losses_model, losses_market = [], []
+        sub = odds_resolved[odds_resolved["market"] == market]
+        for (player_id, game_date), g in sub.groupby(["player_id", "game_date"]):
+            key = (player_id, game_date)
+            if key not in proj.index:
+                continue  # game hasn't been played, or box score not saved for it yet
+            row = proj.loc[key]
+            mean, var, actual = row[f"{stat}_mean_hat"], row[f"{stat}_var_hat"], row[stat]
+            if pd.isna(mean) or mean <= 0 or pd.isna(actual):
+                continue
+
+            closing = g[g["snapshot_time"] == g["snapshot_time"].max()]
+            line = closing["line"].mode().iloc[0]
+            over = closing[closing["side"] == "Over"]
+            under = closing[closing["side"] == "Under"]
+            fair = []
+            for _, b in over.groupby("bookmaker"):
+                ub = under[under["bookmaker"] == b["bookmaker"].iloc[0]]
+                if ub.empty:
+                    continue
+                po, pu = _implied(b["price_american"].iloc[0]), _implied(ub["price_american"].iloc[0])
+                fair.append(po / (po + pu))
+            if not fair:
+                continue
+            p_market = sum(fair) / len(fair)
+
+            is_nb, r, p = fit_dist(pd.Series([mean]), pd.Series([var]))
+            p_model = p_over(np.array([line]), pd.Series([mean]), r, p, is_nb)[0]
+            if np.isnan(p_model):
+                continue
+            y = 1.0 if actual > line else 0.0
+            p_model = min(max(p_model, eps), 1 - eps)
+            p_market = min(max(p_market, eps), 1 - eps)
+            losses_model.append(-(y * np.log(p_model) + (1 - y) * np.log(1 - p_model)))
+            losses_market.append(-(y * np.log(p_market) + (1 - y) * np.log(1 - p_market)))
+
+        n = len(losses_model)
+        if n:
+            ml, kl = float(np.mean(losses_model)), float(np.mean(losses_market))
+            results[stat] = {"n": n, "model_log_loss": ml, "market_log_loss": kl, "model_wins": ml < kl}
+    return results
 
 
 # ---------- backtest ----------

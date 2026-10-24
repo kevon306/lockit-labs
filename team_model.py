@@ -132,6 +132,86 @@ def fitted_params(box):
     return home_edge, sigma_margin, sigma_total
 
 
+def _implied(price):
+    return -price / (-price + 100) if price < 0 else 100 / (price + 100)
+
+
+def closing_line_log_loss(box, game_odds_resolved):
+    """For every settled game where we also saved a game-market odds snapshot at or
+    before tip (the closest thing we have to a closing line), compares the model's own
+    walk-forward probability to the books' no-vig probability on log loss, per market.
+
+    game_odds_resolved must already have home_abbr/away_abbr/game_date columns added
+    (team abbreviation and date lookups live in lockit_app.py, not here, so this stays
+    importable without Streamlit).
+
+    Returns {'h2h': {...}, 'spreads': {...}, 'totals': {...}}, each a dict with n
+    (games covered), model_log_loss, market_log_loss, model_wins (model_log_loss <
+    market_log_loss). n=0 means no settled game has a saved closing-ish line yet for
+    that market - that's "not enough data", not a result of 0.
+    """
+    empty = {"n": 0, "model_log_loss": None, "market_log_loss": None, "model_wins": None}
+    results = {"h2h": dict(empty), "spreads": dict(empty), "totals": dict(empty)}
+    if box.empty or game_odds_resolved.empty:
+        return results
+
+    pairs, home_edge = fit_pairs(box)
+    sigma_margin = (pairs["actual_margin"] - pairs["proj_margin"]).std()
+    sigma_total = (pairs["actual_total"] - pairs["proj_total"]).std()
+    pairs = pairs.set_index(["team", "opponent", "game_date"])
+
+    eps = 1e-6
+    for market in results:
+        losses_model, losses_market = [], []
+        mkt_rows = game_odds_resolved[game_odds_resolved["market"] == market]
+        for event_id, g in mkt_rows.groupby("event_id"):
+            home_abbr, away_abbr, date = g["home_abbr"].iloc[0], g["away_abbr"].iloc[0], g["game_date"].iloc[0]
+            key = (home_abbr, away_abbr, date)
+            if key not in pairs.index:
+                continue  # game hasn't been played, or box scores not saved for it yet
+            row = pairs.loc[key]
+
+            closing = g[g["snapshot_time"] == g["snapshot_time"].max()]
+            pick_side = closing["home_team"].iloc[0] if market != "totals" else "Over"
+            at_side = closing[closing["side"] == pick_side]
+            opp_side = closing[closing["side"] != pick_side]
+            if at_side.empty or opp_side.empty:
+                continue
+            line = at_side["line"].mode().iloc[0] if market != "h2h" else 0.0
+
+            fair = []
+            for _, b in at_side.groupby("bookmaker"):
+                ob = opp_side[opp_side["bookmaker"] == b["bookmaker"].iloc[0]]
+                if ob.empty:
+                    continue
+                po, pu = _implied(b["price_american"].iloc[0]), _implied(ob["price_american"].iloc[0])
+                fair.append(po / (po + pu))
+            if not fair:
+                continue
+            p_market = sum(fair) / len(fair)
+
+            if market == "h2h":
+                y = 1.0 if row.actual_margin > 0 else 0.0
+                p_model = stats.norm.sf(0, row.proj_margin, sigma_margin)
+            elif market == "spreads":
+                y = 1.0 if row.actual_margin > -line else 0.0
+                p_model = stats.norm.sf(-line, row.proj_margin, sigma_margin)
+            else:
+                y = 1.0 if row.actual_total > line else 0.0
+                p_model = stats.norm.sf(line, row.proj_total, sigma_total)
+
+            p_model = min(max(p_model, eps), 1 - eps)
+            p_market = min(max(p_market, eps), 1 - eps)
+            losses_model.append(-(y * np.log(p_model) + (1 - y) * np.log(1 - p_model)))
+            losses_market.append(-(y * np.log(p_market) + (1 - y) * np.log(1 - p_market)))
+
+        n = len(losses_model)
+        if n:
+            ml, kl = float(np.mean(losses_model)), float(np.mean(losses_market))
+            results[market] = {"n": n, "model_log_loss": ml, "market_log_loss": kl, "model_wins": ml < kl}
+    return results
+
+
 def project_tonight_teams(box, matchups, home_edge):
     """matchups: DataFrame with home_team, away_team (abbreviations matching box_scores'
     team/opponent columns). Returns projected points for each side, margin, and total."""
