@@ -18,6 +18,12 @@ markets, so it roughly doubles the credits for that pull too). Also off by defau
 same reasoning - the automated snapshot job (auto.py) uses MARKETS directly and does
 not opt into either flag, so its cost never changes without a deliberate edit there.
 
+Add --alt-lines to also grab every alternate line a book posts per player, not just
+the main one (e.g. Luka at 17.5, 19.5, 21.5, ... 54.5 points, all at once). Real,
+cheap market (~1 credit/market/region) - covers points/rebounds/assists/threes/
+blocks/steals; there's no alternate-turnovers market. Books only post the Over side
+on alt lines, which is normal industry practice, not a gap here.
+
 Every pull saves to three places in the data/ folder:
   raw/...json   the exact API response, untouched (our audit trail)
   props/...csv  one tidy row per player / market / book / side
@@ -49,6 +55,14 @@ MARKETS = "player_points,player_rebounds,player_assists"  # what the automated s
 EXTRA_MARKETS = "player_threes,player_steals,player_blocks,player_turnovers"  # opt-in
                                                            # via --extra-markets, same
                                                            # idea as --game-markets
+# Alternate lines: every other point total a book is willing to post for a player,
+# not just the main line (e.g. Luka at 17.5, 19.5, 21.5, ... 54.5 points, not just one
+# number). Real market, confirmed live - cheap (1 credit/market/region). No alternate
+# turnovers market exists, so only 6 of the 7 stats have one. Books only post the Over
+# side on alt lines (standard industry practice, not a gap in this app).
+ALT_MARKETS = ("player_points_alternate,player_rebounds_alternate,"
+              "player_assists_alternate,player_threes_alternate,"
+              "player_blocks_alternate,player_steals_alternate")
 GAME_MARKETS = "h2h,spreads,totals"  # moneyline, spread, game total - no player involved
 REGIONS = "us"
 CLOSE_MINUTES_BEFORE_TIP = 10  # "closing line" snapshot = 10 min before tipoff
@@ -102,7 +116,7 @@ def parse_time(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-ALL_PLAYER_MARKETS = set(MARKETS.split(",")) | set(EXTRA_MARKETS.split(","))
+ALL_PLAYER_MARKETS = set(MARKETS.split(",")) | set(EXTRA_MARKETS.split(",")) | set(ALT_MARKETS.split(","))
 
 
 def flatten_event(event, snapshot_time, source):
@@ -227,22 +241,24 @@ def pick(events, n):
 
 # ---------- modes ----------
 
-def build_markets(game_markets, extra_markets):
+def build_markets(game_markets, extra_markets, alt_lines):
     parts = [MARKETS]
     if extra_markets:
         parts.append(EXTRA_MARKETS)
+    if alt_lines:
+        parts.append(ALT_MARKETS)
     if game_markets:
         parts.append(GAME_MARKETS)
     return ",".join(parts)
 
 
-def run_today(game, game_markets=False, extra_markets=False):
+def run_today(game, game_markets=False, extra_markets=False, alt_lines=False):
     events = call_api(f"/sports/{SPORT}/events", {})  # free
     if game is None:
         print_games(events)
         return
     event = pick(events, game)
-    markets = build_markets(game_markets, extra_markets)
+    markets = build_markets(game_markets, extra_markets, alt_lines)
     data = call_api(f"/sports/{SPORT}/events/{event['id']}/odds",
                     {"regions": REGIONS, "markets": markets, "oddsFormat": "american"})
     snapshot = iso(datetime.now(timezone.utc))
@@ -251,7 +267,7 @@ def run_today(game, game_markets=False, extra_markets=False):
         save_game_odds(flatten_game_odds(data, snapshot, "live"), f"live_{event['id']}")
 
 
-def run_history(date_str, game, game_markets=False, extra_markets=False):
+def run_history(date_str, game, game_markets=False, extra_markets=False, alt_lines=False):
     try:
         day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
@@ -269,7 +285,7 @@ def run_history(date_str, game, game_markets=False, extra_markets=False):
         return
     event = pick(events, game)
     close_time = parse_time(event["commence_time"]) - timedelta(minutes=CLOSE_MINUTES_BEFORE_TIP)
-    markets = build_markets(game_markets, extra_markets)
+    markets = build_markets(game_markets, extra_markets, alt_lines)
     resp = call_api(f"/historical/sports/{SPORT}/events/{event['id']}/odds",
                     {"date": iso(close_time), "regions": REGIONS,
                      "markets": markets, "oddsFormat": "american"})
@@ -291,6 +307,9 @@ if __name__ == "__main__":
                    help="also pull spread/total/moneyline (doubles credits for this pull)")
     t.add_argument("--extra-markets", action="store_true",
                    help="also pull threes/steals/blocks/turnovers (extra credits for this pull)")
+    t.add_argument("--alt-lines", action="store_true",
+                   help="also pull every alternate line per player, not just the main one "
+                        "(cheap - about 1 credit/market - but adds a lot of rows)")
 
     h = sub.add_parser("history", help="a past date (paid plan)")
     h.add_argument("date", help="YYYY-MM-DD")
@@ -299,9 +318,11 @@ if __name__ == "__main__":
                    help="also pull spread/total/moneyline (doubles credits for this pull)")
     h.add_argument("--extra-markets", action="store_true",
                    help="also pull threes/steals/blocks/turnovers (extra credits for this pull)")
+    h.add_argument("--alt-lines", action="store_true",
+                   help="also pull every alternate line per player, not just the main one")
 
     args = parser.parse_args()
     if args.mode == "today":
-        run_today(args.game, args.game_markets, args.extra_markets)
+        run_today(args.game, args.game_markets, args.extra_markets, args.alt_lines)
     else:
-        run_history(args.date, args.game, args.game_markets, args.extra_markets)
+        run_history(args.date, args.game, args.game_markets, args.extra_markets, args.alt_lines)

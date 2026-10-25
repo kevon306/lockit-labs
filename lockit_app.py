@@ -130,7 +130,20 @@ ALL_STAT_LABELS = (list(STAT_DEFS) + list(MILESTONE_DEFS) + list(FANTASY_FORMULA
 # player's own average (or hit rate, for milestones), clearly labeled, never shown as
 # "the line" when it isn't one.
 MARKET_FOR_STAT = {"Points": "player_points", "Rebounds": "player_rebounds",
-                   "Assists": "player_assists"}
+                   "Assists": "player_assists", "Three-Pointers Made": "player_threes",
+                   "Steals": "player_steals", "Blocks": "player_blocks",
+                   "Turnovers": "player_turnovers"}
+# Alternate-line markets confirmed live on The Odds API (~1 credit/market/region, pulled
+# via `pull_props.py --alt-lines`). No alternate-turnovers market exists industrywide, so
+# Turnovers has no entry here - the Alt Lines tab falls back to model-only for it.
+ALT_MARKET_FOR_STAT = {"Points": "player_points_alternate", "Rebounds": "player_rebounds_alternate",
+                       "Assists": "player_assists_alternate", "Three-Pointers Made": "player_threes_alternate",
+                       "Steals": "player_steals_alternate", "Blocks": "player_blocks_alternate"}
+# The projection model (model.py) only covers these 7 stats - maps this page's display
+# labels to model.STATS keys so the Alt Lines tab knows when a model probability exists.
+MODEL_STAT_FOR_LABEL = {"Points": "points", "Rebounds": "rebounds", "Assists": "assists",
+                        "Three-Pointers Made": "fg3m", "Steals": "steals", "Blocks": "blocks",
+                        "Turnovers": "turnovers"}
 SPLITS = ["H2H", "L5", "L10", "L20", "This season", "Last season"]
 
 
@@ -2062,8 +2075,8 @@ def page_players():
                (f"{hit:.0f}%" if hit is not None else "–", f"over {line_name}"),
                (len(games), f"games, {split.lower()}")])
 
-    tab_stats, tab_support, tab_matchup, tab_log = st.tabs(
-        ["Statistics", "Supporting stats", f"vs {opponent}", "Game log"])
+    tab_stats, tab_support, tab_matchup, tab_log, tab_alt = st.tabs(
+        ["Statistics", "Supporting stats", f"vs {opponent}", "Game log", "Alt Lines"])
 
     with tab_stats:
         if games.empty:
@@ -2133,6 +2146,99 @@ def page_players():
                        "assists", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "steals", "blocks",
                        "turnovers", "fouls"]],
                      hide_index=True, width="stretch")
+
+    with tab_alt:
+        model_stat = MODEL_STAT_FOR_LABEL.get(stat_label)
+        alt_market = ALT_MARKET_FOR_STAT.get(stat_label)
+
+        mean_hat = var_hat = None
+        if model_stat:
+            roster_one = pd.DataFrame([{"player_id": player_id, "player_name": name,
+                                        "team": player_team, "opponent": opponent}])
+            proj = model.project_tonight(box, roster_one).iloc[0]
+            if proj["games_before"] >= model.MIN_HISTORY:
+                mh, vh = proj[f"{model_stat}_mean_hat"], proj[f"{model_stat}_var_hat"]
+                if pd.notna(mh) and mh > 0:
+                    mean_hat, var_hat = float(mh), float(vh)
+
+        def model_prob_at(x):
+            if mean_hat is None:
+                return None
+            is_nb, r, p = model.fit_dist(pd.Series([mean_hat]), pd.Series([var_hat]))
+            prob = model.p_over(pd.Series([float(x)]), pd.Series([mean_hat]), r, p, is_nb)
+            return None if pd.isna(prob[0]) else float(prob[0])
+
+        if model_stat is None:
+            hint(f"{stat_label} isn't one of the 7 stats the projection model covers (points, "
+                 "rebounds, assists, three-pointers, steals, blocks, turnovers), so there's no "
+                 "model probability here - just his own history at any number you pick.")
+        elif mean_hat is None:
+            hint(f"Not enough history yet to project {name} at {stat_label.lower()} "
+                 f"(needs {model.MIN_HISTORY}+ games) - showing his own history at any number "
+                 "you pick instead.")
+
+        default_val = line if line is not None else (float(games["value"].mean()) if not games.empty else 0.0)
+        pick = st.number_input(f"Pick any {stat_label.lower()} line", min_value=0.0,
+                               value=round(default_val * 2) / 2, step=0.5,
+                               help="Not limited to real posted lines - move this to see the "
+                                    "model's probability (if this stat has one) and his own "
+                                    "history clearing any number, not just the main line.")
+
+        pick_prob = model_prob_at(pick)
+        pick_hit = (games["value"] > pick).mean() * 100 if not games.empty else None
+        strip([(f"{pick_prob * 100:.0f}%" if pick_prob is not None else "–", f"model: over {pick:g}"),
+               (f"{pick_hit:.0f}%" if pick_hit is not None else "–", f"his rate, {split.lower()}"),
+               (len(games), f"games, {split.lower()}")])
+
+        st.divider()
+        if alt_market is None:
+            hint(f"The Odds API doesn't offer an alternate-line market for {stat_label.lower()} "
+                 "(true industrywide, not a gap in our pull), so there are no real posted lines "
+                 "to compare against beyond the main line above.")
+        else:
+            rows = alt_line_rows(odds, key, alt_market)
+            if rows.empty:
+                hint(f"No alternate {stat_label.lower()} lines saved yet for {name}. In the "
+                     "terminal, run: `python3 pull_props.py today --alt-lines`")
+            else:
+                table = rows.copy()
+                table["Line"] = table["line"]
+                table["Price"] = table["price_american"].map(fmt_price)
+                table["Book"] = table["bookmaker"].map(book)
+                table["Implied by price"] = table["price_american"].map(
+                    lambda p: f"{implied(p) * 100:.0f}%")
+                table["Model P(Over)"] = table["line"].map(
+                    lambda x: f"{model_prob_at(x) * 100:.0f}%" if model_prob_at(x) is not None else "–")
+                table["His hit rate"] = table["line"].map(
+                    lambda x: (f"{(games['value'] > x).mean() * 100:.0f}%"
+                              if not games.empty else "–"))
+                st.dataframe(table[["Line", "Price", "Book", "Implied by price",
+                                    "Model P(Over)", "His hit rate"]],
+                             hide_index=True, width="stretch")
+                hint("Real alternate lines, Over side only - books don't post an Under on alt "
+                     "lines, so \"implied by price\" is read straight off that one price with no "
+                     "de-vig against a missing Under. \"Model P(Over)\" and \"his hit rate\" are "
+                     "ours, not the market's, and are blank wherever there isn't enough data to "
+                     "support them.")
+
+
+def alt_line_rows(odds, player_key, market):
+    """Latest snapshot's best price per line for one player's alt-line market.
+
+    Alt-line markets only ever get the Over side posted (standard book practice, not a
+    gap in our pull) so there's no Under to no-vig against - "best" just means the
+    highest American-odds price, which is the better price for the bettor either way.
+    """
+    if not market:
+        return pd.DataFrame()
+    mine = odds[(odds["player"].map(box_scores.normalize_name) == player_key)
+                & (odds["market"] == market) & (odds["side"] == "Over")]
+    if mine.empty:
+        return pd.DataFrame()
+    newest = mine[mine["snapshot_time"] == mine["snapshot_time"].max()]
+    best = (newest.sort_values("price_american", ascending=False)
+            .groupby("line", as_index=False).first())
+    return best[["line", "price_american", "bookmaker"]].sort_values("line").reset_index(drop=True)
 
 
 def season_of(date):
