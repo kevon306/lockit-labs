@@ -5,9 +5,16 @@ auto.py  -  the jobs your Mac runs on its own (set up by setup_automation.sh).
   python3 auto.py snapshots capture odds before tipoff     (runs every 15 minutes)
 
 Snapshot timing (change in your .env file if you want):
-  CLOSE_SNAPSHOT=on      odds ~10-20 min before each tip      (3 credits per game)
-  EARLY_SNAPSHOT_HOURS=0 set to 3 to also grab odds 3 hrs out (3 more per game)
+  CLOSE_SNAPSHOT=on      odds ~10-20 min before each tip      (7 credits per game)
+  EARLY_SNAPSHOT_HOURS=0 set to 3 to also grab odds 3 hrs out (7 more per game)
   MIN_CREDITS=15         stop pulling when credits drop this low
+
+Pulls all 7 player markets every time (points/rebounds/assists plus threes/steals/
+blocks/turnovers) - turned on deliberately, not the original 3-market default, so this
+costs more than it used to (3 credits/game -> 7). At roughly 8-15 games/night that's
+~55-105 credits/night just for the close snapshot, against a 500/month free-plan cap -
+watch MIN_CREDITS and `python3 pull_props.py today` (free) to check your balance if a
+heavy week worries you.
 
 At the end of every snapshots run, if the database changed, it's committed and pushed
 to GitHub so the deployed Streamlit Cloud site reflects it (the site itself can't
@@ -90,7 +97,8 @@ def snapshots():
             log(f"{label} snapshot: {game} ({minutes_to_tip:.0f} min to tip)")
             try:
                 data = pp.call_api(f"/sports/{pp.SPORT}/events/{event['id']}/odds",
-                                   {"regions": pp.REGIONS, "markets": pp.MARKETS,
+                                   {"regions": pp.REGIONS,
+                                    "markets": f"{pp.MARKETS},{pp.EXTRA_MARKETS}",
                                     "oddsFormat": "american"})
             except SystemExit as e:
                 log(f"  failed: {e}")
