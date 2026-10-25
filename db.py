@@ -147,6 +147,31 @@ CREATE TABLE IF NOT EXISTS players (
     updated_at   TEXT
 );
 
+-- Real shot-location data from NBA.com's shot chart endpoint: for a team, what
+-- opponents shoot against them by zone (season cumulative, refreshed each pull); for
+-- a player, their own shots by zone. Not walk-forward/leakage-sensitive - descriptive
+-- season-to-date context for Why We Like It, the same way team_defense_allowed() in
+-- lockit_app.py already treats rebounds/assists/turnovers allowed.
+CREATE TABLE IF NOT EXISTS team_shot_zones (
+    team       TEXT NOT NULL,
+    season     TEXT NOT NULL,
+    zone       TEXT NOT NULL,   -- e.g. 'Restricted Area', 'Mid-Range', 'Above the Break 3'
+    fga        INTEGER,
+    fgm        INTEGER,
+    pulled_at  TEXT,
+    PRIMARY KEY (team, season, zone)
+);
+
+CREATE TABLE IF NOT EXISTS player_shot_zones (
+    player_id  TEXT NOT NULL,
+    season     TEXT NOT NULL,
+    zone       TEXT NOT NULL,
+    fga        INTEGER,
+    fgm        INTEGER,
+    pulled_at  TEXT,
+    PRIMARY KEY (player_id, season, zone)
+);
+
 CREATE TABLE IF NOT EXISTS predictions (
     id               INTEGER PRIMARY KEY,
     created_at       TEXT NOT NULL,

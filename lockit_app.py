@@ -826,13 +826,14 @@ GLOSSARY = {
                         "compared fairly.",
     "defensive rating": "Points allowed per 100 possessions - the defensive version "
                         "of offensive rating, same pace adjustment.",
-    "three-point rate": "The share of a player's shot attempts that come from three-"
-                        "point range, a real proxy for 'shooter' since box scores "
-                        "don't record whether a shot was a catch-and-shoot, pull-up, "
-                        "drive, or post-up.",
-    "free-throw rate": "Free throw attempts per field goal attempt - a proxy for how "
-                       "often a player draws contact and gets to the line, since shot "
-                       "location (rim vs. mid-range vs. three) isn't in a box score.",
+    "shot zone": "Where on the floor a shot was taken from (restricted area, mid-"
+                "range, corner three, above-the-break three) - real shot-location data "
+                "from NBA.com, not a derived proxy.",
+    "rim protection": "How well a defense prevents or contests shots close to the "
+                      "basket, measured here by real field-goal percentage allowed at "
+                      "the rim.",
+    "free-throw rate": "Free throw attempts per field goal attempt - a real signal of "
+                       "how often a player draws contact and gets to the line.",
     "offensive rebound": "A rebound of your own team's missed shot, keeping the "
                          "possession alive for another shot.",
     "defensive rebound": "A rebound of the opponent's missed shot, ending their "
@@ -886,17 +887,54 @@ def team_ratings_now(box):
 
 
 def shot_profile(pbox):
-    """A player's real, derivable shot-selection signals: three-point rate and free-
-    throw rate. Box scores don't record shot location or play type (drives, pull-ups,
-    post-ups aren't available), so these are the closest real proxies - a high three-
-    point rate means a perimeter shooter, a high free-throw rate means someone who
-    draws contact and gets to the rim."""
-    fga, fg3a, fta = pbox["fga"].sum(), pbox["fg3a"].sum(), pbox["fta"].sum()
-    return {
-        "three_rate": fg3a / fga if fga else None,
-        "ft_rate": fta / fga if fga else None,
-        "three_pct": pbox["fg3m"].sum() / fg3a if fg3a else None,
-    }
+    """A player's free-throw rate: shots drawn fouls per field-goal attempt, a real
+    proxy for how often he gets to the rim or draws contact, since shot location isn't
+    otherwise in a plain box score. (Shot-selection by zone - restricted area, mid-
+    range, three - now comes from real NBA.com shot-chart data; see zone_summary().)"""
+    fga, fta = pbox["fga"].sum(), pbox["fta"].sum()
+    return {"ft_rate": fta / fga if fga else None}
+
+
+RIM_ZONES = {"Restricted Area", "In The Paint (Non-RA)"}
+THREE_ZONES = {"Above the Break 3", "Left Corner 3", "Right Corner 3"}
+
+
+def zone_summary(zones_df, id_col, entity_id):
+    """Real shot-zone shares and FG% for one team or player, from NBA.com's own shot
+    chart data (box_scores.py's pull-shot-zones command) - not derived or guessed."""
+    sub = zones_df[zones_df[id_col] == entity_id]
+    total = sub["fga"].sum()
+    if sub.empty or not total:
+        return None
+    rim = sub[sub["zone"].isin(RIM_ZONES)]
+    mid = sub[sub["zone"] == "Mid-Range"]
+    three = sub[sub["zone"].isin(THREE_ZONES)]
+
+    def pct(s):
+        return s["fgm"].sum() / s["fga"].sum() if s["fga"].sum() else None
+
+    return {"total_fga": total, "rim_share": rim["fga"].sum() / total, "rim_pct": pct(rim),
+           "mid_share": mid["fga"].sum() / total, "mid_pct": pct(mid),
+           "three_share": three["fga"].sum() / total, "three_pct": pct(three)}
+
+
+def league_zone_summary(team_zones):
+    """League-wide shot-zone shares and FG% allowed, pooled across every team's real
+    numbers - the comparison baseline for 'does this opponent protect the rim' or
+    'does this opponent give up open threes'."""
+    if team_zones.empty:
+        return None
+    total = team_zones["fga"].sum()
+    rim = team_zones[team_zones["zone"].isin(RIM_ZONES)]
+    mid = team_zones[team_zones["zone"] == "Mid-Range"]
+    three = team_zones[team_zones["zone"].isin(THREE_ZONES)]
+
+    def pct(s):
+        return s["fgm"].sum() / s["fga"].sum() if s["fga"].sum() else None
+
+    return {"rim_share": rim["fga"].sum() / total, "rim_pct": pct(rim),
+           "mid_share": mid["fga"].sum() / total, "mid_pct": pct(mid),
+           "three_share": three["fga"].sum() / total, "three_pct": pct(three)}
 
 
 def assessment_tier(confidence, support, oppose):
@@ -1106,12 +1144,22 @@ def _supports(value, league, sign, direction):
     return (value - league) * sign * direction > 0
 
 
-def player_why_html(r, box_keyed, team_ratings, defense_allowed):
+def _zone_text(label, share, pct):
+    if not share:
+        return f"basically no {label} attempts"
+    pct_txt = f", making {pct*100:.0f}%" if pct is not None else ""
+    return f"{share*100:.0f}% {label}{pct_txt}"
+
+
+def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, team_zones):
     """The 'Why we like it' panel for a player-prop pick: real basketball reasoning
     from this player's own game log, his team's and the opponent's current ratings,
-    and the opponent's real season-to-date defensive numbers. No individual defender
-    assignments or coverage schemes (drop/switch/trap) - box scores don't carry that
-    data, and inventing it would violate the project's own no-fabrication rule."""
+    the opponent's real season-to-date defensive numbers, and (for points) real shot-
+    location data from NBA.com's own shot chart - rim/mid-range/three shares and FG%,
+    both his own shot profile and the opponent's real rim-protection and perimeter-
+    defense numbers. No individual defender assignments or coverage schemes (drop/
+    switch/trap) - box scores and shot charts don't carry that data, and inventing it
+    would violate the project's own no-fabrication rule."""
     stat = r.stat
     mean = getattr(r, f"{stat}_mean_hat")
     var = getattr(r, f"{stat}_var_hat")
@@ -1158,24 +1206,59 @@ def player_why_html(r, box_keyed, team_ratings, defense_allowed):
                            f"10 vs {season_min:.0f} on the season), supporting more chances "
                            f"at {stat_lower}.")
 
-    if stat == "points" and prof.get("three_rate") is not None:
-        if prof["three_rate"] > 0.4:
-            breakdown.append(f"About {prof['three_rate']*100:.0f}% of his shots are threes"
-                             + (f" (making {prof['three_pct']*100:.0f}% of them)"
-                                if prof.get("three_pct") is not None else "")
-                             + ", so his scoring leans heavily on the perimeter.")
-        else:
-            breakdown.append(f"Only about {prof['three_rate']*100:.0f}% of his shots are "
-                             "threes, so most of his scoring comes from two-point range.")
+    pzone = zone_summary(player_zones, "player_id", r.player_id) if stat == "points" else None
+    ozone = zone_summary(team_zones, "team", r.opponent) if stat == "points" else None
+    lzone = league_zone_summary(team_zones) if stat == "points" else None
+
+    if stat == "points" and pzone is not None:
+        breakdown.append("His real shot mix this season (from NBA.com's own shot-location "
+                         f"data): {_zone_text('at the rim', pzone['rim_share'], pzone['rim_pct'])}, "
+                         f"{_zone_text('mid-range', pzone['mid_share'], pzone['mid_pct'])}, "
+                         f"{_zone_text('from three', pzone['three_share'], pzone['three_pct'])}.")
         if prof.get("ft_rate") is not None and prof["ft_rate"] > 0.25:
             ft_note = (f"He draws real contact - {prof['ft_rate']:.2f} free-throw attempts "
-                      "per field-goal attempt is an above-average rate, a sign he gets to "
-                      "the rim or draws shooting fouls often."
+                      "per field-goal attempt is an above-average rate, on top of his real "
+                      "shot profile above."
                       if direction == 1 else
                       f"He draws real contact ({prof['ft_rate']:.2f} free-throw attempts per "
                       "field-goal attempt), which usually supports more scoring, not less - "
                       "a real factor working against this Under.")
             (support if direction == 1 else oppose).append(ft_note)
+        if ozone is not None and lzone is not None:
+            if ozone["rim_pct"] is not None and lzone["rim_pct"] is not None:
+                cmp_word = "worse" if ozone["rim_pct"] > lzone["rim_pct"] else "better"
+                breakdown.append(f"At the rim, {escape(str(r.opponent))} allows "
+                                 f"{ozone['rim_pct']*100:.0f}% shooting, {cmp_word} than the "
+                                 f"league average of {lzone['rim_pct']*100:.0f}% - "
+                                 f"{'weak' if cmp_word == 'worse' else 'strong'} rim protection, "
+                                 "from real shot-location data.")
+                ok = _supports(ozone["rim_pct"], lzone["rim_pct"], 1, direction)
+                (support if ok else oppose).append(
+                    f"{escape(str(r.opponent))} allows {ozone['rim_pct']*100:.0f}% shooting at "
+                    f"the rim, {cmp_word} than the league average "
+                    f"({lzone['rim_pct']*100:.0f}%) - real {'weak' if ok else 'strong'} rim "
+                    "protection.")
+                key_candidates.append(("rim defense", abs(ozone["rim_pct"] - lzone["rim_pct"]),
+                                       f"{escape(str(r.opponent))}'s rim field-goal percentage "
+                                       f"allowed ({ozone['rim_pct']*100:.0f}%) vs. the league "
+                                       f"average ({lzone['rim_pct']*100:.0f}%)"))
+            if ozone["three_pct"] is not None and lzone["three_pct"] is not None:
+                cmp_word2 = "worse" if ozone["three_pct"] > lzone["three_pct"] else "better"
+                ok2 = _supports(ozone["three_pct"], lzone["three_pct"], 1, direction)
+                (support if ok2 else oppose).append(
+                    f"{escape(str(r.opponent))} allows {ozone['three_pct']*100:.0f}% shooting "
+                    f"from three, {cmp_word2} than the league average "
+                    f"({lzone['three_pct']*100:.0f}%) - real perimeter-defense signal from "
+                    "shot-location data, not just points allowed.")
+    elif stat == "points" and prof.get("ft_rate") is not None and prof["ft_rate"] > 0.25:
+        ft_note = (f"He draws real contact - {prof['ft_rate']:.2f} free-throw attempts per "
+                  "field-goal attempt is an above-average rate, a sign he gets to the rim or "
+                  "draws shooting fouls often."
+                  if direction == 1 else
+                  f"He draws real contact ({prof['ft_rate']:.2f} free-throw attempts per "
+                  "field-goal attempt), which usually supports more scoring, not less - a "
+                  "real factor working against this Under.")
+        (support if direction == 1 else oppose).append(ft_note)
 
     if opp_row is not None and league_def is not None:
         cmp_word = "worse" if opp_row.def_rtg_hat > league_def else "better"
@@ -1270,7 +1353,7 @@ def player_why_html(r, box_keyed, team_ratings, defense_allowed):
 
     terms = ["pace", "offensive rating", "defensive rating", "no-vig probability", "blowout risk"]
     if stat == "points":
-        terms += ["three-point rate", "free-throw rate"]
+        terms += ["shot zone", "rim protection", "free-throw rate"]
     if stat == "rebounds":
         terms += ["offensive rebound", "defensive rebound"]
     if stat == "assists":
@@ -1296,11 +1379,12 @@ def player_why_html(r, box_keyed, team_ratings, defense_allowed):
         f'{glossary_html(terms)}')
 
 
-def game_why_html(r, defense_allowed):
+def game_why_html(r, defense_allowed, team_zones):
     """The 'Why we like it' panel for a spread/total/moneyline pick: real team-level
-    basketball reasoning from both teams' current ratings and real rebounding/turnover
-    numbers. No coaching adjustments or individual defensive assignments - not in this
-    data, so not invented."""
+    basketball reasoning from both teams' current ratings, real rebounding/turnover
+    numbers, and real rim-protection/perimeter-defense numbers from NBA.com's own
+    shot-location data. No coaching adjustments or individual defensive assignments -
+    not in this data, so not invented."""
     is_total = r.market == "totals"
     center, unit = (r.total, "total points") if is_total else (
         r.margin, f"margin ({r.home_abbr} minus {r.away_abbr})")
@@ -1309,6 +1393,9 @@ def game_why_html(r, defense_allowed):
     home_def = defense_allowed.loc[r.home_abbr] if r.home_abbr in defense_allowed.index else None
     away_def = defense_allowed.loc[r.away_abbr] if r.away_abbr in defense_allowed.index else None
     league = defense_allowed.mean() if not defense_allowed.empty else None
+    home_zone = zone_summary(team_zones, "team", r.home_abbr)
+    away_zone = zone_summary(team_zones, "team", r.away_abbr)
+    lzone = league_zone_summary(team_zones) if not team_zones.empty else None
 
     support, oppose, key_candidates = [], [], []
     breakdown = [escape(r.note)]
@@ -1343,6 +1430,25 @@ def game_why_html(r, defense_allowed):
                 f"league average ({league.tov_forced:.1f}) - more live-ball turnovers can mean "
                 "extra transition points, but fewer clean possessions overall tends to mean "
                 f"fewer total points, which {'supports' if ok_tov else 'works against'} this side.")
+        if (home_zone is not None and away_zone is not None and lzone is not None
+                and home_zone["rim_pct"] is not None and away_zone["rim_pct"] is not None):
+            combined_rim = (home_zone["rim_pct"] + away_zone["rim_pct"]) / 2
+            cmp_word = "above" if combined_rim > lzone["rim_pct"] else "below"
+            ok_rim = _supports(combined_rim, lzone["rim_pct"], 1, direction)
+            (support if ok_rim else oppose).append(
+                f"Combined rim field-goal percentage allowed ({combined_rim*100:.0f}%) is "
+                f"{cmp_word} the league average ({lzone['rim_pct']*100:.0f}%) - real rim-"
+                "protection signal from shot-location data, "
+                f"{'favoring' if ok_rim else 'working against'} more scoring.")
+        if (home_zone is not None and away_zone is not None and lzone is not None
+                and home_zone["three_pct"] is not None and away_zone["three_pct"] is not None):
+            combined_three = (home_zone["three_pct"] + away_zone["three_pct"]) / 2
+            cmp_word2 = "above" if combined_three > lzone["three_pct"] else "below"
+            ok_three = _supports(combined_three, lzone["three_pct"], 1, direction)
+            (support if ok_three else oppose).append(
+                f"Combined three-point percentage allowed ({combined_three*100:.0f}%) is "
+                f"{cmp_word2} the league average ({lzone['three_pct']*100:.0f}%) - real "
+                "perimeter-defense signal from shot-location data.")
     else:
         picked_abbr = r.side
         is_home_pick = (picked_abbr == r.home_abbr)
@@ -1385,6 +1491,23 @@ def game_why_html(r, defense_allowed):
                 f"{'above' if ok else 'at or below'} the league average of "
                 f"{league.reb_allowed:.1f} - "
                 f"{'extra second-chance opportunities for ' + escape(picked_abbr) if ok else 'not an obvious rebounding edge in this matchup'}.")
+        opp_zone = away_zone if is_home_pick else home_zone
+        if opp_zone is not None and lzone is not None:
+            if opp_zone["rim_pct"] is not None and lzone["rim_pct"] is not None:
+                ok = opp_zone["rim_pct"] > lzone["rim_pct"]
+                (support if ok else oppose).append(
+                    f"{escape(opp_abbr)} allows {opp_zone['rim_pct']*100:.0f}% shooting at "
+                    f"the rim, {'above' if ok else 'at or below'} the league average "
+                    f"({lzone['rim_pct']*100:.0f}%) - real "
+                    f"{'weak' if ok else 'strong'} rim protection"
+                    f"{' for ' + escape(picked_abbr) + ' to target' if ok else ''}.")
+            if opp_zone["three_pct"] is not None and lzone["three_pct"] is not None:
+                ok2 = opp_zone["three_pct"] > lzone["three_pct"]
+                (support if ok2 else oppose).append(
+                    f"{escape(opp_abbr)} allows {opp_zone['three_pct']*100:.0f}% shooting "
+                    f"from three, {'above' if ok2 else 'at or below'} the league average "
+                    f"({lzone['three_pct']*100:.0f}%) - real perimeter-defense signal from "
+                    "shot-location data.")
 
     caveats = ["The model has no visibility into injury reports, trades, rest decisions, "
               "lineup changes, or coaching adjustments a sportsbook already knows about - "
@@ -1404,7 +1527,7 @@ def game_why_html(r, defense_allowed):
                  "rather than a blowout that changes rotations.")
 
     terms = ["pace", "offensive rating", "defensive rating", "no-vig probability",
-            "turnovers forced", "blowout risk"]
+            "turnovers forced", "blowout risk", "shot zone", "rim protection"]
 
     return (
         f'<p><b>A. The basketball breakdown.</b> {" ".join(breakdown)}</p>'
@@ -1511,6 +1634,8 @@ def page_top_picks():
     box_keyed = box.assign(key=box["player_name"].map(box_scores.normalize_name)).sort_values("game_date")
     team_ratings = team_ratings_now(box)
     defense_allowed = team_defense_allowed(box)
+    player_zones = load("player_shot_zones")
+    team_zones = load("team_shot_zones")
 
     def render_pick_card(r, label):
         line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
@@ -1540,8 +1665,10 @@ def page_top_picks():
             f'{r.model_p:.0f}%, a gap of {r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
             f'</div>', unsafe_allow_html=True)
         with st.expander("Why we like it"):
-            why_html = (player_why_html(r, box_keyed, team_ratings, defense_allowed)
-                       if r.kind == "player" else game_why_html(r, defense_allowed))
+            why_html = (player_why_html(r, box_keyed, team_ratings, defense_allowed,
+                                       player_zones, team_zones)
+                       if r.kind == "player" else
+                       game_why_html(r, defense_allowed, team_zones))
             st.markdown(why_html, unsafe_allow_html=True)
 
     for rank, r in enumerate(qualifying.itertuples(), 1):

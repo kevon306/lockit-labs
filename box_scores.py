@@ -11,6 +11,8 @@ Commands:
   python3 box_scores.py pull-periods --limit 50    just the next 50 games (good for testing)
   python3 box_scores.py pull-props                 first-basket/first-to-10 props for saved games
   python3 box_scores.py pull-props --limit 50      just the next 50 games (good for testing)
+  python3 box_scores.py pull-shot-zones            real shot-location data (team defense + player profiles)
+  python3 box_scores.py pull-shot-zones --limit 50 just the next 50 players (good for testing)
 
 Must run from your own computer: NBA.com blocks requests from cloud servers.
 """
@@ -409,6 +411,119 @@ def cmd_pull_props(season, limit):
               "Run this command again to pick up where it left off.")
 
 
+def fetch_team_shot_zones(team_id, season):
+    """Every shot taken AGAINST this team all season, by zone - NBA.com's shot chart
+    endpoint returns season-cumulative totals in one call, not per-game, so this is
+    far cheaper than pull-periods/pull-props."""
+    from nba_api.stats.endpoints import shotchartdetail
+    for attempt in range(2):
+        try:
+            return shotchartdetail.ShotChartDetail(
+                team_id=0, player_id=0, season_nullable=season,
+                season_type_all_star="Regular Season", context_measure_simple="FGA",
+                opponent_team_id=team_id, timeout=60).get_data_frames()[0]
+        except Exception:
+            if attempt == 0:
+                time.sleep(2)
+    return None
+
+
+def fetch_player_shot_zones(player_id, season):
+    """Every shot this player has taken all season, by zone."""
+    from nba_api.stats.endpoints import shotchartdetail
+    for attempt in range(2):
+        try:
+            return shotchartdetail.ShotChartDetail(
+                team_id=0, player_id=player_id, season_nullable=season,
+                season_type_all_star="Regular Season", context_measure_simple="FGA",
+                timeout=60).get_data_frames()[0]
+        except Exception:
+            if attempt == 0:
+                time.sleep(2)
+    return None
+
+
+def zone_counts(shots_df):
+    """Raw shot rows -> one row per zone with FGA/FGM."""
+    if shots_df is None or shots_df.empty:
+        return pd.DataFrame(columns=["zone", "fga", "fgm"])
+    g = shots_df.groupby("SHOT_ZONE_BASIC").agg(
+        fga=("SHOT_MADE_FLAG", "size"), fgm=("SHOT_MADE_FLAG", "sum")).reset_index()
+    return g.rename(columns={"SHOT_ZONE_BASIC": "zone"})
+
+
+def cmd_pull_shot_zones(season, limit):
+    """Real shot-location data: for every team, what opponents shoot against them by
+    zone (Restricted Area, Paint, Mid-Range, Corner 3, Above-the-Break 3); for every
+    player with a saved box score this season, their own shot zones.
+
+    Team numbers are cheap (30 calls total) and refresh every run. Player numbers are
+    pulled once per player per season and NOT automatically refreshed - a player
+    already in the table is skipped, so re-run this periodically if you want returning
+    players' zone splits to reflect their most recent games, or clear player_shot_zones
+    for this season first to force a full refresh.
+    """
+    from nba_api.stats.static import teams as static_teams
+
+    print(f"Pulling team shot zones for {season} (30 teams, refreshed every run)...")
+    team_rows, ok = [], 0
+    for t in static_teams.get_teams():
+        df = fetch_team_shot_zones(t["id"], season)
+        time.sleep(0.6)
+        if df is None:
+            print(f"  Skipped {t['abbreviation']}: NBA.com didn't respond")
+            continue
+        for z in zone_counts(df).itertuples():
+            team_rows.append((t["abbreviation"], season, z.zone, int(z.fga), int(z.fgm), db.now_utc()))
+        ok += 1
+    with db.connect() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO team_shot_zones (team, season, zone, fga, fgm, pulled_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)", team_rows)
+    print(f"Saved team shot zones for {ok}/30 teams.")
+
+    start_year = int(season.split("-")[0])
+    date_from, date_to = f"{start_year}-10-01", f"{start_year + 1}-06-30"
+    with db.connect() as conn:
+        players = pd.read_sql(
+            "SELECT DISTINCT player_id, player_name FROM box_scores "
+            "WHERE game_date BETWEEN ? AND ? ORDER BY player_name", conn, params=(date_from, date_to))
+        done = pd.read_sql("SELECT DISTINCT player_id FROM player_shot_zones WHERE season = ?",
+                           conn, params=(season,))
+    todo = players[~players["player_id"].isin(done["player_id"])]
+    if limit:
+        todo = todo.head(limit)
+    if todo.empty:
+        print("Every player with a saved box score this season already has shot-zone data.")
+        return
+
+    print(f"Pulling shot zones for {len(todo)} players ({season}). "
+          "One call per player, season-cumulative, so this is much faster than "
+          "pull-periods/pull-props but still one at a time.")
+    saved, skipped, buffer = 0, 0, []
+    for i, p in enumerate(todo.itertuples(), 1):
+        df = fetch_player_shot_zones(p.player_id, season)
+        time.sleep(0.6)
+        if df is None:
+            skipped += 1
+        else:
+            for z in zone_counts(df).itertuples():
+                buffer.append((p.player_id, season, z.zone, int(z.fga), int(z.fgm), db.now_utc()))
+            saved += 1
+        if i % 25 == 0 or i == len(todo):
+            with db.connect() as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO player_shot_zones (player_id, season, zone, fga, fgm, pulled_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)", buffer)
+            buffer = []
+            print(f"  {i}/{len(todo)} players checked, {saved} saved, {skipped} skipped")
+
+    print(f"\nDone. Saved shot zones for {saved} players.")
+    if skipped:
+        print(f"Skipped {skipped} players NBA.com didn't respond for. "
+              "Run this command again to pick up where it left off.")
+
+
 def grade_lines():
     """Return every saved prop line with its result. Used by the grade command and the dashboard."""
     with db.connect() as conn:
@@ -496,6 +611,9 @@ if __name__ == "__main__":
     pr = sub.add_parser("pull-props", help="pull first-basket/first-to-10 props for saved games")
     pr.add_argument("--season", default=current_season(), help="like 2025-26")
     pr.add_argument("--limit", type=int, default=None, help="only pull this many games")
+    ps = sub.add_parser("pull-shot-zones", help="pull real shot-location data (team defense + player profiles)")
+    ps.add_argument("--season", default=current_season(), help="like 2025-26")
+    ps.add_argument("--limit", type=int, default=None, help="only pull this many players")
     args = parser.parse_args()
 
     if args.mode == "pull":
@@ -512,5 +630,9 @@ if __name__ == "__main__":
         if not re.fullmatch(r"\d{4}-\d{2}", args.season):
             sys.exit("Season must look like 2025-26")
         cmd_pull_props(args.season, args.limit)
+    elif args.mode == "pull-shot-zones":
+        if not re.fullmatch(r"\d{4}-\d{2}", args.season):
+            sys.exit("Season must look like 2025-26")
+        cmd_pull_shot_zones(args.season, args.limit)
     else:
         cmd_grade()
