@@ -30,7 +30,12 @@ import db
 
 load_dotenv()
 
-MODEL = os.getenv("AI_ANALYST_MODEL", "claude-sonnet-5")
+MODEL = os.getenv("AI_ANALYST_MODEL", "claude-haiku-4-5-20251001")  # cost-conscious
+                         # default - still genuinely capable at tool-calling and
+                         # research-style reasoning, at roughly a quarter of Sonnet's
+                         # price. Set AI_ANALYST_MODEL=claude-sonnet-5 for more depth
+                         # on harder questions, at a real cost increase - see the
+                         # pricing table below for the actual numbers.
 DAILY_LIMIT = int(os.getenv("AI_ANALYST_DAILY_LIMIT", "200"))
 MAX_TOOL_ROUNDS = 6      # a single reply can chain at most this many tool calls before
                          # being forced to answer, so one odd request can't loop forever
@@ -184,6 +189,17 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}, "required": []}},
 ]
 
+# Prompt caching: the system prompt and tool definitions above are large, static, and
+# sent on every single API call (every tool-loop round, every turn of every
+# conversation). Marking the end of each with cache_control lets Anthropic cache that
+# whole prefix for ~5 minutes - a cached read costs 10% of normal input price instead
+# of 100%, which matters a lot here since most of a typical call's input tokens are
+# this fixed prefix, not the actual conversation. See _estimate_cost() for the real
+# cost math, including the one-time write cost (1.25x) the first call pays.
+SYSTEM_BLOCKS = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
+CACHED_TOOLS = [dict(t) for t in TOOLS]
+CACHED_TOOLS[-1] = {**CACHED_TOOLS[-1], "cache_control": {"type": "ephemeral"}}
+
 TOOL_FUNCS = {
     "search_player": lambda **kw: ai_tools.search_player(kw["query"]),
     "player_profile": lambda **kw: ai_tools.player_profile(kw["player_name"]),
@@ -201,12 +217,18 @@ TOOL_FUNCS = {
 }
 
 
-def _estimate_cost(tokens_in, tokens_out):
+def _estimate_cost(tokens_in, tokens_out, cache_write=0, cache_read=0):
+    """Real blended cost, accounting for prompt caching: a cache write costs 1.25x
+    normal input price (paid once, the first call), a cache read costs 0.1x (paid on
+    every call after that within the ~5 min cache window)."""
     rates = PRICING_PER_MTOK.get(MODEL)
     if not rates:
         return None
     in_rate, out_rate = rates
-    return round(tokens_in / 1_000_000 * in_rate + tokens_out / 1_000_000 * out_rate, 6)
+    cost = (tokens_in / 1_000_000 * in_rate + tokens_out / 1_000_000 * out_rate
+           + cache_write / 1_000_000 * in_rate * 1.25
+           + cache_read / 1_000_000 * in_rate * 0.1)
+    return round(cost, 6)
 
 
 def _call_with_retry(client, convo):
@@ -215,8 +237,8 @@ def _call_with_retry(client, convo):
     for attempt in range(MAX_RETRIES):
         try:
             return client.messages.create(
-                model=MODEL, max_tokens=1500, system=SYSTEM_PROMPT,
-                tools=TOOLS, messages=convo)
+                model=MODEL, max_tokens=1500, system=SYSTEM_BLOCKS,
+                tools=CACHED_TOOLS, messages=convo)
         except anthropic.APIStatusError as e:
             if e.status_code in (401, 403):
                 raise  # a bad/missing credential - retrying changes nothing
@@ -252,7 +274,7 @@ def call_analyst(messages, conversation_id=None, user_id="owner"):
 
     convo = [{"role": m["role"], "content": m["content"]} for m in messages]
     tool_calls_made = []
-    total_in = total_out = 0
+    total_in = total_out = total_cache_write = total_cache_read = 0
 
     for _ in range(MAX_TOOL_ROUNDS):
         try:
@@ -265,12 +287,15 @@ def call_analyst(messages, conversation_id=None, user_id="owner"):
 
         total_in += resp.usage.input_tokens
         total_out += resp.usage.output_tokens
+        total_cache_write += getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
+        total_cache_read += getattr(resp.usage, "cache_read_input_tokens", 0) or 0
 
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
         if not tool_uses:
             text = "".join(b.text for b in resp.content if b.type == "text")
-            db.log_ai_usage(user_id, conversation_id, MODEL, total_in, total_out,
-                            _estimate_cost(total_in, total_out))
+            cost = _estimate_cost(total_in, total_out, total_cache_write, total_cache_read)
+            db.log_ai_usage(user_id, conversation_id, MODEL,
+                            total_in + total_cache_write + total_cache_read, total_out, cost)
             return text, tool_calls_made, total_in, total_out
 
         convo.append({"role": "assistant", "content": resp.content})
@@ -289,16 +314,19 @@ def call_analyst(messages, conversation_id=None, user_id="owner"):
     # Hit MAX_TOOL_ROUNDS without a final answer - force one more call with no tools
     # available so the user gets an actual reply instead of silence.
     try:
-        resp = client.messages.create(model=MODEL, max_tokens=1500, system=SYSTEM_PROMPT,
+        resp = client.messages.create(model=MODEL, max_tokens=1500, system=SYSTEM_BLOCKS,
                                       messages=convo)
         total_in += resp.usage.input_tokens
         total_out += resp.usage.output_tokens
+        total_cache_write += getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
+        total_cache_read += getattr(resp.usage, "cache_read_input_tokens", 0) or 0
         text = "".join(b.text for b in resp.content if b.type == "text")
     except Exception:
         text = ("I gathered a lot of information on this but ran out of room to finish "
                "the analysis cleanly - try asking a narrower follow-up question.")
-    db.log_ai_usage(user_id, conversation_id, MODEL, total_in, total_out,
-                    _estimate_cost(total_in, total_out))
+    cost = _estimate_cost(total_in, total_out, total_cache_write, total_cache_read)
+    db.log_ai_usage(user_id, conversation_id, MODEL,
+                    total_in + total_cache_write + total_cache_read, total_out, cost)
     return text, tool_calls_made, total_in, total_out
 
 
