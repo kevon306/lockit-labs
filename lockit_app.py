@@ -818,6 +818,112 @@ def resolve_player_odds(odds, box):
     return o.dropna(subset=["player_id"])
 
 
+GLOSSARY = {
+    "pace": "How many possessions a team plays per game. A faster pace means more "
+            "shots and more scoring chances for both teams, not just the favorite.",
+    "offensive rating": "Points scored per 100 possessions - a pace-adjusted measure "
+                        "of offense, so a fast bad team and a slow good team can be "
+                        "compared fairly.",
+    "defensive rating": "Points allowed per 100 possessions - the defensive version "
+                        "of offensive rating, same pace adjustment.",
+    "three-point rate": "The share of a player's shot attempts that come from three-"
+                        "point range, a real proxy for 'shooter' since box scores "
+                        "don't record whether a shot was a catch-and-shoot, pull-up, "
+                        "drive, or post-up.",
+    "free-throw rate": "Free throw attempts per field goal attempt - a proxy for how "
+                       "often a player draws contact and gets to the line, since shot "
+                       "location (rim vs. mid-range vs. three) isn't in a box score.",
+    "offensive rebound": "A rebound of your own team's missed shot, keeping the "
+                         "possession alive for another shot.",
+    "defensive rebound": "A rebound of the opponent's missed shot, ending their "
+                         "possession.",
+    "turnovers forced": "How many times per game a team's opponents give the ball "
+                        "away against them - a real signal for ball-pressure defense, "
+                        "not the same as steals alone.",
+    "no-vig probability": "The betting market's own implied probability with the "
+                          "bookmaker's built-in profit margin mathematically removed.",
+    "blowout risk": "The chance a game gets out of hand, leading a team to rest its "
+                    "normal rotation and cut into a player's usual playing time late.",
+}
+
+
+def glossary_html(terms):
+    rows = "".join(f'<p class="hint" style="margin:.2rem 0;"><b>{escape(t)}:</b> '
+                   f'{escape(GLOSSARY[t])}</p>' for t in terms if t in GLOSSARY)
+    if not rows:
+        return ""
+    return (f'<details style="margin-top:.5rem;"><summary class="hint" '
+           f'style="cursor:pointer;">Basketball terms used here</summary>{rows}</details>')
+
+
+def team_defense_allowed(box):
+    """Per team, this season's real per-game averages of what opponents have scored/
+    grabbed/forced against them (rebounds, assists, three-pointers, turnovers forced).
+    Descriptive context for Why We Like It, not a model input - computed from the full
+    season to date since this is 'what has this defense actually allowed', not a
+    leakage-sensitive projection. A team's own box-score rows carry its opponent's
+    identity in the 'opponent' column, so grouping by that column and summing per game
+    gives exactly what that opponent allowed that game."""
+    g = box.groupby(["game_id", "opponent"]).agg(
+        reb=("rebounds", "sum"), oreb=("oreb", "sum"), dreb=("dreb", "sum"),
+        ast=("assists", "sum"), fg3m=("fg3m", "sum"), fg3a=("fg3a", "sum"),
+        tov=("turnovers", "sum")).reset_index()
+    per_team = g.groupby("opponent").agg(
+        games=("game_id", "nunique"), reb_allowed=("reb", "mean"),
+        oreb_allowed=("oreb", "mean"), dreb_allowed=("dreb", "mean"),
+        ast_allowed=("ast", "mean"), fg3m_allowed=("fg3m", "mean"),
+        fg3a_allowed=("fg3a", "mean"), tov_forced=("tov", "mean"))
+    return per_team
+
+
+def team_ratings_now(box):
+    """Each team's current blended offensive/defensive rating and pace - the exact
+    numbers team_model.py uses to project tonight's games, looked up directly per team
+    instead of per matchup."""
+    tg = team_model.add_team_ratings(team_model.team_games(box))
+    return tg.sort_values("game_date").groupby("team").last()[
+        ["off_rtg_hat", "def_rtg_hat", "pace_hat", "games_before"]]
+
+
+def shot_profile(pbox):
+    """A player's real, derivable shot-selection signals: three-point rate and free-
+    throw rate. Box scores don't record shot location or play type (drives, pull-ups,
+    post-ups aren't available), so these are the closest real proxies - a high three-
+    point rate means a perimeter shooter, a high free-throw rate means someone who
+    draws contact and gets to the rim."""
+    fga, fg3a, fta = pbox["fga"].sum(), pbox["fg3a"].sum(), pbox["fta"].sum()
+    return {
+        "three_rate": fg3a / fga if fga else None,
+        "ft_rate": fta / fga if fga else None,
+        "three_pct": pbox["fg3m"].sum() / fg3a if fg3a else None,
+    }
+
+
+def assessment_tier(confidence, support, oppose):
+    """One of five plain-English verdicts, from real signals only: the backtest-gated
+    confidence label plus how many real basketball factors line up with the pick
+    (support) vs against it (oppose). Never implies a guaranteed result, and never
+    claims more certainty than the data backs up."""
+    if confidence == "Low":
+        return ("Insufficient data",
+                "not enough track record yet to trust the projection on its own.")
+    if oppose > support:
+        return ("Mixed matchup",
+                "at least as many real factors cut against this pick as for it.")
+    if confidence == "High" and support >= 2 and oppose == 0:
+        return ("Strong supporting matchup",
+                "a backtested edge in this market, plus real basketball factors "
+                "pointing the same way, with nothing real pulling the other way.")
+    if support >= 1:
+        return ("Favorable matchup, but meaningful risks",
+                "real factors favor the pick, but at least one real risk (sample "
+                "size, a model blind spot, or an opposing factor) keeps this short "
+                "of a strong case.")
+    return ("Mixed matchup",
+            "the edge is real, but no single basketball factor stands out as the "
+            "clear driver either way.")
+
+
 def decimal_odds(price):
     return 1 + price / 100 if price > 0 else 1 + 100 / abs(price)
 
@@ -992,82 +1098,332 @@ def compute_game_picks(box, game_odds, game_bt=None):
     return pd.DataFrame(rows), game_odds["snapshot_time"].max()
 
 
-def player_why_html(r, box_keyed):
-    """The 'Why we like it' panel for a player-prop pick, built entirely from numbers
-    already computed for this row plus this player's own saved game log - no new
-    narrative content, just the model's real inputs laid out."""
-    mean = getattr(r, f"{r.stat}_mean_hat")
-    var = getattr(r, f"{r.stat}_var_hat")
+def _supports(value, league, sign, direction):
+    """True if a real stat vs. its league average pushes toward the picked side. sign
+    is +1 if a higher value of this stat helps the Over (e.g. more rebounds allowed),
+    -1 if it hurts it (e.g. more turnovers forced). direction is +1 for an Over pick,
+    -1 for an Under pick."""
+    return (value - league) * sign * direction > 0
+
+
+def player_why_html(r, box_keyed, team_ratings, defense_allowed):
+    """The 'Why we like it' panel for a player-prop pick: real basketball reasoning
+    from this player's own game log, his team's and the opponent's current ratings,
+    and the opponent's real season-to-date defensive numbers. No individual defender
+    assignments or coverage schemes (drop/switch/trap) - box scores don't carry that
+    data, and inventing it would violate the project's own no-fabrication rule."""
+    stat = r.stat
+    mean = getattr(r, f"{stat}_mean_hat")
+    var = getattr(r, f"{stat}_var_hat")
     std = var ** 0.5
     is_nb, _, _ = model.fit_dist(pd.Series([mean]), pd.Series([var]))
-    dist_name = ("Negative Binomial (this player's own games run more spread out than a "
-                 "plain Poisson count would expect)") if bool(is_nb.iloc[0]) else "Poisson"
+    dist_name = "Negative Binomial" if bool(is_nb.iloc[0]) else "Poisson"
     stat_lower = r.Stat.lower()
-    pbox = box_keyed[box_keyed["key"] == r.key]
-    l5 = hit_rate(pbox.tail(5), r.stat, r.Line, r.side)
-    l10 = hit_rate(pbox.tail(10), r.stat, r.Line, r.side)
-    l20 = hit_rate(pbox.tail(20), r.stat, r.Line, r.side)
-    h2h = hit_rate(pbox[pbox["opponent"] == r.opponent], r.stat, r.Line, r.side)
+    direction = 1 if r.side == "Over" else -1
+
+    pbox = box_keyed[box_keyed["key"] == r.key].sort_values("game_date")
+    l5 = hit_rate(pbox.tail(5), stat, r.Line, r.side)
+    l10 = hit_rate(pbox.tail(10), stat, r.Line, r.side)
+    l20 = hit_rate(pbox.tail(20), stat, r.Line, r.side)
+    h2h = hit_rate(pbox[pbox["opponent"] == r.opponent], stat, r.Line, r.side)
     chips = (split_chip("L5", *l5) + split_chip("L10", *l10) + split_chip("L20", *l20)
             + split_chip(f"vs {r.opponent}", *h2h))
+
+    recent_min = pbox.tail(10)["minutes"].mean() if not pbox.empty else None
+    season_min = pbox["minutes"].mean() if not pbox.empty else None
+    prof = shot_profile(pbox.tail(20)) if not pbox.empty else {}
+    team_row = team_ratings.loc[r.team] if r.team in team_ratings.index else None
+    opp_row = team_ratings.loc[r.opponent] if r.opponent in team_ratings.index else None
+    opp_def = defense_allowed.loc[r.opponent] if r.opponent in defense_allowed.index else None
+    league_def = team_ratings["def_rtg_hat"].mean() if not team_ratings.empty else None
+    league_pace = team_ratings["pace_hat"].mean() if not team_ratings.empty else None
+    league = defense_allowed.mean() if not defense_allowed.empty else None
+
+    breakdown = [f"The model projects {escape(str(r.Player))} ({escape(str(r.team))}) to go "
+                f"{escape(str(r.side))} {r.Line:.1f} {stat_lower}, estimating {r.model_p:.0f}% "
+                f"against the market's no-vig {r.market_p:.0f}%."]
+    support, oppose, key_candidates = [], [], []
+
+    if recent_min is not None and season_min is not None:
+        trend = "steady" if abs(recent_min - season_min) < 3 else (
+            "trending up" if recent_min > season_min else "trending down")
+        breakdown.append(f"He's logging about {recent_min:.0f} minutes a game over his last "
+                         f"10 ({season_min:.0f} on the season), a role that's {trend}.")
+        if trend == "trending down":
+            oppose.append(f"Minutes have trended down lately ({recent_min:.0f} over his last "
+                          f"10 vs {season_min:.0f} on the season) - a shrinking role works "
+                          "against any counting-stat projection, in either direction.")
+        elif trend == "trending up" and direction == 1:
+            support.append(f"Minutes have trended up lately ({recent_min:.0f} over his last "
+                           f"10 vs {season_min:.0f} on the season), supporting more chances "
+                           f"at {stat_lower}.")
+
+    if stat == "points" and prof.get("three_rate") is not None:
+        if prof["three_rate"] > 0.4:
+            breakdown.append(f"About {prof['three_rate']*100:.0f}% of his shots are threes"
+                             + (f" (making {prof['three_pct']*100:.0f}% of them)"
+                                if prof.get("three_pct") is not None else "")
+                             + ", so his scoring leans heavily on the perimeter.")
+        else:
+            breakdown.append(f"Only about {prof['three_rate']*100:.0f}% of his shots are "
+                             "threes, so most of his scoring comes from two-point range.")
+        if prof.get("ft_rate") is not None and prof["ft_rate"] > 0.25:
+            ft_note = (f"He draws real contact - {prof['ft_rate']:.2f} free-throw attempts "
+                      "per field-goal attempt is an above-average rate, a sign he gets to "
+                      "the rim or draws shooting fouls often."
+                      if direction == 1 else
+                      f"He draws real contact ({prof['ft_rate']:.2f} free-throw attempts per "
+                      "field-goal attempt), which usually supports more scoring, not less - "
+                      "a real factor working against this Under.")
+            (support if direction == 1 else oppose).append(ft_note)
+
+    if opp_row is not None and league_def is not None:
+        cmp_word = "worse" if opp_row.def_rtg_hat > league_def else "better"
+        breakdown.append(f"{escape(str(r.opponent))}'s defense is allowing "
+                         f"{opp_row.def_rtg_hat:.1f} points/100 possessions, {cmp_word} than "
+                         f"the league average of {league_def:.1f}, over "
+                         f"{int(opp_row.games_before)} games this season.")
+        ok = _supports(opp_row.def_rtg_hat, league_def, 1, direction)
+        (support if ok else oppose).append(
+            f"{escape(str(r.opponent))}'s defensive rating ({opp_row.def_rtg_hat:.1f}/100) is "
+            f"{cmp_word} than the league average ({league_def:.1f}) - "
+            f"{'a real scoring-friendly matchup' if ok else 'a real matchup risk'}.")
+        key_candidates.append(("defensive rating", abs(opp_row.def_rtg_hat - league_def),
+                               f"{escape(str(r.opponent))}'s defensive rating "
+                               f"({opp_row.def_rtg_hat:.1f}/100) vs. the league average "
+                               f"({league_def:.1f}/100)"))
+
+    if opp_def is not None and league is not None and stat in ("rebounds", "assists"):
+        col = "reb_allowed" if stat == "rebounds" else "ast_allowed"
+        label = "rebounds" if stat == "rebounds" else "assists"
+        cmp_word = "above" if opp_def[col] > league[col] else "below"
+        breakdown.append(f"{escape(str(r.opponent))} allows {opp_def[col]:.1f} {label}/game "
+                         f"to opponents, {cmp_word} the league average of {league[col]:.1f}.")
+        ok = _supports(opp_def[col], league[col], 1, direction)
+        (support if ok else oppose).append(
+            f"{escape(str(r.opponent))}'s {label} allowed ({opp_def[col]:.1f}/game) is "
+            f"{cmp_word} the league average ({league[col]:.1f}) - "
+            f"{'a real edge for this side' if ok else 'a real headwind for this side'}.")
+        key_candidates.append((f"{label} allowed", abs(opp_def[col] - league[col]),
+                               f"{escape(str(r.opponent))}'s {label} allowed "
+                               f"({opp_def[col]:.1f}/game) vs. the league average "
+                               f"({league[col]:.1f}/game)"))
+        if stat == "assists" and opp_def.tov_forced is not None and league is not None:
+            ok_tov = _supports(opp_def.tov_forced, league.tov_forced, -1, direction)
+            cmp_word2 = "above" if opp_def.tov_forced > league.tov_forced else "below"
+            (support if ok_tov else oppose).append(
+                f"{escape(str(r.opponent))} forces {opp_def.tov_forced:.1f} turnovers/game, "
+                f"{cmp_word2} the league average of {league.tov_forced:.1f} - real ball "
+                f"pressure that {'helps keep possessions clean for this side' if ok_tov else 'can take the ball out of his hands before a pass develops'}.")
+
+    if opp_row is not None and team_row is not None and league_pace is not None:
+        avg_pace = (opp_row.pace_hat + team_row.pace_hat) / 2
+        cmp_word = "faster" if avg_pace > league_pace else "slower"
+        breakdown.append(f"Projected pace for this game is {avg_pace:.1f} possessions/team, "
+                         f"{cmp_word} than the league average of {league_pace:.1f} - "
+                         f"{'more' if cmp_word == 'faster' else 'fewer'} possessions than "
+                         "usual for both teams.")
+        ok = _supports(avg_pace, league_pace, 1, direction)
+        (support if ok else oppose).append(
+            f"Projected pace ({avg_pace:.1f} possessions/team) is {cmp_word} than the league "
+            f"average ({league_pace:.1f}) - {'more' if cmp_word == 'faster' else 'fewer'} live-"
+            "ball chances for every counting stat tonight.")
+
+    if l10[0] is not None:
+        if l10[0] >= 60:
+            support.append(f"This side has hit in {l10[0]}% of his last {l10[1]} games.")
+        elif l10[0] <= 40:
+            oppose.append(f"This side has only hit in {l10[0]}% of his last {l10[1]} games - "
+                          "recent form hasn't lined up with this projection.")
+
+    matchup_line = (f"Against {escape(str(r.opponent))} specifically, this side has hit in "
+                    f"{h2h[0]}% of {h2h[1]} meeting(s) with a box score on file."
+                    if h2h[0] is not None else
+                    f"No completed meetings against {escape(str(r.opponent))} are on file "
+                    "yet for this player, so this leans on overall form and the opponent's "
+                    "real season-to-date numbers above rather than head-to-head history.")
+    breakdown.append(matchup_line)
+
+    caveats = ["The model has no visibility into injury reports, minutes restrictions, "
+              "individual defensive assignments, coverage schemes (drop coverage, "
+              "switching, traps), or role changes a sportsbook may already be pricing in - "
+              "that information isn't in box-score data, so it isn't guessed at here."]
+    if stat == "points":
+        caveats.append("Points specifically still runs a bit overconfident in the tails even "
+                       "with a long track record, which is why it's capped at Medium "
+                       "confidence regardless of sample size (see model.py).")
+
+    tier, tier_reason = assessment_tier(r.confidence, len(support), len(oppose))
+    key_line = (max(key_candidates, key=lambda k: k[1])[2] + " is the sharpest real signal "
+               "in this matchup.") if key_candidates else (
+               "No single real factor stands out sharply here - this leans more on this "
+               "player's own recent form than a clear opponent weakness or strength.")
+
     low, high = max(mean - std, 0), mean + std
-    points_caveat = (" Points specifically still runs a bit overconfident in the tails even with "
-                     "a long track record, which is why it's capped at Medium confidence "
-                     "regardless of sample size (see model.py).") if r.stat == "points" else ""
-    matchup = (f"Against {escape(str(r.opponent))} specifically, this side has hit in "
-              f"{h2h[0]}% of {h2h[1]} meeting(s) with a box score on file."
-              if h2h[0] is not None else
-              f"No completed meetings against {escape(str(r.opponent))} are on file yet for "
-              "this player, so this pick leans on overall recent form rather than "
-              "opponent-specific history.")
+    support_html = "".join(f"<li>{s}</li>" for s in support) or \
+        "<li>No standout real factor beyond the model's own statistical projection.</li>"
+    oppose_html = "".join(f"<li>{s}</li>" for s in oppose + caveats)
+    needs_html = (f"The {escape(str(r.side)).lower()} becomes more likely if "
+                 f"{escape(str(r.Player))} keeps his usual minutes and role, and the real "
+                 "matchup factors above hold - particularly the opponent's actual defensive, "
+                 "rebounding, or pace numbers staying where they've been all season.")
+
+    terms = ["pace", "offensive rating", "defensive rating", "no-vig probability", "blowout risk"]
+    if stat == "points":
+        terms += ["three-point rate", "free-throw rate"]
+    if stat == "rebounds":
+        terms += ["offensive rebound", "defensive rebound"]
+    if stat == "assists":
+        terms += ["turnovers forced"]
+
     return (
-        f'<p><b>Summary.</b> The model projects {escape(str(r.Player))} to go {escape(str(r.side))} '
-        f'{r.Line:.1f} {escape(stat_lower)}, estimating {r.model_p:.0f}% against the market\'s '
-        f'no-vig {r.market_p:.0f}%, a {r.edge:+.0f} point gap, from {int(r.games_before)} games '
-        f'of this player\'s own saved history.</p>'
-        f'<p><b>Statistical evidence.</b> Projected mean is {mean:.1f} {escape(stat_lower)} '
-        f'(std dev {std:.1f}), modeled as a {dist_name} distribution. Hit-rate splits for this '
-        'exact side and line, from this player\'s own saved games:</p>'
+        f'<p><b>A. The basketball breakdown.</b> {" ".join(breakdown)}</p>'
+        f'<p><b>B. What favors the pick.</b></p><ul>{support_html}</ul>'
+        f'<p><b>C. What works against the pick.</b></p><ul>{oppose_html}</ul>'
+        f'<p><b>D. The key matchup.</b> {key_line}</p>'
+        f'<p><b>E. Statistical evidence.</b> Projected mean {mean:.1f} {escape(stat_lower)} '
+        f'(std dev {std:.1f}), modeled as a {dist_name} distribution, from {int(r.games_before)} '
+        f'games of this player\'s own saved history. Hit-rate splits for this exact side and line:</p>'
         f'<div class="strip" style="margin:.4rem 0 .8rem;">{chips}</div>'
-        f'<p><b>Matchup analysis.</b> {matchup}</p>'
-        f'<p><b>Why it might not hit.</b> Within one standard deviation, a typical outcome lands '
-        f'between {low:.1f} and {high:.1f} {escape(stat_lower)} - the model and the market can '
-        'both be reasonable about the distribution and still land on opposite sides of the line '
-        'by chance. The model also has no visibility into injury reports, minutes restrictions, '
-        f'or role changes a sportsbook may already be pricing in.{points_caveat}</p>'
-        f'<p><b>Final assessment.</b> {r.confidence} confidence, a {r.edge:+.0f} point edge '
-        'against a real market price. A probability estimate, not a recommendation to bet.</p>')
+        f'<p><b>F. What needs to happen.</b> {needs_html}</p>'
+        f'<p><b>G. What could cause it to miss.</b> Within one standard deviation, a typical '
+        f'outcome lands between {low:.1f} and {high:.1f} {escape(stat_lower)} - the model and '
+        'the market can both be reasonable about the distribution and still land on opposite '
+        f'sides of the line by chance. {caveats[0]}</p>'
+        f'<p><b>H. Final assessment: {tier}.</b> {r.confidence} confidence, a {r.edge:+.0f} '
+        f'point edge against a real market price - {tier_reason} A probability estimate, not '
+        'a recommendation to bet.</p>'
+        f'{glossary_html(terms)}')
 
 
-def game_why_html(r):
-    """The 'Why we like it' panel for a spread/total/moneyline pick, built from the
-    same team ratings and measured error (sigma) the pick itself was computed from."""
+def game_why_html(r, defense_allowed):
+    """The 'Why we like it' panel for a spread/total/moneyline pick: real team-level
+    basketball reasoning from both teams' current ratings and real rebounding/turnover
+    numbers. No coaching adjustments or individual defensive assignments - not in this
+    data, so not invented."""
     is_total = r.market == "totals"
     center, unit = (r.total, "total points") if is_total else (
         r.margin, f"margin ({r.home_abbr} minus {r.away_abbr})")
     low, high = center - r.sigma, center + r.sigma
+
+    home_def = defense_allowed.loc[r.home_abbr] if r.home_abbr in defense_allowed.index else None
+    away_def = defense_allowed.loc[r.away_abbr] if r.away_abbr in defense_allowed.index else None
+    league = defense_allowed.mean() if not defense_allowed.empty else None
+
+    support, oppose, key_candidates = [], [], []
+    breakdown = [escape(r.note)]
+
+    if is_total:
+        direction = 1 if r.side == "Over" else -1
+        breakdown.append(f"Projected pace is {r.pace:.1f} possessions/team. "
+                         f"{escape(r.home_abbr)} offensive rating {r.home_off_hat:.1f}/100 vs "
+                         f"{escape(r.away_abbr)} defensive rating {r.away_def_hat:.1f}/100 "
+                         f"allowed; {escape(r.away_abbr)} offensive rating "
+                         f"{r.away_off_hat:.1f}/100 vs {escape(r.home_abbr)} defensive rating "
+                         f"{r.home_def_hat:.1f}/100 allowed.")
+        combined_off = (r.home_off_hat + r.away_off_hat) / 2
+        combined_def = (r.home_def_hat + r.away_def_hat) / 2
+        breakdown.append(f"On average, these two teams are running {combined_off:.1f} "
+                         f"points/100 on offense against {combined_def:.1f} allowed on "
+                         "defense this season.")
+        ok = _supports(combined_off, combined_def, 1, direction)
+        (support if ok else oppose).append(
+            f"Combined offensive rating ({combined_off:.1f}/100) vs. combined defensive "
+            f"rating allowed ({combined_def:.1f}/100) favors "
+            f"{'more scoring' if ok else 'less scoring'} than a neutral matchup.")
+        key_candidates.append(("offense vs. defense balance", abs(combined_off - combined_def),
+                               f"the combined offensive rating ({combined_off:.1f}/100) vs. "
+                               f"combined defensive rating allowed ({combined_def:.1f}/100)"))
+        if home_def is not None and away_def is not None and league is not None:
+            combined_tov = (home_def.tov_forced + away_def.tov_forced) / 2
+            cmp_word = "above" if combined_tov > league.tov_forced else "below"
+            ok_tov = _supports(combined_tov, league.tov_forced, -1, direction)
+            (support if ok_tov else oppose).append(
+                f"Combined turnovers forced ({combined_tov:.1f}/game) is {cmp_word} the "
+                f"league average ({league.tov_forced:.1f}) - more live-ball turnovers can mean "
+                "extra transition points, but fewer clean possessions overall tends to mean "
+                f"fewer total points, which {'supports' if ok_tov else 'works against'} this side.")
+    else:
+        picked_abbr = r.side
+        is_home_pick = (picked_abbr == r.home_abbr)
+        opp_abbr = r.away_abbr if is_home_pick else r.home_abbr
+        pick_off = r.home_off_hat if is_home_pick else r.away_off_hat
+        pick_def = r.home_def_hat if is_home_pick else r.away_def_hat
+        opp_off = r.away_off_hat if is_home_pick else r.home_off_hat
+        opp_def_rtg = r.away_def_hat if is_home_pick else r.home_def_hat
+        breakdown.append(f"{escape(picked_abbr)} offensive rating {pick_off:.1f}/100 vs "
+                         f"{escape(opp_abbr)} defensive rating {opp_def_rtg:.1f}/100 allowed; "
+                         f"{escape(opp_abbr)} offensive rating {opp_off:.1f}/100 vs "
+                         f"{escape(picked_abbr)} defensive rating {pick_def:.1f}/100 allowed. "
+                         f"Home-court edge of {r.home_edge:+.2f} points/team is already "
+                         "included in the projection.")
+        off_edge, def_edge = pick_off - opp_def_rtg, opp_off - pick_def
+        if off_edge > 0:
+            support.append(f"{escape(picked_abbr)}'s offense ({pick_off:.1f}/100) rates "
+                           f"above {escape(opp_abbr)}'s defense allows ({opp_def_rtg:.1f}/100) "
+                           "- a real half-court scoring edge.")
+        else:
+            oppose.append(f"{escape(picked_abbr)}'s offense ({pick_off:.1f}/100) doesn't "
+                          f"rate above {escape(opp_abbr)}'s defense ({opp_def_rtg:.1f}/100) - "
+                          "this pick isn't leaning on an offensive mismatch.")
+        if def_edge < 0:
+            support.append(f"{escape(picked_abbr)}'s defense ({pick_def:.1f}/100 allowed) "
+                           f"rates better than {escape(opp_abbr)}'s offense "
+                           f"({opp_off:.1f}/100) - a real edge on the other end too.")
+        else:
+            oppose.append(f"{escape(opp_abbr)}'s offense ({opp_off:.1f}/100) actually rates "
+                          f"above {escape(picked_abbr)}'s defense ({pick_def:.1f}/100 "
+                          "allowed) - the matchup cuts the other way on that end.")
+        key_candidates.append(("net rating edge", abs(off_edge + def_edge),
+                               f"{escape(picked_abbr)}'s combined net-rating advantage in "
+                               f"this matchup ({off_edge + def_edge:+.1f} across both ends)"))
+        if home_def is not None and away_def is not None and league is not None:
+            opp_reb = away_def if is_home_pick else home_def
+            ok = opp_reb.reb_allowed > league.reb_allowed
+            (support if ok else oppose).append(
+                f"{escape(opp_abbr)} allows {opp_reb.reb_allowed:.1f} rebounds/game, "
+                f"{'above' if ok else 'at or below'} the league average of "
+                f"{league.reb_allowed:.1f} - "
+                f"{'extra second-chance opportunities for ' + escape(picked_abbr) if ok else 'not an obvious rebounding edge in this matchup'}.")
+
+    caveats = ["The model has no visibility into injury reports, trades, rest decisions, "
+              "lineup changes, or coaching adjustments a sportsbook already knows about - "
+              "that information isn't in box-score data, so it isn't guessed at here."]
+
+    tier, tier_reason = assessment_tier(r.confidence, len(support), len(oppose))
+    key_line = (max(key_candidates, key=lambda k: k[1])[2] + " is the sharpest real signal "
+               "in this matchup.") if key_candidates else (
+               "No single real factor stands out sharply here.")
+
+    support_html = "".join(f"<li>{s}</li>" for s in support) or \
+        "<li>No standout real factor beyond the model's own statistical projection.</li>"
+    oppose_html = "".join(f"<li>{s}</li>" for s in oppose + caveats)
+    needs_html = ("This side becomes more likely if the real factors above hold - "
+                 "particularly both teams' offensive and defensive ratings staying where "
+                 "they've been all season, and the game being decided in the flow of play "
+                 "rather than a blowout that changes rotations.")
+
+    terms = ["pace", "offensive rating", "defensive rating", "no-vig probability",
+            "turnovers forced", "blowout risk"]
+
     return (
-        f'<p><b>Summary.</b> {escape(r.note)} The model estimates {r.model_p:.0f}% on '
-        f'{escape(str(r.side))} against the market\'s no-vig {r.market_p:.0f}%, a '
-        f'{r.edge:+.0f} point gap, from {int(r.games_before)} games of saved history for the '
+        f'<p><b>A. The basketball breakdown.</b> {" ".join(breakdown)}</p>'
+        f'<p><b>B. What favors the pick.</b></p><ul>{support_html}</ul>'
+        f'<p><b>C. What works against the pick.</b></p><ul>{oppose_html}</ul>'
+        f'<p><b>D. The key matchup.</b> {key_line}</p>'
+        f'<p><b>E. Statistical evidence.</b> Projected score: {escape(r.home_abbr)} '
+        f'{r.home_pts:.1f} - {escape(r.away_abbr)} {r.away_pts:.1f} (margin {r.margin:+.1f}, '
+        f'total {r.total:.1f}), from {int(r.games_before)} games of saved history for the '
         'shorter-tracked of the two teams.</p>'
-        f'<p><b>Statistical evidence.</b> Projected pace is {r.pace:.1f} possessions/team. '
-        f'{escape(r.home_abbr)} offensive rating {r.home_off_hat:.1f}/100 vs {escape(r.away_abbr)} '
-        f'defensive rating {r.away_def_hat:.1f}/100 allowed; {escape(r.away_abbr)} offensive '
-        f'rating {r.away_off_hat:.1f}/100 vs {escape(r.home_abbr)} defensive rating '
-        f'{r.home_def_hat:.1f}/100 allowed. A home-court edge of {r.home_edge:+.2f} points/team '
-        '(measured from this data\'s own home/away scoring gap, not assumed) is already '
-        'included.</p>'
-        f'<p><b>Matchup analysis.</b> Projected score: {escape(r.home_abbr)} {r.home_pts:.1f} - '
-        f'{escape(r.away_abbr)} {r.away_pts:.1f} (margin {r.margin:+.1f}, total {r.total:.1f}).</p>'
-        f'<p><b>Why it might not hit.</b> The model\'s own measured error for this market has a '
-        f'standard deviation of {r.sigma:.1f} points, so a typical result lands between '
-        f'{low:.1f} and {high:.1f} on the {unit}. Like the player model, this has no visibility '
-        'into trades, injuries, rest decisions, or lineup changes a sportsbook already knows '
-        'about.</p>'
-        f'<p><b>Final assessment.</b> {r.confidence} confidence (based on {int(r.games_before)} '
-        f'games of saved history for both teams), a {r.edge:+.0f} point edge against a real '
-        'market price. A probability estimate, not a recommendation to bet.</p>')
+        f'<p><b>F. What needs to happen.</b> {needs_html}</p>'
+        f'<p><b>G. What could cause it to miss.</b> The model\'s own measured error for this '
+        f'market has a standard deviation of {r.sigma:.1f} points, so a typical result lands '
+        f'between {low:.1f} and {high:.1f} on the {unit}. {caveats[0]}</p>'
+        f'<p><b>H. Final assessment: {tier}.</b> {r.confidence} confidence (based on '
+        f'{int(r.games_before)} games of saved history for both teams), a {r.edge:+.0f} point '
+        f'edge against a real market price - {tier_reason} A probability estimate, not a '
+        'recommendation to bet.</p>'
+        f'{glossary_html(terms)}')
 
 
 def page_top_picks():
@@ -1153,6 +1509,8 @@ def page_top_picks():
 
     conf_class = {"High": "b-done", "Medium": "b-wait", "Low": "b-miss"}
     box_keyed = box.assign(key=box["player_name"].map(box_scores.normalize_name)).sort_values("game_date")
+    team_ratings = team_ratings_now(box)
+    defense_allowed = team_defense_allowed(box)
 
     def render_pick_card(r, label):
         line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
@@ -1182,7 +1540,8 @@ def page_top_picks():
             f'{r.model_p:.0f}%, a gap of {r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
             f'</div>', unsafe_allow_html=True)
         with st.expander("Why we like it"):
-            why_html = player_why_html(r, box_keyed) if r.kind == "player" else game_why_html(r)
+            why_html = (player_why_html(r, box_keyed, team_ratings, defense_allowed)
+                       if r.kind == "player" else game_why_html(r, defense_allowed))
             st.markdown(why_html, unsafe_allow_html=True)
 
     for rank, r in enumerate(qualifying.itertuples(), 1):
