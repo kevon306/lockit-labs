@@ -4,3 +4,4 @@ pandas
 nba_api
 streamlit
 scipy
+anthropic

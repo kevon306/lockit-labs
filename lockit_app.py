@@ -6,6 +6,7 @@ Press Control+C in the terminal to stop it.
 """
 
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
@@ -15,6 +16,16 @@ import pandas as pd
 import streamlit as st
 from scipy import stats
 
+# ai_tools.py needs some of this file's own compute functions (compute_picks, team
+# ratings, etc.) and imports this module to get them. But Streamlit runs this file
+# directly (not as a module literally named "lockit_app"), so without this line that
+# nested import would re-execute this entire script from scratch - including
+# st.set_page_config() and nav.run() a second time, which breaks. Registering the
+# module already running under the name "lockit_app" makes the nested import reuse
+# it instead of re-running the file.
+sys.modules.setdefault("lockit_app", sys.modules[__name__])
+
+import ai_analyst
 import box_scores
 import db
 import model
@@ -538,7 +549,7 @@ def topbar(odds, here="tonight"):
     links = [("./", "tonight", "Tonight"), ("./picks", "picks", "Top Picks"),
              ("./game-lines", "game_lines", "Game Lines"), ("./trends", "trends", "Trends"),
              ("./lines", "lines", "Lines"), ("./players", "players", "Players"),
-             ("./bets", "bets", "My bets")]
+             ("./ai-analyst", "ai_analyst", "AI Analyst"), ("./bets", "bets", "My bets")]
     nav = "".join(
         f'<a href="{href}" target="_self" class="{"on" if key == here else ""}">{label}'
         f'{f"<i>{n}</i>" if key == "bets" and n else ""}</a>' for href, key, label in links)
@@ -2472,6 +2483,155 @@ def page_bets():
          "little about long-run results.")
 
 
+def _send_to_analyst(conversation_id, text):
+    try:
+        ai_analyst.ask(conversation_id, text)
+    except (ai_analyst.AnalystUnavailable, ai_analyst.AnalystRateLimited,
+           ai_analyst.AnalystError) as e:
+        db.save_message(conversation_id, "assistant", f"⚠️ {e}")
+
+
+AI_MODE_MAP = {"Ask the Analyst": "ask", "Challenge a Pick": "challenge", "Parlay Lab": "parlay"}
+AI_SUGGESTIONS = {
+    "ask": ["What's the strongest Top Pick tonight?", "Compare two players' points props",
+           "What does the model think about tonight's totals?"],
+    "challenge": ["I think a player goes over because of pace - check my reasoning",
+                 "Find weaknesses in my case for a pick",
+                 "Do you agree with the model's prediction on a specific prop?"],
+    "parlay": ["Add legs below, then hit Analyze this parlay",
+              "What's the risk in combining two props from the same game?",
+              "How should I think about parlay correlation in general?"],
+}
+
+
+def page_ai_analyst():
+    odds = load("odds_snapshots")
+    topbar(odds, "ai_analyst")
+    st.markdown(
+        f'<div class="hero">{COURT_SVG}<h1>AI Analyst</h1>'
+        "<p>Ask about players, matchups, props, spreads, totals, or your own parlay "
+        "idea. The Analyst investigates using this app's real data and model "
+        "projections, and pushes back on weak reasoning instead of just agreeing with "
+        "you.</p></div>", unsafe_allow_html=True)
+
+    if not ai_analyst.is_configured():
+        st.markdown(
+            '<div class="panel"><div class="panel-title">AI Analyst isn\'t connected yet</div>'
+            '<p class="hint">This page is fully built, but needs a real Anthropic API key to '
+            'actually respond. Add <code>ANTHROPIC_API_KEY=...</code> to your .env file (get '
+            'one at console.anthropic.com), then restart the app. Optional: '
+            '<code>AI_ANALYST_MODEL</code>, <code>AI_ANALYST_DAILY_LIMIT</code>, or '
+            '<code>AI_ANALYST_ENABLED=off</code> to disable even with a key present.</p></div>',
+            unsafe_allow_html=True)
+        return
+
+    mode_label = st.pills("Mode", list(AI_MODE_MAP), default="Ask the Analyst",
+                          label_visibility="collapsed") or "Ask the Analyst"
+    mode = AI_MODE_MAP[mode_label]
+
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("**AI Analyst**")
+        if st.button("New conversation", width="stretch"):
+            st.session_state.pop("ai_cid", None)
+            st.rerun()
+        convos = db.list_conversations()
+        if not convos.empty:
+            st.caption("Recent")
+            for r in convos.head(15).itertuples():
+                label = (r.title or r.mode.title())[:28]
+                c1, c2 = st.columns([5, 1])
+                if c1.button(label, key=f"ai_open_{r.id}", width="stretch"):
+                    st.session_state["ai_cid"] = r.id
+                    st.rerun()
+                if c2.button("×", key=f"ai_del_{r.id}"):
+                    db.delete_conversation(r.id)
+                    if st.session_state.get("ai_cid") == r.id:
+                        st.session_state.pop("ai_cid", None)
+                    st.rerun()
+
+    cid = st.session_state.get("ai_cid")
+    if cid is None:
+        cid = ai_analyst.start_conversation(mode=mode)
+        st.session_state["ai_cid"] = cid
+
+    messages = db.conversation_messages(cid)
+
+    if not messages.empty:
+        current = db.list_conversations()
+        current = current[current["id"] == cid]
+        if not current.empty:
+            with st.expander(f"Rename: {current.iloc[0]['title'] or mode.title()}"):
+                new_title = st.text_input("Title", value=current.iloc[0]["title"] or "",
+                                          label_visibility="collapsed", key=f"rename_{cid}")
+                if st.button("Save title", key=f"save_title_{cid}") and new_title.strip():
+                    db.rename_conversation(cid, new_title.strip())
+                    st.rerun()
+
+    if mode == "parlay":
+        legs = st.session_state.setdefault("parlay_legs", [])
+        with st.expander(f"Parlay legs ({len(legs)})", expanded=not legs):
+            c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+            kind = c1.selectbox("Type", ["Player prop", "Team market"], label_visibility="collapsed")
+            if kind == "Player prop":
+                name = c2.text_input("Player", label_visibility="collapsed", placeholder="Player name")
+                stat = c3.selectbox("Stat", model.STATS, label_visibility="collapsed")
+                if c4.button("Add") and name:
+                    legs.append({"player": name, "stat": stat})
+                    st.rerun()
+            else:
+                name = c2.text_input("Team", label_visibility="collapsed", placeholder="Team name")
+                mkt = c3.selectbox("Market", ["spreads", "totals", "h2h"], label_visibility="collapsed")
+                if c4.button("Add") and name:
+                    legs.append({"team": name, "market": mkt})
+                    st.rerun()
+            for i, leg in enumerate(legs):
+                desc = f"{leg['player']} {leg['stat']}" if "player" in leg else f"{leg['team']} {leg['market']}"
+                lc1, lc2 = st.columns([5, 1])
+                lc1.write(f"{i + 1}. {desc}")
+                if lc2.button("Remove", key=f"ai_rm_{i}"):
+                    legs.pop(i)
+                    st.rerun()
+            if legs and st.button("Analyze this parlay", type="primary"):
+                leg_desc = "; ".join(
+                    f"{l['player']} {l['stat']}" if "player" in l else f"{l['team']} {l['market']}"
+                    for l in legs)
+                _send_to_analyst(cid, f"Analyze this {len(legs)}-leg parlay: {leg_desc}")
+                st.session_state["parlay_legs"] = []
+                st.rerun()
+
+    if messages.empty:
+        hint("Try asking:")
+        for s in AI_SUGGESTIONS[mode]:
+            if st.button(s, key=f"ai_sugg_{mode}_{s}"):
+                _send_to_analyst(cid, s)
+                st.rerun()
+
+    for r in messages.itertuples():
+        with st.chat_message("user" if r.role == "user" else "assistant",
+                             avatar="\U0001F9D1" if r.role == "user" else "\U0001F3C0"):
+            st.markdown(r.content)
+            if r.role == "assistant":
+                fc1, fc2, _ = st.columns([1, 1, 8])
+                if fc1.button("\U0001F44D", key=f"ai_up_{r.id}"):
+                    db.save_feedback(r.id, "helpful")
+                    st.toast("Thanks for the feedback")
+                if fc2.button("\U0001F44E", key=f"ai_down_{r.id}"):
+                    db.save_feedback(r.id, "unhelpful")
+                    st.toast("Noted, thanks")
+
+    prompt = st.chat_input("Ask about a player, matchup, prop, or parlay...")
+    if prompt:
+        _send_to_analyst(cid, prompt)
+        st.rerun()
+
+    usage = db.ai_usage_today()
+    cost_txt = f", ~${usage['cost_usd']:.3f} estimated cost today" if usage["cost_usd"] else ""
+    hint(f"{usage['requests']} AI Analyst request(s) today{cost_txt}. Distinguishes verified "
+        "data, model projections, and unverified claims - never presents speculation as fact, "
+        "and never promises a result.")
+
+
 nav = st.navigation({
     "Research": [
         st.Page(page_tonight, title="Tonight", icon=":material/sports_basketball:",
@@ -2481,6 +2641,7 @@ nav = st.navigation({
         st.Page(page_trends, title="Trends", icon=":material/trending_up:", url_path="trends"),
         st.Page(page_lines, title="Lines", icon=":material/table_rows:", url_path="lines"),
         st.Page(page_players, title="Players", icon=":material/person:", url_path="players"),
+        st.Page(page_ai_analyst, title="AI Analyst", icon=":material/forum:", url_path="ai-analyst"),
     ],
     "Track": [
         st.Page(page_bets, title="My bets", icon=":material/receipt_long:", url_path="bets"),

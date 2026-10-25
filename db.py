@@ -234,6 +234,55 @@ CREATE TABLE IF NOT EXISTS corrections (
     new_values TEXT NOT NULL,
     reason     TEXT
 );
+
+-- AI Analyst: conversations, messages, feedback, usage. user_id is a real column now
+-- (not bolted on later) but there's no login system yet - every row today is written
+-- with user_id='owner', the single person who can reach this private Streamlit app.
+-- That's enough to add real multi-user auth later without a schema migration, without
+-- pretending auth exists today.
+CREATE TABLE IF NOT EXISTS ai_conversations (
+    id          INTEGER PRIMARY KEY,
+    user_id     TEXT NOT NULL DEFAULT 'owner',
+    title       TEXT,
+    mode        TEXT NOT NULL DEFAULT 'ask' CHECK (mode IN ('ask', 'challenge', 'parlay')),
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_messages (
+    id              INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES ai_conversations(id),
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content         TEXT NOT NULL,
+    tool_calls_json TEXT,     -- which backend tools were invoked and what they returned,
+                               -- kept for transparency/debugging, not shown raw to the user
+    created_at      TEXT NOT NULL,
+    tokens_in       INTEGER,
+    tokens_out      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ai_feedback (
+    id          INTEGER PRIMARY KEY,
+    message_id  INTEGER NOT NULL REFERENCES ai_messages(id),
+    rating      TEXT NOT NULL CHECK (rating IN ('helpful', 'unhelpful')),
+    comment     TEXT,
+    created_at  TEXT NOT NULL
+);
+
+-- One row per AI request (not per message - a single reply can involve several tool
+-- calls before the final answer). This is what a future rate limit / usage allowance
+-- would be computed from.
+CREATE TABLE IF NOT EXISTS ai_usage_log (
+    id          INTEGER PRIMARY KEY,
+    created_at  TEXT NOT NULL,
+    user_id     TEXT NOT NULL DEFAULT 'owner',
+    conversation_id INTEGER REFERENCES ai_conversations(id),
+    model       TEXT,
+    tokens_in   INTEGER,
+    tokens_out  INTEGER,
+    cost_usd    REAL,
+    error       TEXT        -- set if the request failed, for monitoring without crashing
+);
 """
 
 ODDS_COLUMNS = ["snapshot_time", "source", "event_id", "commence_time", "home_team",
@@ -303,6 +352,110 @@ def save_game_odds(rows):
             [tuple(r.get(c) for c in GAME_ODDS_COLUMNS) for r in rows],
         )
         return conn.total_changes - before
+
+
+def new_conversation(mode="ask", title=None, user_id="owner"):
+    """Start a new AI Analyst conversation. Returns its id."""
+    now = now_utc()
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO ai_conversations (user_id, title, mode, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)", (user_id, title, mode, now, now))
+        return cur.lastrowid
+
+
+def save_message(conversation_id, role, content, tool_calls=None, tokens_in=None, tokens_out=None):
+    """Append one message to a conversation and bump its updated_at. Returns the new
+    message's id (used to attach feedback later)."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO ai_messages (conversation_id, role, content, tool_calls_json, "
+            "created_at, tokens_in, tokens_out) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (conversation_id, role, content,
+             json.dumps(tool_calls) if tool_calls else None,
+             now_utc(), tokens_in, tokens_out))
+        conn.execute("UPDATE ai_conversations SET updated_at = ? WHERE id = ?",
+                     (now_utc(), conversation_id))
+        return cur.lastrowid
+
+
+def list_conversations(user_id="owner", limit=50):
+    with connect() as conn:
+        return pd.read_sql(
+            "SELECT id, title, mode, created_at, updated_at FROM ai_conversations "
+            "WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?", conn, params=(user_id, limit))
+
+
+def conversation_messages(conversation_id, user_id="owner"):
+    """All messages in a conversation - enforces that it actually belongs to this
+    user_id first, the access-control check multi-user support will need later."""
+    with connect() as conn:
+        owner = conn.execute("SELECT user_id FROM ai_conversations WHERE id = ?",
+                             (conversation_id,)).fetchone()
+        if owner is None or owner[0] != user_id:
+            return pd.DataFrame(columns=["id", "role", "content", "created_at"])
+        return pd.read_sql(
+            "SELECT id, role, content, created_at FROM ai_messages "
+            "WHERE conversation_id = ? ORDER BY id", conn, params=(conversation_id,))
+
+
+def rename_conversation(conversation_id, title, user_id="owner"):
+    with connect() as conn:
+        conn.execute("UPDATE ai_conversations SET title = ? WHERE id = ? AND user_id = ?",
+                     (title, conversation_id, user_id))
+
+
+def auto_title_conversation(conversation_id, fallback_text):
+    """Give a conversation a real title from its first message, if it doesn't have
+    one yet - called after the first user message, so the sidebar never just says
+    'Ask' for every conversation."""
+    with connect() as conn:
+        row = conn.execute("SELECT title FROM ai_conversations WHERE id = ?",
+                           (conversation_id,)).fetchone()
+        if row and not row[0]:
+            conn.execute("UPDATE ai_conversations SET title = ? WHERE id = ?",
+                         (fallback_text.strip()[:60], conversation_id))
+
+
+def delete_conversation(conversation_id, user_id="owner"):
+    """Returns False without deleting anything if this conversation isn't this user's."""
+    with connect() as conn:
+        owner = conn.execute("SELECT user_id FROM ai_conversations WHERE id = ?",
+                             (conversation_id,)).fetchone()
+        if owner is None or owner[0] != user_id:
+            return False
+        conn.execute(
+            "DELETE FROM ai_feedback WHERE message_id IN "
+            "(SELECT id FROM ai_messages WHERE conversation_id = ?)", (conversation_id,))
+        conn.execute("DELETE FROM ai_messages WHERE conversation_id = ?", (conversation_id,))
+        conn.execute("DELETE FROM ai_usage_log WHERE conversation_id = ?", (conversation_id,))
+        conn.execute("DELETE FROM ai_conversations WHERE id = ?", (conversation_id,))
+        return True
+
+
+def save_feedback(message_id, rating, comment=None):
+    with connect() as conn:
+        conn.execute("INSERT INTO ai_feedback (message_id, rating, comment, created_at) "
+                     "VALUES (?, ?, ?, ?)", (message_id, rating, comment, now_utc()))
+
+
+def log_ai_usage(user_id="owner", conversation_id=None, model=None, tokens_in=None,
+                 tokens_out=None, cost_usd=None, error=None):
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO ai_usage_log (created_at, user_id, conversation_id, model, "
+            "tokens_in, tokens_out, cost_usd, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (now_utc(), user_id, conversation_id, model, tokens_in, tokens_out, cost_usd, error))
+
+
+def ai_usage_today(user_id="owner"):
+    """Requests and tokens used today - the basis for a simple rate limit/usage display."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), "
+            "COALESCE(SUM(cost_usd),0) FROM ai_usage_log "
+            "WHERE user_id = ? AND created_at >= date('now')", (user_id,)).fetchone()
+        return {"requests": row[0], "tokens_in": row[1], "tokens_out": row[2], "cost_usd": row[3]}
 
 
 def correct_entry(entry_id, changes, reason):
