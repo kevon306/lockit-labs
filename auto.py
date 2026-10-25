@@ -41,7 +41,7 @@ from dotenv import load_dotenv
 import box_scores
 import pull_props as pp
 
-load_dotenv()
+load_dotenv(override=True)  # .env always wins - see the comment on pull_props.get_api_key()
 ET = ZoneInfo("America/New_York")
 STATE_FILE = pp.DATA_DIR / "auto_state.json"
 MORNING_ON = os.getenv("MORNING_SNAPSHOT", "on").lower() == "on"

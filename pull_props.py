@@ -60,7 +60,11 @@ LAST_REMAINING = None  # credits left, updated after every call
 # ---------- helpers ----------
 
 def get_api_key():
-    load_dotenv()
+    # override=True: .env is the source of truth every time this is called, not
+    # just the first time in this process - python-dotenv's default (override=False)
+    # silently keeps whatever was already in os.environ, so updating .env with a new
+    # key wouldn't take effect without this if anything had already set the old value.
+    load_dotenv(override=True)
     key = os.getenv("ODDS_API_KEY")
     if not key or key == "paste_your_key_here":
         sys.exit("No API key found. Open the .env file and paste your key after ODDS_API_KEY=")

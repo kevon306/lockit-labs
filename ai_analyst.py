@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 import ai_tools
 import db
 
-load_dotenv()
+load_dotenv(override=True)  # .env always wins - see the comment on pull_props.get_api_key()
 
 MODEL = os.getenv("AI_ANALYST_MODEL", "claude-haiku-4-5-20251001")  # cost-conscious
                          # default - still genuinely capable at tool-calling and
