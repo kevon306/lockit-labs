@@ -5,16 +5,22 @@ auto.py  -  the jobs your Mac runs on its own (set up by setup_automation.sh).
   python3 auto.py snapshots capture odds before tipoff     (runs every 15 minutes)
 
 Snapshot timing (change in your .env file if you want):
-  CLOSE_SNAPSHOT=on      odds ~10-20 min before each tip      (7 credits per game)
-  EARLY_SNAPSHOT_HOURS=0 set to 3 to also grab odds 3 hrs out (7 more per game)
-  MIN_CREDITS=15         stop pulling when credits drop this low
+  MORNING_SNAPSHOT=on     once/day, ~8-10 AM ET, every game that day   (3 credits/game)
+  AFTERNOON_SNAPSHOT=on   once/day, ~1-3 PM ET, every game that day    (3 credits/game)
+  PREGAME_90_SNAPSHOT=on  ~80-100 min before each tip                  (3 credits/game)
+  CLOSE_SNAPSHOT=on       ~10-20 min before each tip (the real "closing line") (7 credits/game)
+  EARLY_SNAPSHOT_HOURS=0  set to 3 to also grab odds 3 hrs out         (7 more/game)
+  MIN_CREDITS=15          stop pulling when credits drop this low
 
-Pulls all 7 player markets every time (points/rebounds/assists plus threes/steals/
-blocks/turnovers) - turned on deliberately, not the original 3-market default, so this
-costs more than it used to (3 credits/game -> 7). At roughly 8-15 games/night that's
-~55-105 credits/night just for the close snapshot, against a 500/month free-plan cap -
-watch MIN_CREDITS and `python3 pull_props.py today` (free) to check your balance if a
-heavy week worries you.
+The close window alone pulls all 7 player markets (points/rebounds/assists plus
+threes/steals/blocks/turnovers); the other windows use the base 3 to keep cost down
+on the pulls that exist for freshness, not for the backtested "closing line" record.
+Even so, this adds up fast: at a typical 8-game night, (3+3+3+7) x 8 = ~128
+credits/night, or ~3,400/month across a full season - well past the free plan's
+500/month cap. This was turned on deliberately after discussing the real cost with
+an explicit decision to upgrade the Odds API plan rather than scale back - if you're
+back on the free plan, dial windows off above or lower MIN_CREDITS's effective
+headroom by scaling back which windows are on.
 
 At the end of every snapshots run, if the database changed, it's committed and pushed
 to GitHub so the deployed Streamlit Cloud site reflects it (the site itself can't
@@ -28,6 +34,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -35,7 +42,11 @@ import box_scores
 import pull_props as pp
 
 load_dotenv()
+ET = ZoneInfo("America/New_York")
 STATE_FILE = pp.DATA_DIR / "auto_state.json"
+MORNING_ON = os.getenv("MORNING_SNAPSHOT", "on").lower() == "on"
+AFTERNOON_ON = os.getenv("AFTERNOON_SNAPSHOT", "on").lower() == "on"
+PREGAME_90_ON = os.getenv("PREGAME_90_SNAPSHOT", "on").lower() == "on"
 CLOSE_ON = os.getenv("CLOSE_SNAPSHOT", "on").lower() == "on"
 EARLY_HOURS = float(os.getenv("EARLY_SNAPSHOT_HOURS", "0") or 0)
 MIN_CREDITS = int(os.getenv("MIN_CREDITS", "15"))
@@ -68,12 +79,36 @@ def morning():
 
 
 def snapshots():
-    windows = []  # (label, minutes-before-tip upper bound, lower bound)
+    """Two kinds of capture windows:
+    - tip-relative (pregame_90, close, early): fire once per game, ever, based on how
+      many minutes remain before tip. State key has no date, since a game only tips
+      once.
+    - clock-time (morning, afternoon): fire once per game per calendar day, based on
+      the current ET hour, regardless of how far off tip is - this is what actually
+      gives "what's posted so far today" freshness instead of only ever seeing the
+      closing line. State key includes today's date, since these should fire again
+      tomorrow for tomorrow's games.
+
+    Only the close window pulls the extra markets (threes/steals/blocks/turnovers) -
+    the others use the cheaper base 3, since they exist for same-day freshness, not
+    for the backtested closing-line record (see model.py/team_model.py's
+    closing_line_log_loss, which specifically wants the closing snapshot).
+    """
+    tip_windows = []  # (label, minutes-before-tip upper bound, lower bound)
+    if PREGAME_90_ON:
+        tip_windows.append(("pregame_90", 100, 80))
     if CLOSE_ON:
-        windows.append(("close", 20, 0))
+        tip_windows.append(("close", 20, 0))
     if EARLY_HOURS > 0:
-        windows.append(("early", EARLY_HOURS * 60, EARLY_HOURS * 60 - 20))
-    if not windows:
+        tip_windows.append(("early", EARLY_HOURS * 60, EARLY_HOURS * 60 - 20))
+
+    clock_windows = []  # (label, start hour ET, end hour ET)
+    if MORNING_ON:
+        clock_windows.append(("morning", 8, 10))
+    if AFTERNOON_ON:
+        clock_windows.append(("afternoon", 13, 15))
+
+    if not tip_windows and not clock_windows:
         return
 
     try:
@@ -84,12 +119,29 @@ def snapshots():
 
     state = load_state()
     now = datetime.now(timezone.utc)
+    now_et = now.astimezone(ET)
+    today_str = now_et.strftime("%Y-%m-%d")
+
     for event in events:
         minutes_to_tip = (pp.parse_time(event["commence_time"]) - now).total_seconds() / 60
-        for label, upper, lower in windows:
+        tip_date_et = pp.parse_time(event["commence_time"]).astimezone(ET).strftime("%Y-%m-%d")
+
+        todo = []  # (label, state_key, markets)
+        for label, upper, lower in tip_windows:
             key = f"{event['id']}:{label}"
-            if state.get(key) or not (lower < minutes_to_tip <= upper):
-                continue
+            if not state.get(key) and lower < minutes_to_tip <= upper:
+                markets = f"{pp.MARKETS},{pp.EXTRA_MARKETS}" if label == "close" else pp.MARKETS
+                todo.append((label, key, markets))
+        # The events endpoint returns every scheduled game, including ones months out
+        # (e.g. Christmas Day games listed in October) - clock windows only make sense
+        # for a game actually tipping today, not "any time in the future."
+        if tip_date_et == today_str:
+            for label, start_h, end_h in clock_windows:
+                key = f"{event['id']}:{label}:{today_str}"
+                if not state.get(key) and start_h <= now_et.hour < end_h:
+                    todo.append((label, key, pp.MARKETS))
+
+        for label, key, markets in todo:
             if pp.LAST_REMAINING is not None and pp.LAST_REMAINING < MIN_CREDITS:
                 log(f"Skipping {label} snapshot: only {pp.LAST_REMAINING} credits left")
                 return
@@ -97,8 +149,7 @@ def snapshots():
             log(f"{label} snapshot: {game} ({minutes_to_tip:.0f} min to tip)")
             try:
                 data = pp.call_api(f"/sports/{pp.SPORT}/events/{event['id']}/odds",
-                                   {"regions": pp.REGIONS,
-                                    "markets": f"{pp.MARKETS},{pp.EXTRA_MARKETS}",
+                                   {"regions": pp.REGIONS, "markets": markets,
                                     "oddsFormat": "american"})
             except SystemExit as e:
                 log(f"  failed: {e}")
