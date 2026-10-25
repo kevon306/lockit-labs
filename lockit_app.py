@@ -2489,6 +2489,14 @@ def _send_to_analyst(conversation_id, text):
     except (ai_analyst.AnalystUnavailable, ai_analyst.AnalystRateLimited,
            ai_analyst.AnalystError) as e:
         db.save_message(conversation_id, "assistant", f"⚠️ {e}")
+    except Exception as e:
+        # Anything not already wrapped as a clean Analyst* error (a missing
+        # dependency, a bug in a tool call, anything) - never fail silently with
+        # no visible message, always show the user *something* went wrong.
+        db.save_message(conversation_id, "assistant",
+                        f"⚠️ Something unexpected went wrong ({type(e).__name__}: {e}). "
+                        "This has been left in the conversation so it's visible - try "
+                        "again, and if it keeps happening, check the app logs.")
 
 
 AI_MODE_MAP = {"Ask the Analyst": "ask", "Challenge a Pick": "challenge", "Parlay Lab": "parlay"}
