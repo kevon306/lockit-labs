@@ -23,7 +23,9 @@ import team_model
 
 ET = ZoneInfo("America/New_York")
 MARKET_LABELS = {"player_points": "Points", "player_rebounds": "Rebounds",
-                 "player_assists": "Assists"}
+                 "player_assists": "Assists", "player_threes": "3PM",
+                 "player_steals": "Steals", "player_blocks": "Blocks",
+                 "player_turnovers": "Turnovers"}
 BOOK_LABELS = {"draftkings": "DraftKings", "fanduel": "FanDuel", "betmgm": "BetMGM",
                "williamhill_us": "Caesars", "betrivers": "BetRivers", "bovada": "Bovada",
                "betonlineag": "BetOnline", "fliff": "Fliff", "espnbet": "ESPN BET",
@@ -1335,6 +1337,10 @@ def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, t
         caveats.append("Points specifically still runs a bit overconfident in the tails even "
                        "with a long track record, which is why it's capped at Medium "
                        "confidence regardless of sample size (see model.py).")
+    elif stat in ("steals", "blocks"):
+        caveats.append(f"{escape(stat_lower.capitalize())} are a volatile, low-count stat and "
+                       "the backtest found the same kind of overconfidence points has, which "
+                       "is why this is capped at Medium confidence regardless of sample size.")
 
     tier, tier_reason = assessment_tier(r.confidence, len(support), len(oppose))
     key_line = (max(key_candidates, key=lambda k: k[1])[2] + " is the sharpest real signal "

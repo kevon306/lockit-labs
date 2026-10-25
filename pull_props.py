@@ -13,6 +13,11 @@ the same request (same credit cost either way - markets x regions - so this doub
 the credits for that pull, from 3 to 6 for a live game). Off by default so it doesn't
 silently change the cost of existing scripts and scheduled jobs.
 
+Add --extra-markets to also grab threes made, steals, blocks, and turnovers (4 more
+markets, so it roughly doubles the credits for that pull too). Also off by default,
+same reasoning - the automated snapshot job (auto.py) uses MARKETS directly and does
+not opt into either flag, so its cost never changes without a deliberate edit there.
+
 Every pull saves to three places in the data/ folder:
   raw/...json   the exact API response, untouched (our audit trail)
   props/...csv  one tidy row per player / market / book / side
@@ -37,7 +42,13 @@ import db
 
 BASE_URL = "https://api.the-odds-api.com/v4"
 SPORT = "basketball_nba"
-MARKETS = "player_points,player_rebounds,player_assists"
+MARKETS = "player_points,player_rebounds,player_assists"  # what the automated snapshot
+                                                           # job pulls every 15 min - kept
+                                                           # as-is so that job's credit
+                                                           # cost doesn't silently change
+EXTRA_MARKETS = "player_threes,player_steals,player_blocks,player_turnovers"  # opt-in
+                                                           # via --extra-markets, same
+                                                           # idea as --game-markets
 GAME_MARKETS = "h2h,spreads,totals"  # moneyline, spread, game total - no player involved
 REGIONS = "us"
 CLOSE_MINUTES_BEFORE_TIP = 10  # "closing line" snapshot = 10 min before tipoff
@@ -87,12 +98,19 @@ def parse_time(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+ALL_PLAYER_MARKETS = set(MARKETS.split(",")) | set(EXTRA_MARKETS.split(","))
+
+
 def flatten_event(event, snapshot_time, source):
-    """Turn one event's nested odds into flat player-prop rows (player_points, etc)."""
+    """Turn one event's nested odds into flat player-prop rows (player_points, etc).
+    Accepts any recognized player-prop market, not just whichever ones were requested
+    this call - a --extra-markets pull and a plain one both save whatever the response
+    actually contains, so this can't silently drop real data the API already returned
+    and already charged credits for."""
     rows = []
     for book in event.get("bookmakers", []):
         for market in book.get("markets", []):
-            if market["key"] not in MARKETS.split(","):
+            if market["key"] not in ALL_PLAYER_MARKETS:
                 continue
             for outcome in market.get("outcomes", []):
                 rows.append({
@@ -205,13 +223,22 @@ def pick(events, n):
 
 # ---------- modes ----------
 
-def run_today(game, game_markets=False):
+def build_markets(game_markets, extra_markets):
+    parts = [MARKETS]
+    if extra_markets:
+        parts.append(EXTRA_MARKETS)
+    if game_markets:
+        parts.append(GAME_MARKETS)
+    return ",".join(parts)
+
+
+def run_today(game, game_markets=False, extra_markets=False):
     events = call_api(f"/sports/{SPORT}/events", {})  # free
     if game is None:
         print_games(events)
         return
     event = pick(events, game)
-    markets = f"{MARKETS},{GAME_MARKETS}" if game_markets else MARKETS
+    markets = build_markets(game_markets, extra_markets)
     data = call_api(f"/sports/{SPORT}/events/{event['id']}/odds",
                     {"regions": REGIONS, "markets": markets, "oddsFormat": "american"})
     snapshot = iso(datetime.now(timezone.utc))
@@ -220,7 +247,7 @@ def run_today(game, game_markets=False):
         save_game_odds(flatten_game_odds(data, snapshot, "live"), f"live_{event['id']}")
 
 
-def run_history(date_str, game, game_markets=False):
+def run_history(date_str, game, game_markets=False, extra_markets=False):
     try:
         day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
@@ -238,7 +265,7 @@ def run_history(date_str, game, game_markets=False):
         return
     event = pick(events, game)
     close_time = parse_time(event["commence_time"]) - timedelta(minutes=CLOSE_MINUTES_BEFORE_TIP)
-    markets = f"{MARKETS},{GAME_MARKETS}" if game_markets else MARKETS
+    markets = build_markets(game_markets, extra_markets)
     resp = call_api(f"/historical/sports/{SPORT}/events/{event['id']}/odds",
                     {"date": iso(close_time), "regions": REGIONS,
                      "markets": markets, "oddsFormat": "american"})
@@ -258,15 +285,19 @@ if __name__ == "__main__":
     t.add_argument("--game", type=int, help="game number from the list")
     t.add_argument("--game-markets", action="store_true",
                    help="also pull spread/total/moneyline (doubles credits for this pull)")
+    t.add_argument("--extra-markets", action="store_true",
+                   help="also pull threes/steals/blocks/turnovers (extra credits for this pull)")
 
     h = sub.add_parser("history", help="a past date (paid plan)")
     h.add_argument("date", help="YYYY-MM-DD")
     h.add_argument("--game", type=int, help="game number from the list")
     h.add_argument("--game-markets", action="store_true",
                    help="also pull spread/total/moneyline (doubles credits for this pull)")
+    h.add_argument("--extra-markets", action="store_true",
+                   help="also pull threes/steals/blocks/turnovers (extra credits for this pull)")
 
     args = parser.parse_args()
     if args.mode == "today":
-        run_today(args.game, args.game_markets)
+        run_today(args.game, args.game_markets, args.extra_markets)
     else:
-        run_history(args.date, args.game, args.game_markets)
+        run_history(args.date, args.game, args.game_markets, args.extra_markets)

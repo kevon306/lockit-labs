@@ -49,7 +49,7 @@ from scipy import stats
 
 import db
 
-STATS = ["points", "rebounds", "assists"]
+STATS = ["points", "rebounds", "assists", "fg3m", "steals", "blocks", "turnovers"]
 MIN_HISTORY = 10                  # games needed before we'll project a player at all
 SHORT_MIN_W, LONG_MIN_W = 5, 15   # game windows used for the minutes projection
 SHORT_RATE_W, LONG_RATE_W = 10, 40  # game windows used for the rate projection
@@ -201,12 +201,19 @@ def confidence_label(games_before, stat, backtest=None):
     sharper than a real market, and only the second one means the model is actually
     adding information. backtest=None (or a stat with no settled closing-line games
     yet) means that hasn't been shown, so High is never awarded on sample size alone.
-    Points stays capped at Medium regardless - a known tail-overconfidence issue (see
-    the module docstring) that beating the market on log loss wouldn't fix.
+
+    Points, steals, and blocks stay capped at Medium regardless - a real, backtested
+    tail-overconfidence issue (see the module docstring for points; steals and blocks
+    were checked the same way when they were added as markets: both show the model
+    predicting ~74-84% in the upper-middle range when the real rate was 5-7 points
+    lower - a similar-sized gap to points', and matches this project's own prior
+    expectation that steals/blocks are more volatile than points or minutes-based
+    stats). Rebounds, assists, three-pointers made, and turnovers all calibrated
+    cleanly in that same check, so they're not capped.
     """
     if games_before < 15:
         return "Low"
-    if stat == "points":
+    if stat in ("points", "steals", "blocks"):
         return "Medium"
     beats_market = bool(backtest and backtest.get(stat, {}).get("model_wins"))
     return "High" if (games_before >= 30 and beats_market) else "Medium"
@@ -288,8 +295,8 @@ def closing_line_log_loss(box, odds_resolved):
 def cmd_backtest():
     with db.connect() as conn:
         box = pd.read_sql(
-            "SELECT game_id, game_date, player_id, minutes, points, rebounds, assists, fg3m "
-            "FROM box_scores", conn)
+            "SELECT game_id, game_date, player_id, minutes, points, rebounds, assists, fg3m, "
+            "steals, blocks, turnovers FROM box_scores", conn)
     box["game_date"] = pd.to_datetime(box["game_date"])
     box = add_projections(box)
     box = box[box["games_before"] >= MIN_HISTORY].copy()

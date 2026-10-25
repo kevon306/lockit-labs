@@ -33,7 +33,11 @@ import db
 ET = ZoneInfo("America/New_York")
 MARKET_TO_STAT = {"player_points": "points",
                   "player_rebounds": "rebounds",
-                  "player_assists": "assists"}
+                  "player_assists": "assists",
+                  "player_threes": "fg3m",
+                  "player_steals": "steals",
+                  "player_blocks": "blocks",
+                  "player_turnovers": "turnovers"}
 
 
 # ---------- helpers ----------
