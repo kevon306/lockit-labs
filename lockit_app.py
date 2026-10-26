@@ -549,6 +549,42 @@ def game_market_rows(game_odds_event):
     return df
 
 
+def tonight_scoreboard_card(r, game_odds_event):
+    """One game's real spread/total/moneyline, compact - the Tonight page's quick-glance
+    summary. Game Lines (page_game_lines) has the full detailed breakdown with the
+    team model's own projection next to each side; this is just real market data, no
+    model comparison, so it stays fast to scan for every game on the slate."""
+    rows = game_market_rows(game_odds_event)
+    label, cls = close_status(game_odds_event, r.tip)
+    freshness = (f"Updated {ago(game_odds_event['snapshot_time'].max())}"
+                if not game_odds_event.empty else "No lines saved yet")
+
+    def mkt_line(market, title):
+        sub = rows[rows["market"] == market] if not rows.empty else rows
+        if sub.empty:
+            return f'<div class="market-label">{title}</div><span class="hint">Not posted yet.</span>'
+        parts = []
+        for x in sub.itertuples():
+            side_label = short(x.side) if market in ("h2h", "spreads") else x.side
+            line_txt = (f" {x.line:+.1f}" if market == "spreads"
+                       else (f" {x.line:.1f}" if market == "totals" else ""))
+            parts.append(f'<span>{escape(str(side_label))}{line_txt} <b>{fmt_price(x.price)}</b> '
+                        f'<small class="hint">{escape(x.book)}</small></span>')
+        return f'<div class="market-label">{title}</div>' + " &middot; ".join(parts)
+
+    return (
+        f'<div class="panel">'
+        f'<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:.5rem;">'
+        f'<div><span class="badge {cls}">{label}</span>'
+        f'<span class="tipt" style="margin-left:.5rem;">{r.tip:%-I:%M %p} ET</span>'
+        f'<div class="panel-title" style="margin-top:.2rem;">{escape(r.away)} at {escape(r.home)}</div></div>'
+        f'<div class="hint">{escape(freshness)}</div></div>'
+        f'<div style="margin-top:.5rem;">{mkt_line("h2h", "Moneyline")}</div>'
+        f'<div style="margin-top:.4rem;">{mkt_line("spreads", "Spread")}</div>'
+        f'<div style="margin-top:.4rem;">{mkt_line("totals", "Total")}</div>'
+        f'</div>')
+
+
 def chart_style(chart):
     return (chart.configure_view(stroke=None)
             .configure_axis(labelColor=MUTED, gridColor=EDGE, domainColor=EDGE,
@@ -687,6 +723,8 @@ def render_slip():
 
 def page_tonight():
     odds = load("odds_snapshots")
+    game_odds = load("game_odds_snapshots")
+    box = load("box_scores")
     topbar(odds)
     if odds.empty:
         st.info("No odds saved yet. In the terminal, run: `python3 pull_props.py today --game 0`")
@@ -697,6 +735,8 @@ def page_tonight():
     day = today if (ev["date"] == today).any() else ev["date"].max()
     slate = ev[ev["date"] == day]
     slate_odds = odds[odds["event_id"].isin(slate["event_id"])]
+    slate_game_odds = (game_odds[game_odds["event_id"].isin(slate["event_id"])]
+                       if not game_odds.empty else game_odds)
 
     boards = {}
     for r in slate.itertuples():
@@ -708,7 +748,8 @@ def page_tonight():
     title = "Tonight's board" if day == today else f"Board for {pd.Timestamp(day):%A, %b %-d}"
     st.markdown(
         f'<div class="hero">{COURT_SVG}<h1>{escape(title)}</h1>'
-        '<p>Every prop line we tracked, the best price across books, and how the market moved.</p>'
+        '<p>Game lines first, then every prop line we tracked, the best price across '
+        'books, and how the market moved.</p>'
         '<div class="nums">'
         f'<div><b>{len(slate)}</b><span>games</span></div>'
         f'<div><b>{len(allb)}</b><span>props tracked</span></div>'
@@ -716,6 +757,52 @@ def page_tonight():
         f'<div><b>{slate_odds["snapshot_time"].nunique()}</b><span>snapshots</span></div>'
         '</div></div>', unsafe_allow_html=True)
 
+    section("Tonight's games")
+    if slate_game_odds.empty:
+        hint("No spread/total/moneyline odds saved yet. In the terminal, run: "
+             "`python3 pull_props.py today --game-markets` (or let the automated close "
+             "window pick it up before tip).")
+    else:
+        for r in slate.itertuples():
+            st.markdown(tonight_scoreboard_card(
+                r, slate_game_odds[slate_game_odds["event_id"] == r.event_id]),
+                unsafe_allow_html=True)
+        hint("Real market data only, no model comparison - see Game Lines for the team "
+             "model's own projection next to each side, and how it was backtested.")
+
+    section("Strongest opportunities tonight")
+    if box.empty:
+        hint("Need box scores saved before the model can project anything.")
+    else:
+        player_bt = cached_player_backtest(box, odds)
+        game_bt = cached_game_backtest(box, game_odds)
+        player_picks, _ = compute_picks(box, odds, player_bt)
+        game_picks, _ = compute_game_picks(box, game_odds, game_bt)
+        picks = (pd.concat([player_picks, game_picks], ignore_index=True)
+                if not game_picks.empty else player_picks)
+        if picks.empty:
+            hint("No active lines could be projected yet - probably not enough saved "
+                 "box-score history for tonight's players and teams.")
+        else:
+            picks["ev"] = picks.apply(lambda r: expected_value(r["model_p"], r["price"]), axis=1)
+            in_range = picks[picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
+            qualifying = in_range[(in_range["edge"].abs() >= EDGE_THRESHOLD)
+                                  & (in_range["confidence"] != "Low")]
+            top = qualifying.reindex(qualifying["ev"].sort_values(ascending=False).index).head(3)
+            if top.empty:
+                hint("Nothing clears the edge bar tonight across player props or game "
+                     "lines. That's a real result, not an error - see Top Picks for the "
+                     "full methodology.")
+            else:
+                context = pick_render_context(box)
+                for rank, r in enumerate(top.itertuples(), 1):
+                    render_pick_card(r, f"#{rank}", *context)
+                hint(f"Top {len(top)} of {len(qualifying)} qualifying pick(s) tonight, "
+                     "across player props and game lines, ranked by expected value at "
+                     "the best available price - see Top Picks for the complete, "
+                     "ranked list and how confidence and edge are defined.")
+
+    section("Browse player props")
     main, side = st.columns([2.6, 1.1], gap="large")
 
     with main:
