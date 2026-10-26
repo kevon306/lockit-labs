@@ -1701,9 +1701,6 @@ def page_top_picks():
                        game_why_html(r, defense_allowed, team_zones))
             st.markdown(why_html, unsafe_allow_html=True)
 
-    for rank, r in enumerate(qualifying.itertuples(), 1):
-        render_pick_card(r, f"#{rank}")
-
     hint("Estimated probability is not the same as betting value, and value isn't the same "
          "as a guaranteed outcome. Ranked by expected value at the best available price, not "
          "by raw model probability or edge - a smaller edge at a much better price can be "
@@ -1713,6 +1710,31 @@ def page_top_picks():
          "closing-line history for a market, nothing in it can show High confidence. Player "
          "points picks are additionally capped at Medium (a known tail-overconfidence issue, "
          "see model.py).")
+
+    strongest = qualifying[qualifying["confidence"] == "High"]
+    other = qualifying[qualifying["confidence"] != "High"]
+
+    section("Strongest picks")
+    hint("High confidence - the backtest shows the model beating the no-vig closing line on "
+         "log loss for this exact market, with 30+ games of this player's own history, not "
+         "just a calibrated probability. A real, demonstrated edge, not a guarantee.")
+    if strongest.empty:
+        hint("None of tonight's qualifying picks have cleared the High-confidence bar yet. "
+             "That's common while a market's closing-line backtest is still building up "
+             "settled games - see the rest below instead.")
+    else:
+        for rank, r in enumerate(strongest.itertuples(), 1):
+            render_pick_card(r, f"#{rank}")
+
+    if not other.empty:
+        section("Other qualifying picks")
+        hint("Medium confidence - a real edge against the market, but this market either "
+             "hasn't shown the model beating the closing line on log loss yet (often just "
+             "because too few settled games have a saved closing-ish snapshot), or the stat "
+             "is permanently capped at Medium regardless of track record (points, steals, "
+             "blocks - see model.py).")
+        for rank, r in enumerate(other.itertuples(), 1):
+            render_pick_card(r, f"#{rank}")
 
     if not caution.empty:
         section("Check before trusting")
