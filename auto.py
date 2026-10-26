@@ -8,15 +8,18 @@ Snapshot timing (change in your .env file if you want):
   MORNING_SNAPSHOT=on     once/day, ~8-10 AM ET, every game that day   (3 credits/game)
   AFTERNOON_SNAPSHOT=on   once/day, ~1-3 PM ET, every game that day    (3 credits/game)
   PREGAME_90_SNAPSHOT=on  ~80-100 min before each tip                  (3 credits/game)
-  CLOSE_SNAPSHOT=on       ~10-20 min before each tip (the real "closing line") (7 credits/game)
-  EARLY_SNAPSHOT_HOURS=0  set to 3 to also grab odds 3 hrs out         (7 more/game)
+  CLOSE_SNAPSHOT=on       ~10-20 min before each tip (the real "closing line") (10 credits/game)
+  EARLY_SNAPSHOT_HOURS=0  set to 3 to also grab odds 3 hrs out         (10 more/game)
   MIN_CREDITS=15          stop pulling when credits drop this low
 
-The close window alone pulls all 7 player markets (points/rebounds/assists plus
-threes/steals/blocks/turnovers); the other windows use the base 3 to keep cost down
-on the pulls that exist for freshness, not for the backtested "closing line" record.
-Even so, this adds up fast: at a typical 8-game night, (3+3+3+7) x 8 = ~128
-credits/night, or ~3,400/month across a full season - well past the free plan's
+The close window pulls all 7 player markets (points/rebounds/assists plus threes/
+steals/blocks/turnovers) plus the 3 game markets (moneyline/spread/total) - the only
+automated window that refreshes game lines, since Top Picks' spread/total/moneyline
+picks need them current, not whatever was posted when someone last ran a manual
+--game-markets pull. The other windows use the base 3 player markets only, to keep
+cost down on the pulls that exist for same-day freshness, not the backtested "closing
+line" record. Even so, this adds up fast: at a typical 8-game night, (3+3+3+10) x 8 =
+~152 credits/night, or ~4,000/month across a full season - well past the free plan's
 500/month cap. This was turned on deliberately after discussing the real cost with
 an explicit decision to upgrade the Odds API plan rather than scale back - if you're
 back on the free plan, dial windows off above or lower MIN_CREDITS's effective
@@ -89,10 +92,13 @@ def snapshots():
       closing line. State key includes today's date, since these should fire again
       tomorrow for tomorrow's games.
 
-    Only the close window pulls the extra markets (threes/steals/blocks/turnovers) -
-    the others use the cheaper base 3, since they exist for same-day freshness, not
-    for the backtested closing-line record (see model.py/team_model.py's
-    closing_line_log_loss, which specifically wants the closing snapshot).
+    Only the close window pulls the extra player markets (threes/steals/blocks/
+    turnovers) and the game markets (moneyline/spread/total) - the others use the
+    cheaper base 3 player markets, since they exist for same-day freshness, not for
+    the backtested closing-line record (see model.py/team_model.py's
+    closing_line_log_loss, which specifically wants the closing snapshot). Game
+    markets only ever get refreshed here, in the close window - there's no separate
+    automated pull for them.
     """
     tip_windows = []  # (label, minutes-before-tip upper bound, lower bound)
     if PREGAME_90_ON:
@@ -130,7 +136,8 @@ def snapshots():
         for label, upper, lower in tip_windows:
             key = f"{event['id']}:{label}"
             if not state.get(key) and lower < minutes_to_tip <= upper:
-                markets = f"{pp.MARKETS},{pp.EXTRA_MARKETS}" if label == "close" else pp.MARKETS
+                markets = (f"{pp.MARKETS},{pp.EXTRA_MARKETS},{pp.GAME_MARKETS}"
+                          if label == "close" else pp.MARKETS)
                 todo.append((label, key, markets))
         # The events endpoint returns every scheduled game, including ones months out
         # (e.g. Christmas Day games listed in October) - clock windows only make sense
@@ -156,6 +163,9 @@ def snapshots():
                 continue
             rows = pp.flatten_event(data, pp.iso(now), "live")
             pp.save(data, rows, f"{label}_{event['id']}")
+            if label == "close":
+                game_rows = pp.flatten_game_odds(data, pp.iso(now), "live")
+                pp.save_game_odds(game_rows, f"{label}_{event['id']}")
             if rows:  # if books hadn't posted props yet, try again next run
                 state[key] = pp.iso(now)
                 save_state(state)
