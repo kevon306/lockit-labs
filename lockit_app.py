@@ -790,6 +790,30 @@ MAX_PLAUSIBLE_EDGE = 20
 TOP_PICKS_MAX = 5
 
 
+def recommendation_tier(edge, side):
+    """One standardized 5-level call, used everywhere a pick is shown (player props,
+    spreads, totals, moneylines alike) instead of each page inventing its own wording.
+
+    Reuses the two edge bars already established and backtested elsewhere on this page
+    - EDGE_THRESHOLD (the bar a pick must clear to be shown at all) and the midpoint
+    between it and MAX_PLAUSIBLE_EDGE (the bar above which an edge is flagged as
+    implausible, not ranked as a pick) - rather than inventing new cutoffs. A pick that
+    reaches here has already passed the real price-and-probability math (edge = model's
+    probability minus the market's no-vig probability, which is itself derived from the
+    real posted price) - this function only translates that number into one consistent
+    label, it doesn't add a second opinion.
+
+    `side` is whatever the pick's own side is - "Over"/"Under" for player props and
+    totals, a team name for spreads/moneylines - so the label reads naturally for both:
+    "STRONG LEAN OVER" or "STRONG LEAN LOS ANGELES LAKERS"."""
+    strong_bar = (EDGE_THRESHOLD + MAX_PLAUSIBLE_EDGE) / 2
+    e = abs(edge)
+    if e < EDGE_THRESHOLD:
+        return "NO CLEAR EDGE"
+    strength = "STRONG LEAN" if e >= strong_bar else "LEAN"
+    return f"{strength} {str(side).upper()}"
+
+
 def build_roster(box, odds):
     """player_id/team/opponent for everyone with an active line on tonight's board, built
     the same way the H2H opponent default is on the Players page."""
@@ -1617,11 +1641,14 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
     # moneyline) doesn't, so it just gets the same "picked" green.
     color = RED if r.side == "Under" else GREEN
     ev_txt = f'{r.ev:+.0%} EV' if r.ev is not None else "EV n/a"
+    tier = recommendation_tier(r.edge, r.side)
+    tier_color = AMBER if tier.startswith("STRONG") else (BLUE if tier.startswith("LEAN") else "#8A96B0")
     st.markdown(
         f'<div class="panel">'
         f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.8rem;flex-wrap:wrap;">'
         f'<div><div class="panel-title">{label} {escape(str(r.Player))}'
-        f'<span class="badge {CONF_CLASS[r.confidence]}" style="margin-left:.5rem;">{r.confidence} confidence</span></div>'
+        f'<span class="badge" style="margin-left:.5rem;background:{tier_color}26;color:{tier_color};">{escape(tier)}</span>'
+        f'<span class="badge {CONF_CLASS[r.confidence]}" style="margin-left:.4rem;">{r.confidence} confidence</span></div>'
         f'<div class="hint" style="margin:0;">{escape(r.Game)} &middot; {escape(r.Stat)} '
         f'{escape(str(r.side))}{line_txt}</div></div>'
         f'<div style="text-align:right;">'
