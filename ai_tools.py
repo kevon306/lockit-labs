@@ -353,13 +353,40 @@ def saved_picks():
 
 
 def injury_status(player_name):
-    """Always returns 'not available' - this app has no injury or lineup data source
-    connected. A tool, not a shortcut: this exists so the model calls it and gets an
-    honest answer instead of guessing or treating silence as 'healthy'."""
-    return {"player_name": player_name, "available": False,
-           "note": "No injury or lineup data source is connected to this app. Any "
-                   "injury claim in a user's message is unverified until a real source "
-                   "is added - treat it as a stated assumption, not a fact."}
+    """This player's most recently reported availability status, from ESPN's
+    unofficial injuries feed (injuries.py) - not an official NBA source, not
+    continuously monitored, and not always-populated (most players simply have
+    nothing reported, which this returns honestly as 'not reported', never as
+    'confirmed available'). Status wording (e.g. 'Out', 'Day-To-Day') is ESPN's own,
+    not this app's."""
+    box = _load("box_scores")
+    name = _match_player(player_name, box)
+    if name is None:
+        return {"player_name": player_name, "found": False,
+               "note": "No player matched this name in saved box scores."}
+
+    injuries = _load("injury_reports")
+    if injuries.empty:
+        return {"player_name": name, "status": "unknown",
+               "note": "No injury data has ever been pulled for this app yet - "
+                       "run `python3 injuries.py pull`. This is not the same as "
+                       "the player being confirmed healthy."}
+
+    last_checked = injuries["pulled_at"].max()
+    row = app.player_injury_status(injuries, name)
+    if row is None:
+        return {"player_name": name, "status": "not reported", "last_checked": last_checked,
+               "note": "No injury has been reported for this player as of the last "
+                       f"check ({last_checked}). This means nothing is on record - it "
+                       "is NOT the same as confirmed available, and must never be "
+                       "presented as a health confirmation."}
+    return {"player_name": name, "status": row["status"], "comment": row["comment"],
+           "injury_type": row["injury_type"], "return_date": row["return_date"],
+           "reported_at": row["report_date"], "last_checked": row["pulled_at"],
+           "note": f"This reflects the last time injury data was checked "
+                   f"({row['pulled_at']}), not continuous real-time monitoring. "
+                   "Status and details are ESPN's own wording, not verified by this "
+                   "app - treat 'Day-To-Day' as uncertain, not as a confirmed timeline."}
 
 
 # ---------- parlay analysis ----------

@@ -1,8 +1,16 @@
 """
 auto.py  -  the jobs your Mac runs on its own (set up by setup_automation.sh).
 
-  python3 auto.py morning   pull box scores, grade lines   (runs daily at 9 AM)
-  python3 auto.py snapshots capture odds before tipoff     (runs every 15 minutes)
+  python3 auto.py morning   pull box scores, grade lines, injuries (runs daily at 9 AM)
+  python3 auto.py snapshots capture odds before tipoff           (runs every 15 minutes)
+
+Injury data (injuries.py) is pulled once a day here, not on the 15-minute snapshot
+cycle - it's a free, unofficial endpoint with no documented rate limit or SLA, and
+once-daily is deliberately conservative rather than assumed safe. If real staleness
+turns out to matter (e.g. a game-day scratch decided after the morning pull), that's
+worth revisiting with real evidence, the same way the odds schedule evolved this
+season - not something to guess at upfront. A failed injury pull never takes down the
+rest of the morning job (box scores, grading still run).
 
 Snapshot timing (change in your .env file if you want):
   MORNING_SNAPSHOT=on     once/day, ~8-10 AM ET, every game that day   (3 credits/game)
@@ -42,6 +50,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 import box_scores
+import injuries
 import pull_props as pp
 
 load_dotenv(override=True)  # .env always wins - see the comment on pull_props.get_api_key()
@@ -78,6 +87,10 @@ def morning():
         box_scores.cmd_grade()
     except SystemExit as e:  # the scripts exit with a message on errors
         log(f"Stopped: {e}")
+    try:
+        injuries.cmd_pull()
+    except Exception as e:  # unofficial endpoint, no SLA - never take the morning job down
+        log(f"Injury pull failed (non-fatal): {e}")
     log("Morning job done")
 
 

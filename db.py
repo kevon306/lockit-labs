@@ -9,6 +9,7 @@ Commands:
 Tables:
   odds_snapshots  every prop line/price pulled, with the time it was captured
   box_scores      what each player actually did (filled in next step)
+  injury_reports  player availability pulled from ESPN's unofficial feed (injuries.py)
   predictions     model outputs; LOCKED once written (can't be edited or deleted)
   entries         real slips you placed: platform, stake, payout, result
   entry_legs      each pick inside an entry, optionally linked to a prediction
@@ -172,6 +173,28 @@ CREATE TABLE IF NOT EXISTS player_shot_zones (
     PRIMARY KEY (player_id, season, zone)
 );
 
+-- Player availability, pulled from ESPN's unofficial injuries feed - there is no
+-- official NBA or ESPN API for this (see injuries.py's own docstring for what was
+-- verified live before this was built, and its real caveats). Every pull is a new
+-- snapshot, same idea as odds_snapshots, so a status changing over time is visible
+-- instead of silently overwritten - "last reported" is always pulled_at, never implied
+-- continuous monitoring. A player with no row here means "nothing reported", not
+-- "confirmed healthy" - see ai_tools.injury_status(), which says that explicitly.
+CREATE TABLE IF NOT EXISTS injury_reports (
+    id               INTEGER PRIMARY KEY,
+    pulled_at        TEXT NOT NULL,
+    team             TEXT NOT NULL,   -- this app's own abbreviation (LAL, BOS, ...)
+    player_name      TEXT NOT NULL,
+    status           TEXT NOT NULL,   -- ESPN's own value, e.g. 'Out', 'Day-To-Day'
+    status_code      TEXT,            -- e.g. 'INJURY_STATUS_OUT'
+    comment          TEXT,            -- ESPN's own short description, real sourcing
+    injury_type      TEXT,            -- e.g. 'Knee'
+    report_date      TEXT,            -- ESPN's own 'date' field for this entry
+    return_date      TEXT,            -- ESPN's own estimate, if given
+    espn_injury_id   TEXT NOT NULL,
+    UNIQUE (pulled_at, espn_injury_id)
+);
+
 CREATE TABLE IF NOT EXISTS predictions (
     id               INTEGER PRIMARY KEY,
     created_at       TEXT NOT NULL,
@@ -291,6 +314,8 @@ ODDS_COLUMNS = ["snapshot_time", "source", "event_id", "commence_time", "home_te
 GAME_ODDS_COLUMNS = ["snapshot_time", "source", "event_id", "commence_time", "home_team",
                      "away_team", "bookmaker", "market", "side", "line",
                      "price_american", "book_last_update"]
+INJURY_COLUMNS = ["pulled_at", "team", "player_name", "status", "status_code", "comment",
+                  "injury_type", "report_date", "return_date", "espn_injury_id"]
 
 
 def now_utc():
@@ -350,6 +375,21 @@ def save_game_odds(rows):
             f"INSERT OR IGNORE INTO game_odds_snapshots ({', '.join(GAME_ODDS_COLUMNS)}) "
             f"VALUES ({', '.join('?' for _ in GAME_ODDS_COLUMNS)})",
             [tuple(r.get(c) for c in GAME_ODDS_COLUMNS) for r in rows],
+        )
+        return conn.total_changes - before
+
+
+def save_injury_reports(rows):
+    """Insert injury rows. Same pattern as save_odds - exact duplicates (same pull,
+    same ESPN injury id) are skipped, returns how many were new."""
+    if not rows:
+        return 0
+    with connect() as conn:
+        before = conn.total_changes
+        conn.executemany(
+            f"INSERT OR IGNORE INTO injury_reports ({', '.join(INJURY_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in INJURY_COLUMNS)})",
+            [tuple(r.get(c) for c in INJURY_COLUMNS) for r in rows],
         )
         return conn.total_changes - before
 

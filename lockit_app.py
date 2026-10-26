@@ -854,6 +854,31 @@ def resolve_game_odds_teams(game_odds):
     return g
 
 
+def latest_injury_reports(injuries):
+    """The most recent pull's rows only. injury_reports gets a new snapshot every
+    pull, same idea as odds_snapshots, so this is 'what's current', not 'everything
+    ever reported' - older snapshots stay in the table for later change-detection,
+    not for this lookup."""
+    if injuries.empty:
+        return injuries
+    return injuries[injuries["pulled_at"] == injuries["pulled_at"].max()]
+
+
+def player_injury_status(injuries, player_name):
+    """This player's current reported status (a dict of the matching row), or None if
+    nothing was reported for them in the latest pull. None means 'nothing reported',
+    never 'confirmed healthy' - callers must preserve that distinction, not collapse
+    it to a boolean."""
+    latest = latest_injury_reports(injuries)
+    if latest.empty:
+        return None
+    key = box_scores.normalize_name(player_name)
+    mine = latest[latest["player_name"].map(box_scores.normalize_name) == key]
+    if mine.empty:
+        return None
+    return mine.iloc[0].to_dict()
+
+
 def resolve_player_odds(odds, box):
     """Player-prop odds rows with player_id/game_date columns added, matched the same
     way build_roster() matches a player name to their most recent box-score record."""
@@ -2121,6 +2146,22 @@ def page_players():
         home_abbr = short(latest_ev["home_team"].iloc[0])
         away_abbr = short(latest_ev["away_team"].iloc[0])
         default_opp = away_abbr if player_team == home_abbr else home_abbr
+
+    injuries = load("injury_reports")
+    inj = player_injury_status(injuries, name)
+    if inj is not None:
+        badge_cls = "b-miss" if inj["status"] == "Out" else "b-wait"
+        type_txt = f" ({inj['injury_type']})" if inj.get("injury_type") else ""
+        st.markdown(
+            f'<p><span class="badge {badge_cls}">{escape(str(inj["status"]))}{escape(type_txt)}</span> '
+            f'{escape(str(inj["comment"] or ""))}</p>', unsafe_allow_html=True)
+        hint(f"From ESPN's injury feed (not an official NBA source), last checked "
+             f"{ago(inj['pulled_at'])} - not continuously monitored, and not reflected "
+             "in the model probabilities below yet.")
+    elif not injuries.empty:
+        hint(f"No injury reported for {name} as of the last check "
+             f"({ago(injuries['pulled_at'].max())}) - that means nothing is on record, "
+             "not that he's confirmed available.")
 
     section(f"Tonight's props for {name}")
     if mine_ev.empty:

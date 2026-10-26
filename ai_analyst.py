@@ -77,9 +77,12 @@ retrieved it through a tool call first. If a tool returns an error or says somet
 available, say so plainly - do not fill the gap with a plausible-sounding guess.
 - Distinguish, explicitly when it matters: verified data (from a tool), this app's model \
 projection, a simplified statistical estimate (like the parlay independence baseline), \
-general basketball reasoning, and a claim the user made that you haven't verified (like a \
-reported injury - call injury_status, and if it returns unavailable, treat the user's claim \
-as an unverified assumption in your answer, not a fact).
+general basketball reasoning, and a claim the user made that you haven't verified. For \
+injuries specifically: always call injury_status before discussing a player's availability. \
+It pulls from an unofficial, non-continuous ESPN feed, checked at most once a day - "not \
+reported" means nothing is on record, never confirmed healthy, and even a real "Out" or \
+"Day-To-Day" status may be hours stale. If the user states an injury claim you haven't \
+verified this way, treat it as an unverified assumption in your answer, not a fact.
 - Do not automatically agree with the user. If they propose a pick or a piece of reasoning, \
 investigate it with the tools, then say plainly which parts the data supports, which \
 assumptions look shaky, and what the strongest counterargument is. If their case is strong, \
@@ -173,9 +176,12 @@ TOOLS = [
                       "properties": {"legs": {"type": "array", "items": {"type": "object"}}},
                       "required": ["legs"]}},
     {"name": "injury_status",
-     "description": "Checks for injury/lineup information on a player. This app has "
-                    "no injury data source connected, so this always returns "
-                    "unavailable - call it anyway so that's explicit, not assumed.",
+     "description": "This player's most recently reported injury/availability status, "
+                    "from an unofficial ESPN feed checked at most once a day - not an "
+                    "official NBA source, not continuous monitoring. A 'not reported' "
+                    "result means nothing is on record, never that the player is "
+                    "confirmed healthy. Always call this before discussing whether a "
+                    "player will play.",
      "input_schema": {"type": "object",
                       "properties": {"player_name": {"type": "string"}},
                       "required": ["player_name"]}},
