@@ -1579,6 +1579,55 @@ def game_why_html(r, defense_allowed, team_zones):
         f'{glossary_html(terms)}')
 
 
+CONF_CLASS = {"High": "b-done", "Medium": "b-wait", "Low": "b-miss"}
+
+
+def pick_render_context(box):
+    """Shared lookup tables needed to render a pick card and its Why We Like It panel -
+    computed once per page load and passed into every render_pick_card() call."""
+    box_keyed = box.assign(key=box["player_name"].map(box_scores.normalize_name)).sort_values("game_date")
+    team_ratings = team_ratings_now(box)
+    defense_allowed = team_defense_allowed(box)
+    player_zones = load("player_shot_zones")
+    team_zones = load("team_shot_zones")
+    return box_keyed, team_ratings, defense_allowed, player_zones, team_zones
+
+
+def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones, team_zones):
+    line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
+    # Over/Under have a real green/red convention; a team-name side (spread,
+    # moneyline) doesn't, so it just gets the same "picked" green.
+    color = RED if r.side == "Under" else GREEN
+    ev_txt = f'{r.ev:+.0%} EV' if r.ev is not None else "EV n/a"
+    st.markdown(
+        f'<div class="panel">'
+        f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.8rem;flex-wrap:wrap;">'
+        f'<div><div class="panel-title">{label} {escape(str(r.Player))}'
+        f'<span class="badge {CONF_CLASS[r.confidence]}" style="margin-left:.5rem;">{r.confidence} confidence</span></div>'
+        f'<div class="hint" style="margin:0;">{escape(r.Game)} &middot; {escape(r.Stat)} '
+        f'{escape(str(r.side))}{line_txt}</div></div>'
+        f'<div style="text-align:right;">'
+        f'<div style="font-family:\'Bricolage Grotesque\',sans-serif;font-size:1.8rem;'
+        f'font-weight:700;color:{color};">{r.model_p:.0f}%</div>'
+        f'<div class="hint" style="margin:0;">model estimate</div></div></div>'
+        f'<div class="strip" style="margin-top:.8rem;">'
+        f'<div><b>{r.market_p:.0f}%</b><span>market-implied</span></div>'
+        f'<div><b>{r.edge:+.0f} pts</b><span>edge</span></div>'
+        f'<div><b>{ev_txt}</b><span>expected value</span></div>'
+        f'<div><b>{fmt_price(r.price)}</b><span>{escape(book(r.book) if pd.notna(r.book) else "-")}</span></div>'
+        f'<div><b>{int(r.games_before)}</b><span>games of history</span></div></div>'
+        f'<p class="hint" style="margin-top:.6rem;">{escape(r.note)} The market\'s no-vig '
+        f'price implies {r.market_p:.0f}% on {escape(str(r.side))}; the model estimates '
+        f'{r.model_p:.0f}%, a gap of {r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
+        f'</div>', unsafe_allow_html=True)
+    with st.expander("Why we like it"):
+        why_html = (player_why_html(r, box_keyed, team_ratings, defense_allowed,
+                                   player_zones, team_zones)
+                   if r.kind == "player" else
+                   game_why_html(r, defense_allowed, team_zones))
+        st.markdown(why_html, unsafe_allow_html=True)
+
+
 def page_top_picks():
     box, odds = load("box_scores"), load("odds_snapshots")
     game_odds = load("game_odds_snapshots")
@@ -1660,46 +1709,10 @@ def page_top_picks():
             unsafe_allow_html=True)
         return
 
-    conf_class = {"High": "b-done", "Medium": "b-wait", "Low": "b-miss"}
-    box_keyed = box.assign(key=box["player_name"].map(box_scores.normalize_name)).sort_values("game_date")
-    team_ratings = team_ratings_now(box)
-    defense_allowed = team_defense_allowed(box)
-    player_zones = load("player_shot_zones")
-    team_zones = load("team_shot_zones")
+    box_keyed, team_ratings, defense_allowed, player_zones, team_zones = pick_render_context(box)
 
-    def render_pick_card(r, label):
-        line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
-        # Over/Under have a real green/red convention; a team-name side (spread,
-        # moneyline) doesn't, so it just gets the same "picked" green.
-        color = RED if r.side == "Under" else GREEN
-        ev_txt = f'{r.ev:+.0%} EV' if r.ev is not None else "EV n/a"
-        st.markdown(
-            f'<div class="panel">'
-            f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.8rem;flex-wrap:wrap;">'
-            f'<div><div class="panel-title">{label} {escape(str(r.Player))}'
-            f'<span class="badge {conf_class[r.confidence]}" style="margin-left:.5rem;">{r.confidence} confidence</span></div>'
-            f'<div class="hint" style="margin:0;">{escape(r.Game)} &middot; {escape(r.Stat)} '
-            f'{escape(str(r.side))}{line_txt}</div></div>'
-            f'<div style="text-align:right;">'
-            f'<div style="font-family:\'Bricolage Grotesque\',sans-serif;font-size:1.8rem;'
-            f'font-weight:700;color:{color};">{r.model_p:.0f}%</div>'
-            f'<div class="hint" style="margin:0;">model estimate</div></div></div>'
-            f'<div class="strip" style="margin-top:.8rem;">'
-            f'<div><b>{r.market_p:.0f}%</b><span>market-implied</span></div>'
-            f'<div><b>{r.edge:+.0f} pts</b><span>edge</span></div>'
-            f'<div><b>{ev_txt}</b><span>expected value</span></div>'
-            f'<div><b>{fmt_price(r.price)}</b><span>{escape(book(r.book) if pd.notna(r.book) else "-")}</span></div>'
-            f'<div><b>{int(r.games_before)}</b><span>games of history</span></div></div>'
-            f'<p class="hint" style="margin-top:.6rem;">{escape(r.note)} The market\'s no-vig '
-            f'price implies {r.market_p:.0f}% on {escape(str(r.side))}; the model estimates '
-            f'{r.model_p:.0f}%, a gap of {r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
-            f'</div>', unsafe_allow_html=True)
-        with st.expander("Why we like it"):
-            why_html = (player_why_html(r, box_keyed, team_ratings, defense_allowed,
-                                       player_zones, team_zones)
-                       if r.kind == "player" else
-                       game_why_html(r, defense_allowed, team_zones))
-            st.markdown(why_html, unsafe_allow_html=True)
+    def render_card(r, label):
+        render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones, team_zones)
 
     hint("Estimated probability is not the same as betting value, and value isn't the same "
          "as a guaranteed outcome. Ranked by expected value at the best available price, not "
@@ -1724,7 +1737,7 @@ def page_top_picks():
              "settled games - see the rest below instead.")
     else:
         for rank, r in enumerate(strongest.itertuples(), 1):
-            render_pick_card(r, f"#{rank}")
+            render_card(r, f"#{rank}")
 
     if not other.empty:
         section("Other qualifying picks")
@@ -1734,7 +1747,7 @@ def page_top_picks():
              "is permanently capped at Medium regardless of track record (points, steals, "
              "blocks - see model.py).")
         for rank, r in enumerate(other.itertuples(), 1):
-            render_pick_card(r, f"#{rank}")
+            render_card(r, f"#{rank}")
 
     if not caution.empty:
         section("Check before trusting")
@@ -1745,7 +1758,7 @@ def page_top_picks():
              "far more likely explanation for a gap this size. Worth a look before trusting, "
              "not ranked alongside Top Picks.")
         for r in caution.itertuples():
-            render_pick_card(r, "Check:")
+            render_card(r, "Check:")
 
     def backtest_row(label, info):
         n = info.get("n", 0)
@@ -2063,6 +2076,37 @@ def page_players():
         home_abbr = short(latest_ev["home_team"].iloc[0])
         away_abbr = short(latest_ev["away_team"].iloc[0])
         default_opp = away_abbr if player_team == home_abbr else home_abbr
+
+    section(f"Tonight's props for {name}")
+    if mine_ev.empty:
+        hint(f"No active odds found for {name} right now - either he's not playing today, "
+             "or books haven't posted his props yet.")
+    else:
+        player_bt = model.closing_line_log_loss(box, resolve_player_odds(odds, box))
+        all_picks, _ = compute_picks(box, odds, player_bt)
+        his_picks = all_picks[all_picks["key"] == key].copy() if not all_picks.empty else all_picks
+        if his_picks.empty:
+            hint(f"{name} has active odds right now, but none of his markets have enough "
+                 "saved game history yet for a model projection.")
+        else:
+            his_picks["ev"] = his_picks.apply(lambda r: expected_value(r["model_p"], r["price"]), axis=1)
+            flagged = his_picks[his_picks["edge"].abs() > MAX_PLAUSIBLE_EDGE]
+            shown = his_picks[his_picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
+            shown = shown.reindex(shown["ev"].sort_values(ascending=False).index)
+            box_keyed, team_ratings, defense_allowed, player_zones, team_zones = pick_render_context(box)
+            for rank, r in enumerate(shown.itertuples(), 1):
+                render_pick_card(r, f"#{rank}", box_keyed, team_ratings, defense_allowed,
+                                 player_zones, team_zones)
+            if not flagged.empty:
+                with st.expander(f"{len(flagged)} more market(s) excluded - edge too large to be plausible"):
+                    hint(f"An edge over {MAX_PLAUSIBLE_EDGE} points against a real, liquid market "
+                         "almost always means the model is missing something real-world (an "
+                         "injury, a minutes restriction, a role change) rather than finding value "
+                         "no book noticed.")
+            hint("Ranked by expected value at the best available price, same ranking Top Picks "
+                 f"uses - every one of {name}'s markets with a model projection tonight, not "
+                 "just the ones that would clear Top Picks' own edge bar.")
+    st.divider()
 
     c3, c4 = st.columns([1.6, 3.6])
     opponent = c3.selectbox(
