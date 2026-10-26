@@ -195,6 +195,26 @@ CREATE TABLE IF NOT EXISTS injury_reports (
     UNIQUE (pulled_at, espn_injury_id)
 );
 
+-- One row per saved parlay analysis. Never updated - re-analyzing the same legs
+-- later (odds moved, model recalibrated) always inserts a new row, same philosophy
+-- as predictions below, just without the hard DB triggers since this is a user's own
+-- saved analysis, not a locked model-output ledger. legs_json carries each leg's full
+-- resolved state at analysis time (line, side, price, book, model/market probability)
+-- so a later odds update can never silently change what this analysis says.
+CREATE TABLE IF NOT EXISTS parlay_analyses (
+    id                                 INTEGER PRIMARY KEY,
+    created_at                         TEXT NOT NULL,
+    model_version                      TEXT NOT NULL,  -- same value predictions.model_version uses
+    legs_json                          TEXT NOT NULL,
+    leg_count                          INTEGER NOT NULL,
+    stake                              REAL,
+    combined_decimal_odds              REAL,
+    potential_payout                   REAL,
+    break_even_probability             REAL,
+    independence_baseline_probability  REAL,
+    legs_sharing_a_game                INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS predictions (
     id               INTEGER PRIMARY KEY,
     created_at       TEXT NOT NULL,
@@ -392,6 +412,22 @@ def save_injury_reports(rows):
             [tuple(r.get(c) for c in INJURY_COLUMNS) for r in rows],
         )
         return conn.total_changes - before
+
+
+def save_parlay_analysis(row):
+    """Insert one parlay analysis snapshot. Always a new row - see the table's own
+    comment for why this is never updated in place."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO parlay_analyses (created_at, model_version, legs_json, "
+            "leg_count, stake, combined_decimal_odds, potential_payout, "
+            "break_even_probability, independence_baseline_probability, "
+            "legs_sharing_a_game) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row["created_at"], row["model_version"], row["legs_json"], row["leg_count"],
+             row["stake"], row["combined_decimal_odds"], row["potential_payout"],
+             row["break_even_probability"], row["independence_baseline_probability"],
+             row["legs_sharing_a_game"]))
+        return cur.lastrowid
 
 
 def new_conversation(mode="ask", title=None, user_id="owner"):

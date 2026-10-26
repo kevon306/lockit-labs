@@ -549,6 +549,26 @@ def game_market_rows(game_odds_event):
     return df
 
 
+def game_market_model_pct(market, side, line, is_home_side, model_row, sigma_margin, sigma_total):
+    """The team model's own probability for one side of one game market, given a
+    team-model projection row (home_points/away_points/margin/total from
+    team_model.project_tonight_teams) and its fitted margin/total sigmas (from
+    team_model.fitted_params). Factored out so page_game_lines() and the Parlay
+    Analyzer compute this exactly the same way - one formula, not two that could
+    quietly drift apart."""
+    side_margin = model_row.margin if is_home_side else -model_row.margin
+    if market == "h2h":
+        return round(100 * stats.norm.sf(0, side_margin, sigma_margin), 1)
+    if market == "spreads":
+        # A side with posted line L covers iff its own signed margin beats -L (a -3.5
+        # favorite covers by winning by more than 3.5; a +3.5 underdog covers by
+        # losing by less than 3.5, or winning).
+        return round(100 * stats.norm.sf(-line, side_margin, sigma_margin), 1)
+    if side == "Over":
+        return round(100 * stats.norm.sf(line, model_row.total, sigma_total), 1)
+    return round(100 * stats.norm.cdf(line, model_row.total, sigma_total), 1)
+
+
 def tonight_scoreboard_card(r, game_odds_event):
     """One game's real spread/total/moneyline, compact - the Tonight page's quick-glance
     summary. Game Lines (page_game_lines) has the full detailed breakdown with the
@@ -596,7 +616,8 @@ def topbar(odds, here="tonight"):
     fresh = f"Odds updated {ago(odds['snapshot_time'].max())}" if not odds.empty else "No odds yet"
     n = len(slip.load())
     links = [("./", "tonight", "Tonight"), ("./picks", "picks", "Top Picks"),
-             ("./game-lines", "game_lines", "Game Lines"), ("./trends", "trends", "Trends"),
+             ("./game-lines", "game_lines", "Game Lines"), ("./parlay", "parlay", "Parlay"),
+             ("./trends", "trends", "Trends"),
              ("./lines", "lines", "Lines"), ("./players", "players", "Players"),
              ("./ai-analyst", "ai_analyst", "AI Analyst"), ("./bets", "bets", "My bets")]
     nav = "".join(
@@ -2073,18 +2094,8 @@ def page_game_lines():
                 model_pct = None
                 if model_row is not None:
                     is_home_side = (x.side == r.home)
-                    side_margin = model_row.margin if is_home_side else -model_row.margin
-                    if mkt == "h2h":
-                        model_pct = round(100 * stats.norm.sf(0, side_margin, sigma_margin), 1)
-                    elif mkt == "spreads":
-                        # A side with posted line L covers iff its own signed margin beats
-                        # -L (e.g. a -3.5 favorite covers by winning by more than 3.5; a
-                        # +3.5 underdog covers by losing by less than 3.5, or winning).
-                        model_pct = round(100 * stats.norm.sf(-x.line, side_margin, sigma_margin), 1)
-                    elif x.side == "Over":
-                        model_pct = round(100 * stats.norm.sf(x.line, model_row.total, sigma_total), 1)
-                    else:
-                        model_pct = round(100 * stats.norm.cdf(x.line, model_row.total, sigma_total), 1)
+                    model_pct = game_market_model_pct(mkt, x.side, x.line, is_home_side,
+                                                      model_row, sigma_margin, sigma_total)
 
                 model_line = ""
                 if model_pct is not None and x.no_vig_pct is not None:
@@ -2114,6 +2125,272 @@ def page_game_lines():
          f"{MAX_PLAUSIBLE_EDGE} points are flagged rather than shown as real value, same rule as "
          "Top Picks: a model with no access to real-world news that disagrees with a sharp market "
          "by a lot is more likely missing something than finding something.")
+
+
+PARLAY_MARKET_KEY = {"Moneyline": "h2h", "Spread": "spreads", "Total": "totals"}
+
+
+def parlay_leg_card(i, leg):
+    color = GREEN if leg["model_p"] is not None and leg["model_p"] >= leg["market_p"] else RED
+    model_txt = f'{leg["model_p"]:.0f}%' if leg["model_p"] is not None else "n/a"
+    conf_txt = (f'<span class="badge {CONF_CLASS[leg["confidence"]]}" style="margin-left:.4rem;">'
+               f'{leg["confidence"]} confidence</span>' if leg.get("confidence") else "")
+    st.markdown(
+        f'<div class="panel">'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;">'
+        f'<div><b>Leg {i}:</b> {escape(leg["description"])}{conf_txt}</div>'
+        f'<div style="text-align:right;">'
+        f'<span style="color:{color};font-weight:700;">{model_txt}</span> model '
+        f'&middot; {leg["market_p"]:.0f}% implied &middot; {fmt_price(leg["price"])} '
+        f'<small class="hint">{escape(leg["book"])}</small></div></div></div>',
+        unsafe_allow_html=True)
+
+
+def page_parlay():
+    box = load("box_scores")
+    odds = load("odds_snapshots")
+    game_odds = load("game_odds_snapshots")
+    topbar(odds, "parlay")
+
+    st.markdown(
+        f'<div class="hero">{COURT_SVG}<h1>Parlay Analyzer</h1>'
+        "<p>Build a parlay from real posted lines only - every leg here is a price "
+        "this app actually saved, never a typed-in guess. Each leg gets this app's "
+        "own model probability next to the market's; the combined number assumes "
+        "independence, which is explicitly a floor, not a real joint probability - "
+        "see the note below once you've added legs.</p></div>",
+        unsafe_allow_html=True)
+
+    legs = st.session_state.setdefault("parlay_analyzer_legs", [])
+
+    with st.expander(f"Parlay legs ({len(legs)})", expanded=not legs):
+        kind = st.segmented_control("Leg type", ["Player prop", "Game market"],
+                                    default="Player prop", label_visibility="collapsed") \
+            or "Player prop"
+
+        if kind == "Player prop":
+            if box.empty:
+                hint("No box scores saved yet.")
+            else:
+                c1, c2 = st.columns(2)
+                name = c1.selectbox("Player", sorted(box["player_name"].unique()), key="pa_player")
+                stat_label = c2.selectbox("Stat", list(MODEL_STAT_FOR_LABEL), key="pa_stat")
+                key = box_scores.normalize_name(name)
+                opts = player_leg_options(odds, key, stat_label)
+                if not opts:
+                    hint(f"No active {stat_label.lower()} lines for {name} tonight.")
+                else:
+                    c3, c4 = st.columns(2)
+                    line = c3.selectbox("Line", sorted(opts), key="pa_line",
+                                        format_func=lambda x: f"{x:g}")
+                    side = c4.selectbox("Side", list(opts[line]), key="pa_side")
+                    if st.button("Add player leg"):
+                        price, leg_book = opts[line][side]
+                        games_all_p = box[box["player_name"] == name].sort_values("game_date")
+                        player_id = games_all_p["player_id"].iloc[-1]
+                        team = games_all_p["team"].iloc[-1]
+                        mine_ev = odds[odds["player"].map(box_scores.normalize_name) == key]
+                        opponent = None
+                        if not mine_ev.empty:
+                            latest_ev = mine_ev[mine_ev["snapshot_time"] == mine_ev["snapshot_time"].max()]
+                            home_abbr = short(latest_ev["home_team"].iloc[0])
+                            away_abbr = short(latest_ev["away_team"].iloc[0])
+                            opponent = away_abbr if team == home_abbr else home_abbr
+                        model_stat = MODEL_STAT_FOR_LABEL[stat_label]
+                        mean_hat, var_hat = player_model_dist(box, player_id, name, team,
+                                                              opponent, model_stat)
+                        p_over = player_model_prob_at(mean_hat, var_hat, line)
+                        model_p = (p_over * 100 if side == "Over" else (100 - p_over * 100)) \
+                            if p_over is not None else None
+                        games_before = len(games_all_p)
+                        player_bt = cached_player_backtest(box, odds)
+                        confidence = (model.confidence_label(games_before, model_stat, player_bt)
+                                     if model_p is not None else None)
+                        legs.append({
+                            "kind": "player",
+                            "description": f"{name} {stat_label} {side} {line:g}",
+                            "price": price, "book": leg_book,
+                            "model_p": model_p, "market_p": implied(price) * 100,
+                            "confidence": confidence,
+                            "game_key": tuple(sorted({t for t in (team, opponent) if t})),
+                        })
+                        st.rerun()
+
+        else:
+            if game_odds.empty:
+                hint("No spread/total/moneyline odds saved yet.")
+            else:
+                ev = events_table(game_odds)
+                today = datetime.now(ET).strftime("%Y-%m-%d")
+                day = today if (ev["date"] == today).any() else ev["date"].max()
+                slate = ev[ev["date"] == day]
+                game_map = {f"{short(r.away)} at {short(r.home)}": r for r in slate.itertuples()}
+                if not game_map:
+                    hint("No games found for tonight's slate.")
+                else:
+                    c1, c2 = st.columns(2)
+                    game_choice = c1.selectbox("Game", list(game_map), key="pa_game")
+                    r = game_map[game_choice]
+                    market_label = c2.selectbox("Market", list(PARLAY_MARKET_KEY), key="pa_market")
+                    mkt = PARLAY_MARKET_KEY[market_label]
+                    board = game_market_rows(game_odds[game_odds["event_id"] == r.event_id])
+                    sub = board[board["market"] == mkt] if not board.empty else board
+                    if sub.empty:
+                        hint(f"No {market_label.lower()} posted yet for this game.")
+                    else:
+                        home_abbr, away_abbr = short(r.home), short(r.away)
+                        side_labels = {}
+                        for x in sub.itertuples():
+                            disp = short(x.side) if mkt in ("h2h", "spreads") else x.side
+                            line_txt = (f" {x.line:+.1f}" if mkt == "spreads"
+                                       else (f" {x.line:.1f}" if mkt == "totals" else ""))
+                            side_labels[f"{disp}{line_txt} ({fmt_price(x.price)})"] = x
+                        side_choice = st.selectbox("Side", list(side_labels), key="pa_side_game")
+                        if st.button("Add game leg"):
+                            x = side_labels[side_choice]
+                            if box.empty:
+                                st.toast("Need box scores saved to project this leg.")
+                            else:
+                                home_edge, sigma_margin, sigma_total = team_model.fitted_params(box)
+                                matchups = pd.DataFrame([{"home_team": home_abbr, "away_team": away_abbr}])
+                                try:
+                                    proj_row = team_model.project_tonight_teams(
+                                        box, matchups, home_edge).iloc[0]
+                                except (KeyError, IndexError):
+                                    proj_row = None
+                                model_p = games_before = confidence = None
+                                if proj_row is not None:
+                                    is_home_side = (x.side == r.home)
+                                    model_p = game_market_model_pct(
+                                        mkt, x.side, x.line, is_home_side, proj_row,
+                                        sigma_margin, sigma_total)
+                                    games_before = int(min(proj_row.home_games_before,
+                                                           proj_row.away_games_before))
+                                    game_bt = cached_game_backtest(box, game_odds)
+                                    confidence = game_confidence(games_before, mkt, game_bt)
+                                disp = short(x.side) if mkt in ("h2h", "spreads") else x.side
+                                line_txt = (f" {x.line:+.1f}" if mkt == "spreads"
+                                           else (f" {x.line:.1f}" if mkt == "totals" else ""))
+                                legs.append({
+                                    "kind": "game",
+                                    "description": f"{away_abbr} at {home_abbr} {market_label} "
+                                                   f"{disp}{line_txt}",
+                                    "price": int(x.price), "book": x.book,
+                                    "model_p": model_p,
+                                    "market_p": (x.no_vig_pct if x.no_vig_pct is not None
+                                                else implied(x.price) * 100),
+                                    "confidence": confidence,
+                                    "game_key": tuple(sorted({home_abbr, away_abbr})),
+                                })
+                                st.rerun()
+
+        for i, leg in enumerate(legs):
+            lc1, lc2 = st.columns([5, 1])
+            lc1.write(f"{i + 1}. {leg['description']} ({fmt_price(leg['price'])} {leg['book']})")
+            if lc2.button("Remove", key=f"pa_rm_{i}"):
+                legs.pop(i)
+                st.rerun()
+
+    if not legs:
+        hint("Add at least one leg above to analyze a parlay.")
+        return
+
+    stake = st.number_input("Stake ($)", min_value=0.0, value=10.0, step=5.0)
+
+    section("Parlay breakdown")
+    for i, leg in enumerate(legs, 1):
+        parlay_leg_card(i, leg)
+
+    combined_decimal = 1.0
+    for leg in legs:
+        combined_decimal *= decimal_odds(leg["price"])
+    legs_with_model_p = [leg for leg in legs if leg["model_p"] is not None]
+    independence_p = None
+    if len(legs_with_model_p) == len(legs):
+        independence_p = 1.0
+        for leg in legs:
+            independence_p *= leg["model_p"] / 100
+    break_even = 100 / combined_decimal
+    payout = stake * combined_decimal
+    profit = payout - stake
+
+    strip([
+        (len(legs), "legs"),
+        (f"{combined_decimal:.2f}x", "combined payout multiple"),
+        (f"{break_even:.1f}%", "break-even probability"),
+        (f"{independence_p * 100:.1f}%" if independence_p is not None else "n/a",
+         "independence baseline"),
+        (money(payout), "potential payout"),
+        (money(profit, signed=True), "potential profit"),
+    ])
+
+    game_keys = [leg["game_key"] for leg in legs if leg["game_key"]]
+    same_game_pairs = len(game_keys) - len(set(game_keys))
+    if same_game_pairs > 0:
+        hint(f"{same_game_pairs} pair(s) of legs share a game. The independence baseline "
+             "above is the product of each leg's individual probability, assuming they're "
+             "all unrelated - that assumption is almost certainly wrong when legs share a "
+             "game: pace, rotation, and game script connect them. This app has no joint "
+             "probability model for player-player or player-team correlation, so there is "
+             "no real combined-probability number to give. Treat the independence baseline "
+             "as a simplified, likely-optimistic floor, not this parlay's actual hit "
+             "probability.")
+    elif independence_p is not None:
+        hint("No legs share a game, so there's no known correlation signal between them - "
+             "the independence baseline is still a simplified estimate, not a verified "
+             "joint probability, but there's no specific reason here to think it's "
+             "badly wrong.")
+
+    if legs_with_model_p:
+        weakest = min(legs_with_model_p, key=lambda leg: leg["model_p"])
+        hint(f"Weakest leg by model probability: {weakest['description']} at "
+             f"{weakest['model_p']:.0f}%. A parlay is only as strong as its shakiest leg - "
+             "this is the one most likely to be the reason it misses.")
+    if len(legs_with_model_p) < len(legs):
+        hint(f"{len(legs) - len(legs_with_model_p)} leg(s) have no model probability "
+             "(not enough history, or an unmodeled stat) - the independence baseline above "
+             "is left blank rather than guessed when that happens.")
+
+    hint("Combined payout assumes standard decimal-odds multiplication across legs, the "
+         "same math every public parlay calculator uses - your sportsbook's actual parlay "
+         "price can differ (some books adjust for correlated or same-game legs). Estimated "
+         "probability is not the same as betting value, and value isn't the same as a "
+         "guaranteed outcome.")
+
+    if st.button("Save this analysis", type="primary"):
+        row = {
+            "created_at": db.now_utc(), "model_version": "walk-forward-v1",
+            "legs_json": json.dumps(legs), "leg_count": len(legs), "stake": stake,
+            "combined_decimal_odds": combined_decimal, "potential_payout": payout,
+            "break_even_probability": break_even / 100,
+            "independence_baseline_probability": independence_p,
+            "legs_sharing_a_game": same_game_pairs,
+        }
+        db.save_parlay_analysis(row)
+        st.toast("Saved to your parlay analysis history.")
+
+    with st.expander("Your saved parlay analyses"):
+        with db.connect() as conn:
+            history = pd.read_sql(
+                "SELECT * FROM parlay_analyses ORDER BY created_at DESC LIMIT 25", conn)
+        if history.empty:
+            hint("Nothing saved yet.")
+        else:
+            for h in history.itertuples():
+                h_legs = json.loads(h.legs_json)
+                desc = "; ".join(l["description"] for l in h_legs)
+                ip = (f"{h.independence_baseline_probability * 100:.0f}%"
+                     if h.independence_baseline_probability is not None else "n/a")
+                st.markdown(
+                    f'<div class="panel"><div class="hint">{escape(et(h.created_at).strftime("%b %-d, %-I:%M %p"))} '
+                    f'ET &middot; {h.leg_count} leg(s) &middot; stake {money(h.stake)}</div>'
+                    f'<div style="margin:.3rem 0;">{escape(desc)}</div>'
+                    f'<div class="hint">Independence baseline {ip} &middot; break-even '
+                    f'{h.break_even_probability * 100:.1f}% &middot; potential payout '
+                    f'{money(h.potential_payout)}</div></div>', unsafe_allow_html=True)
+            hint("Saved at analysis time and never overwritten - if odds or the model "
+                 "change later, re-analyze and save again rather than this updating "
+                 "in place.")
 
 
 def page_lines():
@@ -2305,20 +2582,11 @@ def page_players():
     model_stat = MODEL_STAT_FOR_LABEL.get(stat_label)
     mean_hat = var_hat = None
     if model_stat and not games_all.empty:
-        roster_one = pd.DataFrame([{"player_id": player_id, "player_name": name,
-                                    "team": player_team, "opponent": opponent}])
-        proj = model.project_tonight(box, roster_one).iloc[0]
-        if proj["games_before"] >= model.MIN_HISTORY:
-            mh, vh = proj[f"{model_stat}_mean_hat"], proj[f"{model_stat}_var_hat"]
-            if pd.notna(mh) and mh > 0:
-                mean_hat, var_hat = float(mh), float(vh)
+        mean_hat, var_hat = player_model_dist(box, player_id, name, player_team,
+                                              opponent, model_stat)
 
     def model_prob_at(x):
-        if mean_hat is None:
-            return None
-        is_nb, r, p = model.fit_dist(pd.Series([mean_hat]), pd.Series([var_hat]))
-        prob = model.p_over(pd.Series([float(x)]), pd.Series([mean_hat]), r, p, is_nb)
-        return None if pd.isna(prob[0]) else float(prob[0])
+        return player_model_prob_at(mean_hat, var_hat, x)
 
     if is_binary:
         line = None
@@ -2439,6 +2707,62 @@ def page_players():
                        "assists", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "steals", "blocks",
                        "turnovers", "fouls"]],
                      hide_index=True, width="stretch")
+
+def player_model_dist(box, player_id, player_name, team, opponent, model_stat):
+    """This player's fitted (mean, variance) for one model stat tonight, or (None,
+    None) if there's not enough history (model.MIN_HISTORY) or no real projection.
+    Same project_tonight() call the Players page and compute_picks() use - one engine,
+    not a second one that could quietly drift from it."""
+    if not model_stat:
+        return None, None
+    roster_one = pd.DataFrame([{"player_id": player_id, "player_name": player_name,
+                                "team": team, "opponent": opponent}])
+    proj = model.project_tonight(box, roster_one).iloc[0]
+    if proj["games_before"] < model.MIN_HISTORY:
+        return None, None
+    mh, vh = proj[f"{model_stat}_mean_hat"], proj[f"{model_stat}_var_hat"]
+    if pd.isna(mh) or mh <= 0:
+        return None, None
+    return float(mh), float(vh)
+
+
+def player_model_prob_at(mean_hat, var_hat, x):
+    """P(stat > x) for a player's already-fitted distribution, or None if there isn't
+    one (mean_hat is None)."""
+    if mean_hat is None:
+        return None
+    is_nb, r, p = model.fit_dist(pd.Series([mean_hat]), pd.Series([var_hat]))
+    prob = model.p_over(pd.Series([float(x)]), pd.Series([mean_hat]), r, p, is_nb)
+    return None if pd.isna(prob[0]) else float(prob[0])
+
+
+def player_leg_options(odds, key, stat_label):
+    """Every real, currently-posted line for one player+stat tonight, each tagged with
+    which sides actually have a posted price. Main-market lines have both Over and
+    Under; alt-market lines only ever have Over - books don't post an Under on alt
+    lines (see pull_props.py's ALT_MARKETS comment) - so this never offers a side that
+    isn't real. Returns {line: {"Over": (price, book) or None, "Under": (...) or None}}."""
+    options = {}
+    if stat_label in MARKET_FOR_STAT:
+        mine = odds[(odds["player"].map(box_scores.normalize_name) == key)
+                    & (odds["market"] == MARKET_FOR_STAT[stat_label])]
+        if not mine.empty:
+            newest = mine[mine["snapshot_time"] == mine["snapshot_time"].max()]
+            for line, g in newest.groupby("line"):
+                sides = {}
+                for side in ("Over", "Under"):
+                    s = g[g["side"] == side]
+                    if not s.empty:
+                        best = s.loc[s["price_american"].idxmax()]
+                        sides[side] = (int(best["price_american"]), book(best["bookmaker"]))
+                if sides:
+                    options[float(line)] = sides
+    if stat_label in ALT_MARKET_FOR_STAT:
+        rows = alt_line_rows(odds, key, ALT_MARKET_FOR_STAT[stat_label])
+        for r in rows.itertuples():
+            options.setdefault(float(r.line), {})["Over"] = (int(r.price_american), book(r.bookmaker))
+    return options
+
 
 def alt_line_rows(odds, player_key, market):
     """Latest snapshot's best price per line for one player's alt-line market.
@@ -2970,6 +3294,7 @@ nav = st.navigation({
                 url_path="tonight", default=True),
         st.Page(page_top_picks, title="Top Picks", icon=":material/stars:", url_path="picks"),
         st.Page(page_game_lines, title="Game Lines", icon=":material/scoreboard:", url_path="game-lines"),
+        st.Page(page_parlay, title="Parlay", icon=":material/calculate:", url_path="parlay"),
         st.Page(page_trends, title="Trends", icon=":material/trending_up:", url_path="trends"),
         st.Page(page_lines, title="Lines", icon=":material/table_rows:", url_path="lines"),
         st.Page(page_players, title="Players", icon=":material/person:", url_path="players"),
