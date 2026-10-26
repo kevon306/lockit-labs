@@ -1352,7 +1352,7 @@ def _zone_text(label, share, pct):
     return f"{share*100:.0f}% {label}{pct_txt}"
 
 
-def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, team_zones):
+def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries):
     """The 'Why we like it' panel for a player-prop pick: real basketball reasoning
     from this player's own game log, his team's and the opponent's current ratings,
     the opponent's real season-to-date defensive numbers, and (for points) real shot-
@@ -1360,7 +1360,12 @@ def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, t
     both his own shot profile and the opponent's real rim-protection and perimeter-
     defense numbers. No individual defender assignments or coverage schemes (drop/
     switch/trap) - box scores and shot charts don't carry that data, and inventing it
-    would violate the project's own no-fabrication rule."""
+    would violate the project's own no-fabrication rule.
+
+    injuries (from injury_reports, an unofficial feed checked at most once a day) is
+    shown for context only - it is NOT yet folded into mean/var_hat or model_p, which
+    is why an Out/Day-To-Day status is always surfaced as a caveat, never silently
+    treated as already accounted for."""
     stat = r.stat
     mean = getattr(r, f"{stat}_mean_hat")
     var = getattr(r, f"{stat}_var_hat")
@@ -1392,6 +1397,17 @@ def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, t
                 f"{escape(str(r.side))} {r.Line:.1f} {stat_lower}, estimating {r.model_p:.0f}% "
                 f"against the market's no-vig {r.market_p:.0f}%."]
     support, oppose, key_candidates = [], [], []
+
+    inj = player_injury_status(injuries, r.Player)
+    if inj is not None and inj["status"] in ("Out", "Day-To-Day"):
+        inj_comment = f" ESPN: \"{escape(str(inj['comment']))}\"" if inj.get("comment") else ""
+        breakdown.append(f"Reported status: <b>{escape(str(inj['status']))}</b> "
+                         f"(last checked {ago(inj['pulled_at'])}).{inj_comment} This isn't yet "
+                         "reflected in the projection below - treat the model's number as "
+                         "not accounting for this.")
+        oppose.append(f"{escape(str(r.Player))} has a reported {escape(str(inj['status']))} "
+                      "status the model's projection doesn't adjust for - a real reason "
+                      "this pick could be stale regardless of what the numbers below say.")
 
     if recent_min is not None and season_min is not None:
         trend = "steady" if abs(recent_min - season_min) < 3 else (
@@ -1528,10 +1544,11 @@ def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, t
                     "real season-to-date numbers above rather than head-to-head history.")
     breakdown.append(matchup_line)
 
-    caveats = ["The model has no visibility into injury reports, minutes restrictions, "
-              "individual defensive assignments, coverage schemes (drop coverage, "
-              "switching, traps), or role changes a sportsbook may already be pricing in - "
-              "that information isn't in box-score data, so it isn't guessed at here."]
+    caveats = ["The projection itself (mean/variance above) doesn't adjust for reported "
+              "injuries, minutes restrictions, individual defensive assignments, coverage "
+              "schemes (drop coverage, switching, traps), or role changes a sportsbook may "
+              "already be pricing in - none of that is in box-score data or folded into the "
+              "math here, even when a status is shown above."]
     if stat == "points":
         caveats.append("Points specifically still runs a bit overconfident in the tails even "
                        "with a long track record, which is why it's capped at Medium "
@@ -1765,10 +1782,11 @@ def pick_render_context(box):
     defense_allowed = team_defense_allowed(box)
     player_zones = load("player_shot_zones")
     team_zones = load("team_shot_zones")
-    return box_keyed, team_ratings, defense_allowed, player_zones, team_zones
+    injuries = load("injury_reports")
+    return box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries
 
 
-def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones, team_zones):
+def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries):
     line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
     # Over/Under have a real green/red convention; a team-name side (spread,
     # moneyline) doesn't, so it just gets the same "picked" green.
@@ -1800,7 +1818,7 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
         f'</div>', unsafe_allow_html=True)
     with st.expander("Why we like it"):
         why_html = (player_why_html(r, box_keyed, team_ratings, defense_allowed,
-                                   player_zones, team_zones)
+                                   player_zones, team_zones, injuries)
                    if r.kind == "player" else
                    game_why_html(r, defense_allowed, team_zones))
         st.markdown(why_html, unsafe_allow_html=True)
@@ -1887,10 +1905,11 @@ def page_top_picks():
             unsafe_allow_html=True)
         return
 
-    box_keyed, team_ratings, defense_allowed, player_zones, team_zones = pick_render_context(box)
+    box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries = pick_render_context(box)
 
     def render_card(r, label):
-        render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones, team_zones)
+        render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones,
+                         team_zones, injuries)
 
     hint("Estimated probability is not the same as betting value, and value isn't the same "
          "as a guaranteed outcome. Ranked by expected value at the best available price, not "
@@ -2543,10 +2562,9 @@ def page_players():
             flagged = his_picks[his_picks["edge"].abs() > MAX_PLAUSIBLE_EDGE]
             shown = his_picks[his_picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
             shown = shown.reindex(shown["ev"].sort_values(ascending=False).index)
-            box_keyed, team_ratings, defense_allowed, player_zones, team_zones = pick_render_context(box)
+            context = pick_render_context(box)
             for rank, r in enumerate(shown.itertuples(), 1):
-                render_pick_card(r, f"#{rank}", box_keyed, team_ratings, defense_allowed,
-                                 player_zones, team_zones)
+                render_pick_card(r, f"#{rank}", *context)
             if not flagged.empty:
                 with st.expander(f"{len(flagged)} more market(s) excluded - edge too large to be plausible"):
                     hint(f"An edge over {MAX_PLAUSIBLE_EDGE} points against a real, liquid market "
@@ -2978,6 +2996,179 @@ def page_results():
              "the gold zero line.")
 
 
+def learn_topic(title, body):
+    with st.expander(title):
+        st.markdown(body, unsafe_allow_html=True)
+
+
+def page_learn():
+    topbar(load("odds_snapshots"), "learn")
+    st.markdown(
+        f'<div class="hero">{COURT_SVG}<h1>Key / Learn</h1>'
+        "<p>What every number on this site actually means, in plain basketball terms - "
+        "with the exact math this app uses, not a generic definition.</p></div>",
+        unsafe_allow_html=True)
+
+    section("Bet types")
+    learn_topic("Moneyline", """
+<p>A straight bet on who wins the game, no margin involved. If the Lakers are
+<b>-150</b> and the Celtics are <b>+130</b>, the Lakers are the favorite: bet $150 on
+them to win $100 (plus your $150 back), or bet $100 on the Celtics to win $130 if they
+pull the upset.</p>
+<p>Negative price = favorite, you risk more than you win. Positive price = underdog,
+you win more than you risk. See Game Lines and the Parlay Analyzer's "Moneyline" leg
+type.</p>""")
+    learn_topic("Spread", """
+<p>A bet on the margin of victory, not just who wins. If the Lakers are <b>-5.5</b>,
+they have to win by 6 or more for that bet to cash - winning by 4 loses it, even
+though they still won the game. The underdog at <b>+5.5</b> covers by losing by 5 or
+fewer, or winning outright.</p>
+<p>This app's team model computes a side's cover probability from its own projected
+margin and how much that margin actually varies game to game (see "Variance" below) -
+that's the "model %" shown next to each spread on Game Lines.</p>""")
+    learn_topic("Total (Over/Under)", """
+<p>A bet on the combined score of both teams, not who wins. A posted total of
+<b>228.5</b> means Over wins if the final combined score is 229 or more, Under wins at
+228 or fewer.</p>
+<p>The team model's own projected total (home + away projected points) is compared
+against this line the same way a spread is - see Game Lines.</p>""")
+    learn_topic("Player props", """
+<p>A bet on one player's own stat line, not the game outcome - points, rebounds,
+assists, threes, steals, blocks, turnovers, or combinations like Pts+Reb+Ast. This
+app's model fits a real probability distribution (Poisson or Negative Binomial,
+whichever matches that player's own history better) from his actual game log, then
+asks "what's the chance he clears this number" - not a guess, a calculated
+probability from his own minutes, rate, and variance. See the Players page's "Tonight's
+props" section or Top Picks.</p>""")
+    learn_topic("Parlays", """
+<p>Multiple bets combined into one slip - every leg has to win for the parlay to pay
+out. The payout multiplies across legs (see "Expected value" below), which is why a
+big parlay payout isn't free money: the probability of winning drops multiplicatively
+too, often faster than people expect, especially when legs aren't actually
+independent (see "Correlation"). Build and analyze real parlays on the Parlay
+Analyzer page.</p>""")
+
+    section("Reading the odds")
+    learn_topic("American odds & implied probability", """
+<p>The standard US price format. A negative number is how much you'd risk to win
+$100; a positive number is how much you'd win on a $100 bet.</p>
+<p>Every price implies a probability, even before removing the book's margin:</p>
+<ul>
+<li>Negative price <code>p</code>: implied probability = <code>-p / (-p + 100)</code>.
+A -150 price implies 60%.</li>
+<li>Positive price <code>p</code>: implied probability = <code>100 / (p + 100)</code>.
+A +130 price implies 43.5%.</li>
+</ul>
+<p>This is the exact <code>implied()</code> function used everywhere on this site a
+"market-implied %" or "implied by price" number appears.</p>""")
+    learn_topic("No-vig (de-vig) probability", """
+<p>Add the implied probabilities of both sides of a real two-way market (Over/Under,
+or a moneyline) and they total more than 100% - that extra is the book's built-in
+margin ("the vig"). No-vig probability splits that margin out proportionally between
+both sides, leaving the market's honest best estimate with the house's cut removed.</p>
+<p>This only works when both sides are posted at the same book. Alternate lines only
+ever get the Over side posted, so there's nothing to de-vig against - anywhere you see
+"implied by price" instead of "no-vig %," that's why, and it's labeled that way on
+purpose rather than pretending it's the same calculation.</p>""")
+    learn_topic("Break-even probability", """
+<p>The win rate you'd need at a given price just to come out even in the long run -
+<code>100 / decimal odds</code>. At -150 (decimal 1.67), you need to win about 60% of
+the time to break even; at +130 (decimal 2.30), about 43.5%. The Parlay Analyzer shows
+this for a full combined parlay price, same formula, just on the multiplied-together
+odds.</p>""")
+    learn_topic("Expected value (EV)", """
+<p>The actual ranking metric this app uses for Top Picks and the Parlay Analyzer - not
+probability alone, and not edge in percentage points alone. EV per $1 staked is:</p>
+<p><code>model probability &times; decimal odds - 1</code></p>
+<p>A smaller edge at a much better price can be worth more than a bigger edge at a
+worse price, since the payout is what money is actually won or lost on - this is why
+Top Picks ranks by EV, not by raw model probability or the point-gap "edge" number.</p>""")
+    learn_topic("Projection vs. betting line (\"edge\")", """
+<p>The gap between this app's own model probability and the market's no-vig
+probability, in percentage points. An edge has to clear <b>8 points</b> before
+anything is even shown as a pick (<code>EDGE_THRESHOLD</code>), and anything over
+<b>20 points</b> (<code>MAX_PLAUSIBLE_EDGE</code>) gets flagged and excluded instead
+of celebrated - a gap that large against a real, liquid market is far more likely to
+mean the model is missing real-world context (an injury, a minutes restriction, a
+role change) than that it found value no book noticed. See Top Picks' "flagged" panel
+for exactly which lines got excluded and why.</p>""")
+
+    section("How this app evaluates a pick")
+    learn_topic("Confidence vs. probability", """
+<p>Two different things this app deliberately keeps separate. The <b>probability</b>
+is the model's own number for how likely a side is to hit. <b>Confidence</b> is how
+much to trust that number at all:</p>
+<ul>
+<li><b>Low</b>: fewer than 15 games of this player's or team's own history.</li>
+<li><b>Medium</b>: 15+ games, but this market hasn't yet shown (in a real backtest)
+that the model beats the closing line - or the stat is permanently capped here
+regardless of sample size (points, steals, blocks - a real, backtested tail-
+overconfidence issue, see model.py).</li>
+<li><b>High</b>: 30+ games <i>and</i> a real backtest showing the model's own
+probability beats the no-vig closing line on log loss for that exact market - proof
+it adds information, not just that it's well-calibrated.</li>
+</ul>
+<p>A pick can have a high probability and still be Low confidence (not enough
+history), or a modest probability and High confidence (a well-proven market). They're
+answering different questions.</p>""")
+    learn_topic("The recommendation indicator (STRONG LEAN / LEAN / NO CLEAR EDGE)", """
+<p>One consistent label, used the same way everywhere a pick is shown - Top Picks,
+Tonight, the Players page, the Parlay Analyzer:</p>
+<ul>
+<li><b>NO CLEAR EDGE</b>: edge under 8 points - not shown as a pick at all.</li>
+<li><b>LEAN [side]</b>: edge of 8-13.9 points.</li>
+<li><b>STRONG LEAN [side]</b>: edge of 14+ points (up to the 20-point plausibility
+cap - above that, it's flagged instead, see "Projection vs. betting line" above).</li>
+</ul>
+<p>For spreads and moneylines the team name takes the place of Over/Under (e.g.
+"STRONG LEAN LOS ANGELES LAKERS"). This is a straight translation of the edge math
+already described above, not a second opinion layered on top of it.</p>""")
+    learn_topic("Correlation", """
+<p>Two bets are correlated when one outcome makes the other more or less likely - most
+obviously, multiple props or a prop and a game line from the <i>same game</i>: pace,
+rotation, and game script connect them. This app has no joint probability model for
+player-player or player-team correlation, so it never invents a real combined
+probability for same-game parlay legs. The Parlay Analyzer explicitly flags when legs
+share a game and labels its combined number an "independence baseline" - a simplified,
+likely-optimistic floor, not a verified joint probability. Never trust a same-game
+parlay's quoted hit rate more than that.</p>""")
+    learn_topic("Variance (how spread out an outcome can be)", """
+<p>How much a player's or team's own results bounce around their average - not just
+what they average, but how reliably. This app estimates each player's real variance
+from his own game log (and for points specifically, also factors in how much his made
+threes swing, since a three is worth 50% more than a two and adds volatility a plain
+average can't see), then fits a Poisson or Negative Binomial distribution to it. Two
+players can share the same average and have very different real probabilities at the
+same line if one is far more consistent than the other.</p>""")
+    learn_topic("Sample size", """
+<p>How many real games a number is based on. This app shows sample size next to every
+split (L5, L10, L20, H2H, this season, last season) because a 3-for-5 head-to-head
+record and a 30-for-50 full-season record are not the same kind of evidence, even if
+the percentage looks similar - small samples (especially H2H) are noisy and are
+explicitly labeled that way rather than treated as predictive on their own.</p>""")
+    learn_topic("Player availability", """
+<p>Where reported, player status (e.g. Out, Day-To-Day) is pulled from an unofficial
+ESPN feed, checked at most once a day - not continuous monitoring, and not an official
+NBA source. A player with no status shown means nothing has been reported, which is
+never the same as confirmed healthy. As of now this is shown for context on the
+Players page, but isn't yet factored into the model's own probabilities - see the
+note on each player's status for exactly what that means for the picks below it.</p>""")
+
+    section("Tracking results")
+    learn_topic("ROI and profit tracking", """
+<p>My Bets records entries you actually placed elsewhere (this app never places
+bets) - stake, odds, and result, so real profit and loss can be tracked against what
+you actually risked, separate from the model's own prediction accuracy. Results shows
+how saved prop lines actually graded (Over/Under/Push) against real box scores. These
+are reported separately on purpose: a model can be well-calibrated while you're down
+money on bad prices, or vice versa - they answer different questions and conflating
+them would hide which one is actually the problem.</p>""")
+
+    hint("Every number explained here is computed with the exact formula named, from "
+         "this app's own saved data - nothing above is a generic textbook definition "
+         "standing in for what the site actually does.")
+
+
 def page_system():
     odds, box = load("odds_snapshots"), load("box_scores")
     topbar(odds, "system")
@@ -3299,6 +3490,7 @@ nav = st.navigation({
         st.Page(page_lines, title="Lines", icon=":material/table_rows:", url_path="lines"),
         st.Page(page_players, title="Players", icon=":material/person:", url_path="players"),
         st.Page(page_ai_analyst, title="AI Analyst", icon=":material/forum:", url_path="ai-analyst"),
+        st.Page(page_learn, title="Key / Learn", icon=":material/menu_book:", url_path="learn"),
     ],
     "Track": [
         st.Page(page_bets, title="My bets", icon=":material/receipt_long:", url_path="bets"),
