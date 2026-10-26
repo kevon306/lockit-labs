@@ -436,7 +436,7 @@ def events_table(odds):
                away=("away_team", "first"), last_snap=("snapshot_time", "max"),
                snaps=("snapshot_time", "nunique"))
           .reset_index())
-    ev["tip"] = ev["commence_time"].map(et)
+    ev["tip"] = pd.to_datetime(ev["commence_time"], utc=True).dt.tz_convert(ET)
     ev["date"] = ev["tip"].dt.strftime("%Y-%m-%d")
     return ev.sort_values("tip")
 
@@ -826,7 +826,7 @@ def resolve_game_odds_teams(game_odds):
     g = game_odds.copy()
     g["home_abbr"] = g["home_team"].map(short)
     g["away_abbr"] = g["away_team"].map(short)
-    g["game_date"] = g["commence_time"].map(et).dt.strftime("%Y-%m-%d")
+    g["game_date"] = pd.to_datetime(g["commence_time"], utc=True).dt.tz_convert(ET).dt.strftime("%Y-%m-%d")
     return g
 
 
@@ -840,7 +840,7 @@ def resolve_player_odds(odds, box):
     box_keyed = box.assign(key=box["player_name"].map(box_scores.normalize_name))
     last_id = box_keyed.sort_values("game_date").groupby("key")["player_id"].last()
     o["player_id"] = o["key"].map(last_id)
-    o["game_date"] = o["commence_time"].map(et).dt.strftime("%Y-%m-%d")
+    o["game_date"] = pd.to_datetime(o["commence_time"], utc=True).dt.tz_convert(ET).dt.strftime("%Y-%m-%d")
     return o.dropna(subset=["player_id"])
 
 
@@ -1014,6 +1014,23 @@ def game_confidence(games_before, market, backtest):
     return "High" if (games_before >= 30 and beats_market) else "Medium"
 
 
+@st.cache_data(ttl=60)
+def cached_player_backtest(box, odds):
+    """Cached wrapper around model.closing_line_log_loss() - a full walk-forward
+    recompute over every saved box score (~5-7s), now needed on both the Top Picks
+    and Players pages. Streamlit reruns the whole script on every widget interaction,
+    so without caching this, every single click anywhere on either page would pay
+    this cost again - the ttl matches load()'s, so it never serves odds staler than
+    what's already on screen."""
+    return model.closing_line_log_loss(box, resolve_player_odds(odds, box))
+
+
+@st.cache_data(ttl=60)
+def cached_game_backtest(box, game_odds):
+    return team_model.closing_line_log_loss(box, resolve_game_odds_teams(game_odds))
+
+
+@st.cache_data(ttl=60)
 def compute_picks(box, odds, player_bt=None):
     """Every active prop line with a model projection, with the model's probability,
     the market's, and the gap between them. Not yet filtered to "qualifying" picks."""
@@ -1076,6 +1093,7 @@ def compute_picks(box, odds, player_bt=None):
     return picks, slate_odds["snapshot_time"].max()
 
 
+@st.cache_data(ttl=60)
 def compute_game_picks(box, game_odds, game_bt=None):
     """Every game+market with a model projection, in the same shape as compute_picks()
     so the two can be ranked together. Only the side of each game+market the model
@@ -1644,8 +1662,8 @@ def page_top_picks():
         "number of picks - some nights there may be none.</p></div>",
         unsafe_allow_html=True)
 
-    player_bt = model.closing_line_log_loss(box, resolve_player_odds(odds, box))
-    game_bt = team_model.closing_line_log_loss(box, resolve_game_odds_teams(game_odds))
+    player_bt = cached_player_backtest(box, odds)
+    game_bt = cached_game_backtest(box, game_odds)
 
     player_picks, last_snap_p = compute_picks(box, odds, player_bt)
     game_picks, last_snap_g = compute_game_picks(box, game_odds, game_bt)
@@ -2082,7 +2100,7 @@ def page_players():
         hint(f"No active odds found for {name} right now - either he's not playing today, "
              "or books haven't posted his props yet.")
     else:
-        player_bt = model.closing_line_log_loss(box, resolve_player_odds(odds, box))
+        player_bt = cached_player_backtest(box, odds)
         all_picks, _ = compute_picks(box, odds, player_bt)
         his_picks = all_picks[all_picks["key"] == key].copy() if not all_picks.empty else all_picks
         if his_picks.empty:
