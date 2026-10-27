@@ -3119,7 +3119,12 @@ def page_trends():
     today = datetime.now(ET).strftime("%Y-%m-%d")
     day = today if (ev["date"] == today).any() else ev["date"].max()
     slate = ev[ev["date"] == day]
-    slate_odds = odds[odds["event_id"].isin(slate["event_id"])]
+    # Alt-line markets (player_points_alternate etc, from --alt-lines pulls) are
+    # excluded here - they're not in box_scores.MARKET_TO_STAT (that crashes
+    # build_trends below on an unknown market), and a trend needs one consensus
+    # line per player/stat, which alt lines don't give (a book posts many).
+    slate_odds = odds[odds["event_id"].isin(slate["event_id"])
+                      & odds["market"].isin(box_scores.MARKET_TO_STAT)]
 
     boards = []
     for r in slate.itertuples():
