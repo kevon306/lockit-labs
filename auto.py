@@ -1,8 +1,13 @@
 """
 auto.py  -  the jobs your Mac runs on its own (set up by setup_automation.sh).
 
-  python3 auto.py morning   pull box scores, grade lines, injuries (runs daily at 9 AM)
-  python3 auto.py snapshots capture odds before tipoff           (runs every 15 minutes)
+  python3 auto.py morning   pull box scores, grade lines/injuries/predictions (9 AM)
+  python3 auto.py snapshots capture odds before tipoff                  (every 15 min)
+
+Prediction grading (performance.py) matches every logged-but-ungraded prediction
+against real settled results once its game is final, and never touches the locked
+predictions table itself - see performance.py's own docstring for exactly how. A
+grading bug here never takes down the rest of the morning job.
 
 Injury data (injuries.py) is pulled once a day here, not on the 15-minute snapshot
 cycle - it's a free, unofficial endpoint with no documented rate limit or SLA, and
@@ -51,6 +56,7 @@ from dotenv import load_dotenv
 
 import box_scores
 import injuries
+import performance
 import pull_props as pp
 
 load_dotenv(override=True)  # .env always wins - see the comment on pull_props.get_api_key()
@@ -91,6 +97,11 @@ def morning():
         injuries.cmd_pull()
     except Exception as e:  # unofficial endpoint, no SLA - never take the morning job down
         log(f"Injury pull failed (non-fatal): {e}")
+    try:
+        summary = performance.grade_predictions()
+        log(f"Graded predictions: {summary}")
+    except Exception as e:  # never take the morning job down over a grading bug
+        log(f"Prediction grading failed (non-fatal): {e}")
     log("Morning job done")
 
 

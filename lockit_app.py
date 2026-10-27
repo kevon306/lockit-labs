@@ -1824,6 +1824,73 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
         st.markdown(why_html, unsafe_allow_html=True)
 
 
+MODEL_VERSION = "walk-forward-v1"
+
+
+def log_predictions(savable):
+    """Writes every not-yet-logged pick in `savable` to the locked predictions ledger.
+    Safe to call on every page load: dedupes against (event_id, player, market) already
+    in the table, so re-opening Top Picks never logs the same pick twice. Returns how
+    many new rows were written.
+
+    This is the only place predictions get logged - automatic, not gated behind a
+    button, so the ledger reflects every pick this app has ever actually generated,
+    not just the ones someone remembered to save."""
+    if savable.empty:
+        return 0
+    with db.connect() as conn:
+        existing = pd.read_sql("SELECT event_id, player, market FROM predictions", conn)
+    have = set(zip(existing["event_id"], existing["player"], existing["market"]))
+    new_rows = [r for r in savable.itertuples()
+               if (r.event_id, r.Player, r.market) not in have]
+    if not new_rows:
+        return 0
+
+    with db.connect() as conn:
+        for r in new_rows:
+            line_for_lookup = None if r.Stat == "Moneyline" else r.Line
+            # Each kind's snapshot id goes in its own column now - an earlier version
+            # put a game_odds_snapshots id into the odds_snapshot_id column (which
+            # REFERENCES odds_snapshots), and only avoided a FK failure by coincidental
+            # id overlap between the two tables. Fixed going forward; a handful of
+            # early logged rows still carry that stale, misleading odds_snapshot_id
+            # value (event_id/player/market/line/probability on those rows are still
+            # correct - only the snapshot back-reference was ever wrong).
+            if r.kind == "player":
+                snap_table, player_col = "odds_snapshots", "AND player=?"
+                params = [r.event_id, r.Player, r.market, line_for_lookup]
+            else:
+                snap_table, player_col = "game_odds_snapshots", ""
+                params = [r.event_id, r.market, line_for_lookup]
+            snap_id = conn.execute(
+                f"SELECT id FROM {snap_table} WHERE event_id=? {player_col} AND "
+                "market=? AND line IS ? ORDER BY snapshot_time DESC LIMIT 1",
+                params).fetchone()
+            # p_over here means "probability of the recommended side", not literally
+            # Over for spread/moneyline picks - true for every kind this page produces.
+            p_val = r.model_p / 100
+            inputs = json.dumps({
+                "note": r.note, "games_before": int(r.games_before),
+                "confidence": r.confidence, "market_p": round(r.market_p, 2),
+                "edge_threshold": EDGE_THRESHOLD, "kind": r.kind,
+                # Recommended side, explicit - for game-kind rows this duplicates
+                # `player` (team abbr, or Over/Under for totals), but for player-prop
+                # rows it's the ONLY place Over/Under is recorded at all. A handful of
+                # early test rows were saved before this was added and can't be graded
+                # for win/loss as a result - see performance.py's grading function.
+                "side": r.side})
+            conn.execute(
+                "INSERT INTO predictions (created_at, model_version, event_id, player, "
+                "market, line, p_over, p_under, p_push, odds_snapshot_id, "
+                "game_odds_snapshot_id, inputs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                (db.now_utc(), MODEL_VERSION, r.event_id, r.Player, r.market,
+                 0.0 if r.Stat == "Moneyline" else r.Line, p_val, 1 - p_val,
+                 snap_id[0] if (snap_id and r.kind == "player") else None,
+                 snap_id[0] if (snap_id and r.kind != "player") else None, inputs))
+    st.cache_data.clear()
+    return len(new_rows)
+
+
 def page_top_picks():
     box, odds = load("box_scores"), load("odds_snapshots")
     game_odds = load("game_odds_snapshots")
@@ -1989,45 +2056,15 @@ def page_top_picks():
                              "confidence": "Confidence"}),
             hide_index=True, width="stretch")
 
-    if st.button("Save these picks to the prediction ledger", type="primary"):
-        with db.connect() as conn:
-            existing = pd.read_sql(
-                "SELECT event_id, player, market FROM predictions", conn)
-        have = set(zip(existing["event_id"], existing["player"], existing["market"]))
-        savable = pd.concat([qualifying, caution], ignore_index=True)
-        new_rows = [r for r in savable.itertuples()
-                   if (r.event_id, r.Player, r.market) not in have]
-        if not new_rows:
-            st.toast("Every current pick is already in the ledger.")
-        else:
-            with db.connect() as conn:
-                for r in new_rows:
-                    line_for_lookup = None if r.Stat == "Moneyline" else r.Line
-                    snap_table = "odds_snapshots" if r.kind == "player" else "game_odds_snapshots"
-                    player_col = "AND player=?" if r.kind == "player" else ""
-                    params = [r.event_id] + ([r.Player] if r.kind == "player" else []) + [r.market, line_for_lookup]
-                    snap_id = conn.execute(
-                        f"SELECT id FROM {snap_table} WHERE event_id=? {player_col} AND "
-                        "market=? AND line IS ? ORDER BY snapshot_time DESC LIMIT 1",
-                        params).fetchone()
-                    # p_over here means "probability of the recommended side", not literally
-                    # Over for spread/moneyline picks - true for every kind this page produces.
-                    p_val = r.model_p / 100
-                    inputs = json.dumps({
-                        "note": r.note, "games_before": int(r.games_before),
-                        "confidence": r.confidence, "market_p": round(r.market_p, 2),
-                        "edge_threshold": EDGE_THRESHOLD, "kind": r.kind})
-                    conn.execute(
-                        "INSERT INTO predictions (created_at, model_version, event_id, player, "
-                        "market, line, p_over, p_under, p_push, odds_snapshot_id, inputs_json) "
-                        "VALUES (?, 'walk-forward-v1', ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-                        (db.now_utc(), r.event_id, r.Player, r.market,
-                         0.0 if r.Stat == "Moneyline" else r.Line, p_val, 1 - p_val,
-                         snap_id[0] if snap_id else None, inputs))
-            st.cache_data.clear()
-            st.toast(f"Saved {len(new_rows)} prediction{'s' if len(new_rows) != 1 else ''} "
-                     "to the locked ledger.")
-            st.rerun()
+    new_count = log_predictions(pd.concat([qualifying, caution], ignore_index=True))
+    if new_count:
+        st.toast(f"Logged {new_count} new prediction{'s' if new_count != 1 else ''} "
+                 "to the locked ledger.")
+    hint(f"Every qualifying pick above is automatically logged to the prediction "
+         "ledger once, the moment it's first computed - re-opening this page never "
+         "logs the same pick twice, and a logged prediction can't be edited or "
+         "deleted afterward, even if the model or the odds change later. See Model "
+         "Performance for how logged predictions have actually done.")
 
 
 CONFIDENCE_NOTE = {
@@ -2378,7 +2415,7 @@ def page_parlay():
 
     if st.button("Save this analysis", type="primary"):
         row = {
-            "created_at": db.now_utc(), "model_version": "walk-forward-v1",
+            "created_at": db.now_utc(), "model_version": MODEL_VERSION,
             "legs_json": json.dumps(legs), "leg_count": len(legs), "stake": stake,
             "combined_decimal_odds": combined_decimal, "potential_payout": payout,
             "break_even_probability": break_even / 100,
@@ -2996,6 +3033,125 @@ def page_results():
              "the gold zero line.")
 
 
+def page_model_performance():
+    topbar(load("odds_snapshots"), "model_performance")
+    st.markdown(
+        f'<div class="hero">{COURT_SVG}<h1>Model Performance</h1>'
+        "<p>How this app's own logged predictions have actually done, against real "
+        "settled results - not the raw market-line grading on Results, this is "
+        "specifically the locked prediction ledger's own track record.</p></div>",
+        unsafe_allow_html=True)
+
+    with db.connect() as conn:
+        preds = pd.read_sql("SELECT * FROM predictions", conn)
+        results = pd.read_sql("SELECT * FROM prediction_results", conn)
+
+    if preds.empty:
+        hint("No predictions logged yet. Every qualifying pick on Top Picks is now "
+             "logged automatically the first time it's computed - check back once "
+             "some have been saved and their games have finished.")
+        return
+
+    merged = preds.merge(results, left_on="id", right_on="prediction_id", how="left",
+                         suffixes=("", "_r"))
+    merged["confidence"] = merged["inputs_json"].map(
+        lambda s: json.loads(s).get("confidence") if s else None)
+    merged["kind"] = merged["inputs_json"].map(
+        lambda s: json.loads(s).get("kind", "player") if s else "player")
+    graded = merged[merged["result"].notna()]
+    decided = graded[graded["result"].isin(["WON", "LOST"])]
+
+    strip([
+        (len(preds), "predictions logged"),
+        (len(graded), "graded"),
+        (int((graded["result"] == "VOID").sum()), "void (unmatched)"),
+        (int((graded["result"] == "PUSH").sum()), "pushed"),
+        (len(decided), "decided (won/lost)"),
+        (f"{(decided['result'] == 'WON').mean() * 100:.0f}%" if not decided.empty else "–",
+         "win rate"),
+    ])
+
+    if len(preds) - len(graded):
+        hint(f"{len(preds) - len(graded)} prediction(s) haven't graded yet - their games "
+             "either haven't finished, or box scores for that date haven't been pulled. "
+             "Graded automatically every morning, same job that pulls box scores.")
+
+    def show_all_graded():
+        with st.expander(f"All {len(graded)} graded predictions"):
+            show = graded.copy()
+            show["Logged"] = pd.to_datetime(show["created_at"]).dt.strftime("%b %-d, %-I:%M %p")
+            st.dataframe(
+                show[["Logged", "player", "market", "line", "result", "actual_value", "confidence"]]
+                .rename(columns={"player": "Player/Team", "market": "Market", "line": "Line",
+                                 "result": "Result", "actual_value": "Actual", "confidence": "Confidence"})
+                .sort_values("Logged", ascending=False),
+                hide_index=True, width="stretch")
+            hint("VOID means this prediction couldn't be matched to a real settled outcome - "
+                 "most commonly a player who didn't play, or (for a handful of early "
+                 "predictions) a recommended side that wasn't recorded before this page "
+                 "existed. Never counted as a loss.")
+
+    if decided.empty:
+        hint("No decided (won/lost) predictions yet - nothing below can be computed "
+             "honestly until there are some. This isn't an error; it just means the "
+             "ledger is new. Come back after a few nights of games have graded.")
+        if not graded.empty:
+            show_all_graded()
+        return
+
+    if len(decided) < 20:
+        hint(f"Only {len(decided)} decided prediction(s) so far - far too small a "
+             "sample to draw any real conclusion from a win rate, by-market breakdown, "
+             "or calibration check. Shown below for transparency and to verify the "
+             "pipeline works, not as evidence the model is good or bad yet.")
+
+    section("Performance by market")
+    by_market = decided.groupby("market").agg(
+        n=("result", "size"), wins=("result", lambda s: (s == "WON").sum()))
+    by_market["Win rate"] = (by_market["wins"] / by_market["n"] * 100).round(0).astype(int).astype(str) + "%"
+    by_market = by_market.rename(columns={"n": "Decided", "wins": "Won"}).reset_index()
+    by_market = by_market.rename(columns={"market": "Market"})
+    st.dataframe(by_market[["Market", "Decided", "Won", "Win rate"]], hide_index=True, width="stretch")
+
+    section("Performance by confidence")
+    by_conf = decided.groupby("confidence").agg(
+        n=("result", "size"), wins=("result", lambda s: (s == "WON").sum()))
+    by_conf["Win rate"] = (by_conf["wins"] / by_conf["n"] * 100).round(0).astype(int).astype(str) + "%"
+    by_conf = by_conf.rename(columns={"n": "Decided", "wins": "Won"}).reset_index()
+    by_conf = by_conf.rename(columns={"confidence": "Confidence"})
+    st.dataframe(by_conf[["Confidence", "Decided", "Won", "Win rate"]], hide_index=True, width="stretch")
+    hint("High confidence should win more often than Medium, which should win more "
+         "often than Low, if the confidence tiers mean what they claim to. With this "
+         "few decided predictions, don't read anything into it yet either way.")
+
+    section("Calibration (Brier score)")
+    has_brier = decided[decided["brier_component"].notna()]
+    if has_brier.empty:
+        hint("No decided predictions have a Brier component yet.")
+    else:
+        brier_score = has_brier["brier_component"].mean()
+        strip([(f"{brier_score:.3f}", "Brier score (lower is better, 0 is perfect)"),
+              (len(has_brier), "predictions scored")])
+        hint("Brier score is the average squared gap between the probability this app "
+             "assigned to the side it recommended and whether that side actually won "
+             "(1) or lost (0). 0.25 is what a coin flip (always guessing 50%) scores - "
+             "meaningfully below that over a real sample is a real signal, not noise.")
+
+        has_brier = has_brier.assign(p_bucket=(has_brier["p_over"] * 10).astype(int) * 10)
+        buckets = has_brier.groupby("p_bucket").agg(
+            n=("result", "size"), wins=("result", lambda s: (s == "WON").sum()))
+        buckets["Real hit rate"] = (buckets["wins"] / buckets["n"] * 100).round(0).astype(int).astype(str) + "%"
+        buckets = buckets.rename(columns={"n": "Predictions"}).reset_index()
+        buckets["Predicted probability"] = buckets["p_bucket"].map(lambda b: f"{b}-{b + 9}%")
+        st.dataframe(buckets[["Predicted probability", "Predictions", "Real hit rate"]],
+                     hide_index=True, width="stretch")
+        hint("Well-calibrated predictions in, say, the 60-69% bucket should actually win "
+             "about 60-69% of the time. A bucket with only a handful of predictions is "
+             "too small to judge - this needs real volume before it means anything.")
+
+    show_all_graded()
+
+
 def learn_topic(title, body):
     with st.expander(title):
         st.markdown(body, unsafe_allow_html=True)
@@ -3495,6 +3651,8 @@ nav = st.navigation({
     "Track": [
         st.Page(page_bets, title="My bets", icon=":material/receipt_long:", url_path="bets"),
         st.Page(page_results, title="Results", icon=":material/fact_check:", url_path="results"),
+        st.Page(page_model_performance, title="Model Performance", icon=":material/monitoring:",
+                url_path="model-performance"),
         st.Page(page_system, title="System", icon=":material/settings:", url_path="system"),
     ],
 })

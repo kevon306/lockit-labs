@@ -11,6 +11,7 @@ Tables:
   box_scores      what each player actually did (filled in next step)
   injury_reports  player availability pulled from ESPN's unofficial feed (injuries.py)
   predictions     model outputs; LOCKED once written (can't be edited or deleted)
+  prediction_results  real graded outcome for each prediction, once its game is final
   entries         real slips you placed: platform, stake, payout, result
   entry_legs      each pick inside an entry, optionally linked to a prediction
   corrections     log of every fix made to an entry (old and new values)
@@ -220,13 +221,19 @@ CREATE TABLE IF NOT EXISTS predictions (
     created_at       TEXT NOT NULL,
     model_version    TEXT NOT NULL,
     event_id         TEXT NOT NULL,
-    player           TEXT NOT NULL,
+    player           TEXT NOT NULL,   -- player name for prop markets, team abbr for game markets
     market           TEXT NOT NULL,
     line             REAL NOT NULL,
-    p_over           REAL NOT NULL,
+    p_over           REAL NOT NULL,   -- really "probability of the recommended side" - see
+                                      -- page_top_picks' save-to-ledger comment. Not literally
+                                      -- P(Over) for game-market rows (side there is a team).
     p_under          REAL NOT NULL,
     p_push           REAL NOT NULL DEFAULT 0,
-    odds_snapshot_id INTEGER REFERENCES odds_snapshots(id),
+    odds_snapshot_id INTEGER REFERENCES odds_snapshots(id),  -- player-prop rows only (see
+                      -- game_odds_snapshot_id below for game-market rows - added after an
+                      -- early bug where this column held a game_odds_snapshots id that
+                      -- happened not to violate the FK only by coincidental id overlap)
+    game_odds_snapshot_id INTEGER REFERENCES game_odds_snapshots(id),
     inputs_json      TEXT            -- what the model knew at the time
 );
 
@@ -238,6 +245,22 @@ BEGIN SELECT RAISE(ABORT, 'Predictions are locked and cannot be edited'); END;
 CREATE TRIGGER IF NOT EXISTS predictions_no_delete
 BEFORE DELETE ON predictions
 BEGIN SELECT RAISE(ABORT, 'Predictions are locked and cannot be deleted'); END;
+
+-- Grading a prediction against what actually happened - kept separate from predictions
+-- itself (rather than adding result columns there) because predictions is locked the
+-- instant it's written, before the game is even final; results can only exist afterward.
+-- One row per prediction, written once a real, settled outcome exists - a prediction's
+-- outcome is a fixed fact once the game ends, not a value that should be re-snapshotted
+-- over time the way odds are, so this is graded once and left alone (see UNIQUE below).
+CREATE TABLE IF NOT EXISTS prediction_results (
+    id              INTEGER PRIMARY KEY,
+    prediction_id   INTEGER NOT NULL REFERENCES predictions(id),
+    graded_at       TEXT NOT NULL,
+    actual_value    REAL,            -- the real stat, margin, or total observed
+    result          TEXT NOT NULL,   -- 'WON', 'LOST', 'PUSH', or 'VOID' (no real match found)
+    brier_component REAL,            -- (p_recommended_side - outcome)^2; NULL for PUSH/VOID
+    UNIQUE (prediction_id)
+);
 
 CREATE TABLE IF NOT EXISTS entries (
     id              INTEGER PRIMARY KEY,
@@ -349,13 +372,15 @@ NEW_BOX_SCORE_COLUMNS = {"fgm": "INTEGER", "fga": "INTEGER", "fg3a": "INTEGER",
 NEW_PERIOD_BOX_SCORE_COLUMNS = {"q1_steals": "INTEGER", "q1_blocks": "INTEGER",
                                 "q1_turnovers": "INTEGER", "h1_steals": "INTEGER",
                                 "h1_blocks": "INTEGER", "h1_turnovers": "INTEGER"}
+NEW_PREDICTIONS_COLUMNS = {"game_odds_snapshot_id": "INTEGER"}
 
 
 def migrate(conn):
     """Add columns to tables that already existed from before they did.
     CREATE TABLE IF NOT EXISTS can't do this on its own, since the table is already there."""
     for table, new_cols in [("box_scores", NEW_BOX_SCORE_COLUMNS),
-                            ("period_box_scores", NEW_PERIOD_BOX_SCORE_COLUMNS)]:
+                            ("period_box_scores", NEW_PERIOD_BOX_SCORE_COLUMNS),
+                            ("predictions", NEW_PREDICTIONS_COLUMNS)]:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         for col, sqltype in new_cols.items():
             if col not in existing:
@@ -428,6 +453,23 @@ def save_parlay_analysis(row):
              row["break_even_probability"], row["independence_baseline_probability"],
              row["legs_sharing_a_game"]))
         return cur.lastrowid
+
+
+def save_prediction_results(rows):
+    """Insert graded outcomes. INSERT OR IGNORE against the UNIQUE(prediction_id)
+    constraint - a prediction already graded once stays graded, since the real outcome
+    is a fixed fact, not something to re-snapshot. Returns how many were newly graded."""
+    if not rows:
+        return 0
+    cols = ["prediction_id", "graded_at", "actual_value", "result", "brier_component"]
+    with connect() as conn:
+        before = conn.total_changes
+        conn.executemany(
+            f"INSERT OR IGNORE INTO prediction_results ({', '.join(cols)}) "
+            f"VALUES ({', '.join('?' for _ in cols)})",
+            [tuple(r.get(c) for c in cols) for r in rows],
+        )
+        return conn.total_changes - before
 
 
 def new_conversation(mode="ask", title=None, user_id="owner"):
