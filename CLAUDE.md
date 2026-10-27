@@ -3,6 +3,10 @@
 NBA player-prop research app. Goal: calibrated over/under probabilities that beat the market,
 proven with a timestamped prediction ledger. It is a research tool; it never places bets.
 
+## Roadmap
+Read `ROADMAP.md` for the launch plan and follow it in order, one week/prompt at a time -
+finish and test each step before starting the next, unless the user says otherwise.
+
 ## The person you're working with
 - Beginner with code. Explain each step plainly, one command at a time, and say what output to expect.
 - Mac (Python 3.9 from Apple's tools, in .venv). Avoid Python 3.10+ syntax (no `X | Y` types, no `match`).
