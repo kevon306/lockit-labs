@@ -2620,12 +2620,19 @@ def page_players():
                                                                   # player(s) actually played
                 team_roster = team_games_box.drop_duplicates("player_id")
                 missing_names = team_roster[team_roster["player_id"].isin(missing_ids)]["player_name"].tolist()
-                who = " and ".join(missing_names)
+                if len(missing_names) == 1:
+                    who, verb, pronoun = missing_names[0], "stays", "his"
+                elif len(missing_names) == 2:
+                    who = " and ".join(missing_names)
+                    verb, pronoun = "stay", "their"
+                else:
+                    who = ", ".join(missing_names[:-1]) + f", and {missing_names[-1]}"
+                    verb, pronoun = "stay", "their"
 
-                section(f"If {who} stays out")
+                section(f"If {who} {verb} out")
                 hint(f"{name}'s own real average this season and last, split by whether "
                      f"{player_team} actually had {who} active that game - a direct comparison "
-                     f"of real games, not a guessed redistribution of {who}'s stats, and not run "
+                     f"of real games, not a guessed redistribution of {pronoun} stats, and not run "
                      "through the usual projection model (see the hint below for why). Needs "
                      f"{model.MIN_HISTORY}+ games on a side before showing a number for it - "
                      "below that it says so rather than guessing.")
