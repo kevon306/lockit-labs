@@ -2100,12 +2100,17 @@ def page_game_lines():
     day = today if (ev["date"] == today).any() else ev["date"].max()
     slate = ev[ev["date"] == day]
 
+    injuries = load("injury_reports")
+
     if box.empty:
         hint("No box scores saved - the model needs those to project anything. "
              "Showing real market odds only.")
         home_edge = sigma_margin = sigma_total = None
+        tg_all = pd.DataFrame()
     else:
         home_edge, sigma_margin, sigma_total = team_model.fitted_params(box)
+        tg_all = team_model.team_games(box)
+        tg_all["season"] = tg_all["game_date"].map(season_of)
         matchups = pd.DataFrame([
             {"home_team": short(r.home), "away_team": short(r.away)} for r in slate.itertuples()])
         try:
@@ -2138,6 +2143,49 @@ def page_game_lines():
             f'{escape(r.away)} at {escape(r.home)}</div>'
             f'<span class="tipt">{r.tip:%-I:%M %p} ET</span>{fav_line}</div>'
             f'{gauge_html}</div></div>', unsafe_allow_html=True)
+
+        if not box.empty:
+            for team_abbr, team_label in [(home_abbr, r.home), (away_abbr, r.away)]:
+                missing_ids = confirmed_out_teammates(injuries, box, team_abbr, None)
+                if not missing_ids:
+                    continue
+                team_player_box = box[box["team"] == team_abbr]
+                team_roster = team_player_box.drop_duplicates("player_id")
+                missing_names = team_roster[team_roster["player_id"].isin(missing_ids)]["player_name"].tolist()
+                if not missing_names:
+                    continue
+                if len(missing_names) == 1:
+                    who, verb, was_were = missing_names[0], "stays", "was"
+                elif len(missing_names) == 2:
+                    who, verb, was_were = " and ".join(missing_names), "stay", "were"
+                else:
+                    who = ", ".join(missing_names[:-1]) + f", and {missing_names[-1]}"
+                    verb, was_were = "stay", "were"
+
+                splits = team_split_with_without(tg_all, team_abbr, team_player_box, missing_ids)
+                cmp_rows = []
+                for col, label in [("points", "Points scored"), ("opp_points", "Points allowed"),
+                                   ("pace", "Pace")]:
+                    with_mean, with_n, without_mean, without_n = splits[col]
+                    if with_mean is None and without_mean is None:
+                        continue
+                    cmp_rows.append({
+                        "Stat": label,
+                        f"With {who} ({with_n}g)": f"{with_mean:.1f}" if with_mean is not None else "Not enough games",
+                        f"Without {who} ({without_n}g)": f"{without_mean:.1f}" if without_mean is not None else "Not enough games",
+                    })
+                if cmp_rows:
+                    with st.expander(f"If {who} {verb} out for {team_label}: real team average"):
+                        st.dataframe(pd.DataFrame(cmp_rows), hide_index=True, use_container_width=True)
+                        hint(f"{team_label}'s own real average this season and last, split by "
+                             f"whether {who} {was_were} actually active that game - a direct comparison "
+                             "of real games, not run through the team model above (same reason "
+                             "as the player-level version on the Players page: the rolling "
+                             "model's recency windows assume a continuous game sequence, which "
+                             "breaks down on a filtered, scattered subset like this). Needs "
+                             f"{team_model.MIN_HISTORY}+ games on a side before showing a number "
+                             "- below that it says so rather than guessing. Not yet factored "
+                             "into the model % or flagging above.")
 
         c1, c2, c3 = st.columns(3)
         for col, mkt in [(c1, "h2h"), (c2, "spreads"), (c3, "totals")]:
@@ -2903,6 +2951,42 @@ def real_split_with_without(games_all, team_games_box, missing_ids, stat_col):
     with_mean, with_n = summarize(with_g)
     without_mean, without_n = summarize(without_g)
     return with_mean, with_n, without_mean, without_n
+
+
+def team_split_with_without(tg_all, team, team_player_box, missing_ids):
+    """A team's own real average points scored, points allowed, and pace, split by
+    whether `missing_ids` (its confirmed-out players) were active that game - the
+    team-level analog of real_split_with_without, same reasoning: a direct average of
+    real games (this season and last), not the rolling walk-forward team model
+    (team_model.project_tonight_teams), since that model's recency windows assume a
+    continuous game sequence and break down on a filtered, scattered subset - see
+    real_split_with_without's docstring for the real case (OKC/Cason Wallace) that
+    proved this for the player-level version.
+
+    tg_all must be team_model.team_games(box) with a "season" column added
+    (season_of(game_date)), covering every team. team_player_box must be every one of
+    this team's player-level box-score rows (box[box["team"]==team]), NOT
+    deduplicated - same reason as real_split_with_without's team_games_box: a
+    deduplicated frame only has one game_id per player and would undercount which
+    games the missing player(s) actually played.
+
+    Returns {"points": (with_mean, with_n, without_mean, without_n), "opp_points":
+    (...), "pace": (...)}. A side's mean is None below team_model.MIN_HISTORY
+    qualifying games."""
+    this_season = season_of(datetime.now(ET))
+    last_start = int(this_season.split("-")[0]) - 1
+    last_season = f"{last_start}-{str(last_start + 1)[2:]}"
+    tg_team = tg_all[(tg_all["team"] == team) & (tg_all["season"].isin([this_season, last_season]))]
+
+    games_missing_played = set(team_player_box[team_player_box["player_id"].isin(missing_ids)]["game_id"])
+    with_g = tg_team[tg_team["game_id"].isin(games_missing_played)]
+    without_g = tg_team[~tg_team["game_id"].isin(games_missing_played)]
+
+    def summarize(g, col):
+        return (float(g[col].mean()) if len(g) >= team_model.MIN_HISTORY else None), len(g)
+
+    return {col: summarize(with_g, col) + summarize(without_g, col)
+            for col in ("points", "opp_points", "pace")}
 
 
 def player_leg_options(odds, key, stat_label):
