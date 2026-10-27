@@ -2611,6 +2611,51 @@ def page_players():
             hint("Ranked by expected value at the best available price, same ranking Top Picks "
                  f"uses - every one of {name}'s markets with a model projection tonight, not "
                  "just the ones that would clear Top Picks' own edge bar.")
+
+            missing_ids = confirmed_out_teammates(injuries, box, player_team, player_id)
+            if missing_ids:
+                team_games_box = box[box["team"] == player_team]  # every game, not deduped -
+                                                                  # real_split_with_without needs
+                                                                  # every game the missing
+                                                                  # player(s) actually played
+                team_roster = team_games_box.drop_duplicates("player_id")
+                missing_names = team_roster[team_roster["player_id"].isin(missing_ids)]["player_name"].tolist()
+                who = " and ".join(missing_names)
+
+                section(f"If {who} stays out")
+                hint(f"{name}'s own real average this season and last, split by whether "
+                     f"{player_team} actually had {who} active that game - a direct comparison "
+                     f"of real games, not a guessed redistribution of {who}'s stats, and not run "
+                     "through the usual projection model (see the hint below for why). Needs "
+                     f"{model.MIN_HISTORY}+ games on a side before showing a number for it - "
+                     "below that it says so rather than guessing.")
+                rows = []
+                for stat_lbl2, mstat2 in MODEL_STAT_FOR_LABEL.items():
+                    if mstat2 not in set(his_picks["stat"]):
+                        continue
+                    with_mean, with_n, without_mean, without_n = real_split_with_without(
+                        games_all, team_games_box, missing_ids, mstat2)
+                    if with_mean is None and without_mean is None:
+                        continue
+                    rows.append({
+                        "Stat": stat_lbl2,
+                        f"With {who} ({with_n}g)": f"{with_mean:.1f}" if with_mean is not None else "Not enough games",
+                        f"Without {who} ({without_n}g)":
+                            f"{without_mean:.1f}" if without_mean is not None else "Not enough games",
+                    })
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+                else:
+                    hint(f"Not enough real games this season or last with {player_team} missing "
+                         f"{who} yet to show a number for any of tonight's markets.")
+                hint("Deliberately a plain average of real games, not the usual projection model "
+                     "- that model's recency weighting assumes a continuous game sequence, which "
+                     "doesn't hold up on a scattered subset of games across a season or two "
+                     "(confirmed on real data before shipping this: for one real case, the model's "
+                     "own 'last 10' window landed on old games and gave a number pointing the "
+                     "wrong direction from the real average). Not yet factored into the model "
+                     "probabilities or picks shown above - a separate, real comparison to weigh "
+                     "yourself.")
     st.divider()
 
     c3, c4 = st.columns([1.6, 3.6])
@@ -2789,6 +2834,68 @@ def player_model_prob_at(mean_hat, var_hat, x):
     is_nb, r, p = model.fit_dist(pd.Series([mean_hat]), pd.Series([var_hat]))
     prob = model.p_over(pd.Series([float(x)]), pd.Series([mean_hat]), r, p, is_nb)
     return None if pd.isna(prob[0]) else float(prob[0])
+
+
+def confirmed_out_teammates(injuries, box, team, exclude_player_id):
+    """player_id of every one of this team's players currently reported 'Out', not
+    counting the player himself. Only 'Out' counts here - 'Day-To-Day' stays a shown
+    caveat elsewhere (player_injury_status), never treated as a confirmed absence for
+    this adjustment, since the player could easily still suit up."""
+    latest = latest_injury_reports(injuries)
+    if latest.empty:
+        return []
+    out = latest[(latest["team"] == team) & (latest["status"] == "Out")]
+    if out.empty:
+        return []
+    team_box = box[box["team"] == team].drop_duplicates("player_id")
+    name_to_id = team_box.set_index(team_box["player_name"].map(box_scores.normalize_name))["player_id"]
+    ids = []
+    for pname in out["player_name"]:
+        pid = name_to_id.get(box_scores.normalize_name(pname))
+        if pid is not None and pid != exclude_player_id:
+            ids.append(pid)
+    return ids
+
+
+def real_split_with_without(games_all, team_games_box, missing_ids, stat_col):
+    """This player's own real average of `stat_col`, split by whether his team had
+    `missing_ids` (currently confirmed-out players) active that game - restricted to
+    this season and last, same 'recent enough to matter' convention SPLITS already
+    uses elsewhere (a four-year-old game isn't a meaningful signal for tonight).
+
+    team_games_box must be every one of the team's box-score rows (box[box["team"]==
+    team]), NOT deduplicated to one row per player - a deduplicated roster frame only
+    has one game_id per player and would silently undercount which games the missing
+    player(s) actually played, which is exactly the bug this signature now guards
+    against by name.
+
+    Deliberately a direct average of real games, NOT run through the rolling walk-
+    forward model (model.project_tonight): that model's recency weighting assumes a
+    continuous game sequence, which breaks down on a filtered, scattered subset like
+    this - confirmed on real data (OKC's Cason Wallace, 63 real games without Jalen
+    Williams spanning 2023-2026): the rolling model's 'last 10' window landed on old,
+    early-career games and gave a LOWER number than his actual real average in those
+    same games, which was clearly higher. A plain average doesn't have that failure
+    mode and is honest about being exactly what it is.
+
+    Returns (with_mean, with_n, without_mean, without_n). A side's mean is None if it
+    has fewer than model.MIN_HISTORY qualifying games - same sample-size bar used
+    everywhere else, not a guess from a handful of games."""
+    this_season = season_of(datetime.now(ET))
+    last_start = int(this_season.split("-")[0]) - 1
+    last_season = f"{last_start}-{str(last_start + 1)[2:]}"
+    recent = games_all[games_all["season"].isin([this_season, last_season])]
+
+    games_missing_played = set(team_games_box[team_games_box["player_id"].isin(missing_ids)]["game_id"])
+    with_g = recent[recent["game_id"].isin(games_missing_played)]
+    without_g = recent[~recent["game_id"].isin(games_missing_played)]
+
+    def summarize(g):
+        return (float(g[stat_col].mean()) if len(g) >= model.MIN_HISTORY else None), len(g)
+
+    with_mean, with_n = summarize(with_g)
+    without_mean, without_n = summarize(without_g)
+    return with_mean, with_n, without_mean, without_n
 
 
 def player_leg_options(odds, key, stat_label):
