@@ -924,11 +924,17 @@ def recommendation_tier(edge, side):
 
 def build_roster(box, odds):
     """player_id/team/opponent for everyone with an active line on tonight's board, built
-    the same way the H2H opponent default is on the Players page."""
+    the same way the H2H opponent default is on the Players page.
+
+    Literal today only, no falling back to the most recent date with data: this feeds
+    picks pages (Top Picks, Tonight's "Strongest opportunities", the Players page's
+    "Tonight's props") that present results as current, actionable opportunities - a
+    silent fallback would surface an already-finished game's odds as if it were
+    tonight's, with no sign it's stale. An empty roster today is a real, honest result
+    (no lines posted yet, or no games), not something to paper over with yesterday's."""
     ev = events_table(odds)
     today = datetime.now(ET).strftime("%Y-%m-%d")
-    day = today if (ev["date"] == today).any() else ev["date"].max()
-    slate = ev[ev["date"] == day]
+    slate = ev[ev["date"] == today]
     slate_odds = odds[odds["event_id"].isin(slate["event_id"])]
 
     latest = slate_odds[slate_odds["snapshot_time"]
@@ -1255,14 +1261,21 @@ def compute_game_picks(box, game_odds, game_bt=None):
     """Every game+market with a model projection, in the same shape as compute_picks()
     so the two can be ranked together. Only the side of each game+market the model
     actually likes more than the market (positive edge) is kept - the other side of
-    the same line is the same disagreement mirrored, not a second, independent pick."""
+    the same line is the same disagreement mirrored, not a second, independent pick.
+
+    Literal today only, no falling back to the most recent date with data - same reason
+    as build_roster(). Game-market odds only refresh in the ~20-minutes-before-tip
+    "close" window (see auto.py), so between a game day ending and tonight's close
+    window firing, game_odds' most recent rows are yesterday's, already-decided games.
+    Falling back to those would show a finished game as a live "pick" with no sign it's
+    stale - confirmed as the real cause of Sacramento-at-San-Antonio (a game SAC lost by
+    30) appearing in "Strongest opportunities tonight" the morning after it was played."""
     if box.empty or game_odds.empty:
         return pd.DataFrame(), None
 
-    ev = events_table(game_odds)
     today = datetime.now(ET).strftime("%Y-%m-%d")
-    day = today if (ev["date"] == today).any() else ev["date"].max()
-    slate = ev[ev["date"] == day]
+    ev = events_table(game_odds)
+    slate = ev[ev["date"] == today]
     if slate.empty:
         return pd.DataFrame(), None
 
