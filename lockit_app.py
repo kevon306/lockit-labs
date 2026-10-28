@@ -2099,19 +2099,25 @@ def page_game_lines():
                 "`python3 pull_props.py today --game 0 --game-markets`")
         return
 
-    st.markdown(
-        f'<div class="hero">{COURT_SVG}<h1>Game Lines</h1>'
-        "<p>Real spread, total, and moneyline odds, next to the team model's own "
-        "projection. The model is built the same walk-forward way as the player "
-        "model and backtested for calibration (see <code>team_model.py</code>), but "
-        "like any box-score-only model it has no idea about trades, injuries, or "
-        "scheme changes a sportsbook already knows about.</p></div>",
-        unsafe_allow_html=True)
-
     ev = events_table(game_odds)
     today = datetime.now(ET).strftime("%Y-%m-%d")
     day = today if (ev["date"] == today).any() else ev["date"].max()
     slate = ev[ev["date"] == day]
+
+    title = "Game Lines" if day == today else f"Game Lines for {pd.Timestamp(day):%A, %b %-d}"
+    stale_note = ("" if day == today else
+                  f'<p style="color:{AMBER};">Nothing posted yet for today - showing the most '
+                  "recent odds saved, from "
+                  f"{pd.Timestamp(day):%A, %b %-d}. Game-market odds refresh automatically "
+                  "through the day; check back closer to tonight's games.</p>")
+    st.markdown(
+        f'<div class="hero">{COURT_SVG}<h1>{escape(title)}</h1>'
+        "<p>Real spread, total, and moneyline odds, next to the team model's own "
+        "projection. The model is built the same walk-forward way as the player "
+        "model and backtested for calibration (see <code>team_model.py</code>), but "
+        "like any box-score-only model it has no idea about trades, injuries, or "
+        f"scheme changes a sportsbook already knows about.</p>{stale_note}</div>",
+        unsafe_allow_html=True)
 
     injuries = load("injury_reports")
 
