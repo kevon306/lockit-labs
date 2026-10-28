@@ -512,6 +512,19 @@ def list_conversations(user_id="owner", limit=50):
     return df
 
 
+def conversation_exists(conversation_id, user_id="owner"):
+    """On the deployed site, the whole database file gets replaced every time fresh
+    data is synced from the odds-pulling Mac (several times a day) - a conversation
+    started since the last sync lives only in that container's local disk and won't
+    survive it. Lets the UI detect an orphaned conversation_id (from browser session
+    state that outlived the reset) and recover instead of hitting a foreign-key
+    IntegrityError on the next message."""
+    with connect() as conn:
+        row = conn.execute("SELECT 1 FROM ai_conversations WHERE id = ? AND user_id = ?",
+                           (conversation_id, user_id)).fetchone()
+    return row is not None
+
+
 def conversation_messages(conversation_id, user_id="owner"):
     """All messages in a conversation - enforces that it actually belongs to this
     user_id first, the access-control check multi-user support will need later."""

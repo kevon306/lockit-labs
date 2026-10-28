@@ -3705,15 +3705,26 @@ def _send_to_analyst(conversation_id, text):
         ai_analyst.ask(conversation_id, text)
     except (ai_analyst.AnalystUnavailable, ai_analyst.AnalystRateLimited,
            ai_analyst.AnalystError) as e:
-        db.save_message(conversation_id, "assistant", f"⚠️ {e}")
+        _save_fallback(conversation_id, f"⚠️ {e}")
     except Exception as e:
         # Anything not already wrapped as a clean Analyst* error (a missing
         # dependency, a bug in a tool call, anything) - never fail silently with
         # no visible message, always show the user *something* went wrong.
-        db.save_message(conversation_id, "assistant",
-                        f"⚠️ Something unexpected went wrong ({type(e).__name__}: {e}). "
-                        "This has been left in the conversation so it's visible - try "
-                        "again, and if it keeps happening, check the app logs.")
+        _save_fallback(conversation_id,
+                       f"⚠️ Something unexpected went wrong ({type(e).__name__}: {e}). "
+                       "This has been left in the conversation so it's visible - try "
+                       "again, and if it keeps happening, check the app logs.")
+
+
+def _save_fallback(conversation_id, text):
+    """db.save_message() can itself fail the same way the original request did -
+    most likely conversation_id no longer exists (see conversation_exists()'s
+    docstring on why). Never let that crash the whole page on top of the original
+    error - show it directly instead of trying to persist it."""
+    try:
+        db.save_message(conversation_id, "assistant", text)
+    except Exception:
+        st.error(text)
 
 
 AI_MODE_MAP = {"Ask the Analyst": "ask", "Challenge a Pick": "challenge", "Parlay Lab": "parlay"}
@@ -3776,6 +3787,14 @@ def page_ai_analyst():
                     st.rerun()
 
     cid = st.session_state.get("ai_cid")
+    if cid is not None and not db.conversation_exists(cid):
+        # Orphaned by a data sync that reset the deployed site's database mid-session
+        # (see conversation_exists()'s docstring) - recover instead of crashing on
+        # the next message.
+        st.session_state.pop("ai_cid", None)
+        cid = None
+        st.info("Your previous conversation wasn't saved past the last data sync - "
+                "starting a new one.")
     if cid is None:
         cid = ai_analyst.start_conversation(mode=mode)
         st.session_state["ai_cid"] = cid
