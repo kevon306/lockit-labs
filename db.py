@@ -499,9 +499,17 @@ def save_message(conversation_id, role, content, tool_calls=None, tokens_in=None
 
 def list_conversations(user_id="owner", limit=50):
     with connect() as conn:
-        return pd.read_sql(
+        df = pd.read_sql(
             "SELECT id, title, mode, created_at, updated_at FROM ai_conversations "
             "WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?", conn, params=(user_id, limit))
+    # A conversation's title is NULL until renamed. pandas silently upgrades an
+    # all-NULL object column to float64 NaN (not None) when every row in the result
+    # is still untitled - `r.title or fallback` then picks the truthy NaN itself
+    # instead of falling through, and `nan[:28]` crashes with a TypeError. Confirmed
+    # as the real cause of a live crash on page_ai_analyst's conversation list.
+    # Force it back to a real string-or-None column regardless of dtype.
+    df["title"] = df["title"].map(lambda x: x if isinstance(x, str) else None)
+    return df
 
 
 def conversation_messages(conversation_id, user_id="owner"):
