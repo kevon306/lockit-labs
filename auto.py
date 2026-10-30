@@ -106,6 +106,8 @@ def morning():
         log(f"Graded predictions: {summary}")
     except Exception as e:  # never take the morning job down over a grading bug
         log(f"Prediction grading failed (non-fatal): {e}")
+    log_todays_picks()  # also runs after every snapshots() pull - here too as a
+                        # same-day safety net, since log_predictions() dedupes
     log("Morning job done")
 
 
@@ -200,7 +202,29 @@ def snapshots():
                 state[key] = pp.iso(now)
                 save_state(state)
 
+    log_todays_picks()
     git_sync()
+
+
+def log_todays_picks():
+    """Computes and logs every qualifying pick to the locked prediction ledger, the
+    same way opening Top Picks in a browser already did - see
+    lockit_app.log_todays_qualifying_picks()'s own docstring. Runs here so the ledger
+    (and therefore calibration.py's learning loop, which trains on it) grows every
+    day on its own, not just when someone happens to open the app.
+
+    Imports lockit_app lazily, inside this function, not at module load - that file
+    is written to run as a Streamlit script (st.set_page_config, nav.run() at module
+    level), and ai_tools.py already established the pattern of importing it purely
+    for its compute functions; done here the same way, isolated so a problem with it
+    can never take down the rest of the snapshot job (odds capture, git sync)."""
+    try:
+        import lockit_app
+        new_count = lockit_app.log_todays_qualifying_picks()
+        if new_count:
+            log(f"Logged {new_count} new prediction(s) to the ledger")
+    except Exception as e:
+        log(f"Prediction logging failed (non-fatal): {e}")
 
 
 def git_sync():

@@ -27,6 +27,7 @@ sys.modules.setdefault("lockit_app", sys.modules[__name__])
 
 import ai_analyst
 import box_scores
+import calibration
 import db
 import model
 import slip
@@ -1194,6 +1195,15 @@ def cached_game_backtest(box, game_odds):
 
 
 @st.cache_data(ttl=60)
+def cached_calibration():
+    """Cached wrapper around calibration.current_calibration() - same reasoning as
+    cached_player_backtest above. Dormant (a no-op) below
+    calibration.MIN_DECIDED_FOR_CALIBRATION real decided predictions - see that
+    module's docstring."""
+    return calibration.current_calibration()
+
+
+@st.cache_data(ttl=60)
 def compute_picks(box, odds, player_bt=None):
     """Every active prop line with a model projection, with the model's probability,
     the market's, and the gap between them. Not yet filtered to "qualifying" picks."""
@@ -1237,6 +1247,10 @@ def compute_picks(box, odds, player_bt=None):
     picks["side"] = picks["edge_over"].map(lambda e: "Over" if e > 0 else "Under")
     picks["model_p"] = picks.apply(
         lambda r: r["model_p_over"] if r["side"] == "Over" else 100 - r["model_p_over"], axis=1)
+    # Nudges the raw walk-forward probability toward what the locked prediction
+    # ledger has actually shown (see calibration.py) - a strict no-op until there's
+    # real volume, so this has no effect at all today.
+    picks["model_p"] = calibration.apply(picks["model_p"], cached_calibration()["params"])
     picks["market_p"] = picks.apply(
         lambda r: r["Market Over %"] if r["side"] == "Over" else 100 - r["Market Over %"], axis=1)
     picks["edge"] = picks["model_p"] - picks["market_p"]
@@ -1279,6 +1293,7 @@ def compute_game_picks(box, game_odds, game_bt=None):
     if slate.empty:
         return pd.DataFrame(), None
 
+    cal_params = cached_calibration()["params"]
     home_edge, sigma_margin, sigma_total = team_model.fitted_params(box)
     matchups = pd.DataFrame([
         {"home_team": short(r.home), "away_team": short(r.away)} for r in slate.itertuples()])
@@ -1324,6 +1339,9 @@ def compute_game_picks(box, game_odds, game_bt=None):
                 else:  # h2h / moneyline: win probability is just the spread formula at line 0
                     model_p = round(100 * stats.norm.sf(0, side_margin, sigma_margin), 1)
                     line_display = 0.0
+                # Nudges the raw projection toward the locked ledger's own track
+                # record (see calibration.py) - a no-op until there's real volume.
+                model_p = round(float(calibration.apply(model_p, cal_params)), 1)
                 label = x.side if market == "totals" else short(x.side)
                 candidates.append((model_p - x.no_vig_pct, label, line_display, model_p, x))
 
@@ -1904,6 +1922,49 @@ def log_predictions(savable):
     return len(new_rows)
 
 
+def qualifying_and_caution(view):
+    """The 'qualifies as a pick' filter - edge in [EDGE_THRESHOLD, MAX_PLAUSIBLE_EDGE],
+    not Low confidence - split into `qualifying` (player props, Top Picks' own ranked
+    list, capped at TOP_PICKS_MAX) and `caution` (game lines, held to the same bar but
+    shown separately for a human look - see page_top_picks()'s 'Check before trusting'
+    section for why). Shared by the page's own display (market-filtered) and
+    log_todays_qualifying_picks() (every market, unfiltered - see its docstring for
+    why that distinction matters for the locked ledger)."""
+    in_range = view[view["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
+    qualified = in_range[(in_range["edge"].abs() >= EDGE_THRESHOLD) & (in_range["confidence"] != "Low")]
+    caution = qualified[qualified["kind"] == "game"]
+    caution = caution.reindex(caution["ev"].sort_values(ascending=False).index)
+    qualified = qualified[qualified["kind"] == "player"]
+    qualifying = qualified.reindex(
+        qualified["ev"].sort_values(ascending=False).index).head(TOP_PICKS_MAX)
+    return qualifying, caution
+
+
+def log_todays_qualifying_picks():
+    """Computes every qualifying pick across every market - not filtered to whichever
+    market a browser happened to have selected, unlike the page's own display - and
+    logs them to the locked ledger via log_predictions() (which already dedupes, so
+    calling this repeatedly through the day, e.g. from auto.py's automated snapshot
+    job, never double-logs). This is what lets the prediction ledger - and therefore
+    calibration.py's learning loop, which trains on exactly this ledger - grow on its
+    own every day, instead of depending on a human happening to open Top Picks.
+    Returns how many new predictions were logged."""
+    box, odds = load("box_scores"), load("odds_snapshots")
+    game_odds = load("game_odds_snapshots")
+    if box.empty or odds.empty:
+        return 0
+    player_bt = cached_player_backtest(box, odds)
+    game_bt = cached_game_backtest(box, game_odds)
+    player_picks, _ = compute_picks(box, odds, player_bt)
+    game_picks, _ = compute_game_picks(box, game_odds, game_bt)
+    picks = pd.concat([player_picks, game_picks], ignore_index=True) if not game_picks.empty else player_picks
+    if picks.empty:
+        return 0
+    picks["ev"] = picks.apply(lambda r: expected_value(r["model_p"], r["price"]), axis=1)
+    qualifying, caution = qualifying_and_caution(picks)
+    return log_predictions(pd.concat([qualifying, caution], ignore_index=True))
+
+
 def page_top_picks():
     box, odds = load("box_scores"), load("odds_snapshots")
     game_odds = load("game_odds_snapshots")
@@ -1942,19 +2003,12 @@ def page_top_picks():
     view = picks[market_filter[market_choice]] if market_choice != "All" else picks
 
     flagged = view[view["edge"].abs() > MAX_PLAUSIBLE_EDGE]
-    in_range = view[view["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
-    qualified = in_range[(in_range["edge"].abs() >= EDGE_THRESHOLD) & (in_range["confidence"] != "Low")]
-
     # Game-line edges this size are flagged for a human look rather than ranked as Top
     # Picks - the team model has no visibility into injuries, trades, or rest/lineup
     # news, and that's a far more likely explanation than a real edge (see MAX_PLAUSIBLE_
     # EDGE above). Player props aren't affected: their edges have historically tracked
     # real model/market disagreement, not missing roster news, at this size.
-    caution = qualified[qualified["kind"] == "game"]
-    caution = caution.reindex(caution["ev"].sort_values(ascending=False).index)
-    qualified = qualified[qualified["kind"] == "player"]
-    qualifying = qualified.reindex(
-        qualified["ev"].sort_values(ascending=False).index).head(TOP_PICKS_MAX)
+    qualifying, caution = qualifying_and_caution(view)
 
     strip([(len(view), "lines projected"), (len(qualifying), "qualify as picks"),
           (len(caution), "game lines to check first"),
@@ -2069,13 +2123,19 @@ def page_top_picks():
                              "confidence": "Confidence"}),
             hide_index=True, width="stretch")
 
-    new_count = log_predictions(pd.concat([qualifying, caution], ignore_index=True))
+    # Logs from the full, unfiltered `picks` (every market), not the market_choice-
+    # filtered `view` used for display above - otherwise browsing with "Spread" (say)
+    # selected would silently log nothing for every other market that page load.
+    log_qualifying, log_caution = qualifying_and_caution(picks)
+    new_count = log_predictions(pd.concat([log_qualifying, log_caution], ignore_index=True))
     if new_count:
         st.toast(f"Logged {new_count} new prediction{'s' if new_count != 1 else ''} "
                  "to the locked ledger.")
-    hint(f"Every qualifying pick above is automatically logged to the prediction "
-         "ledger once, the moment it's first computed - re-opening this page never "
-         "logs the same pick twice, and a logged prediction can't be edited or "
+    hint(f"Every qualifying pick across every market is automatically logged to the "
+         "prediction ledger once, the moment it's first computed - also runs "
+         "automatically in the background (see auto.py), so the ledger grows daily "
+         "without anyone needing to open this page. Re-logging never happens twice, "
+         "and a logged prediction can't be edited or "
          "deleted afterward, even if the model or the odds change later. See Model "
          "Performance for how logged predictions have actually done.")
 
@@ -3370,6 +3430,40 @@ def page_model_performance():
         hint("Well-calibrated predictions in, say, the 60-69% bucket should actually win "
              "about 60-69% of the time. A bucket with only a handful of predictions is "
              "too small to judge - this needs real volume before it means anything.")
+
+    section("Automatic recalibration")
+    cal = calibration.current_calibration()
+    if cal["params"] is None:
+        strip([(cal["n"], "decided predictions"),
+              (calibration.MIN_DECIDED_FOR_CALIBRATION, "needed to activate")])
+        hint("Not active yet. Every new prediction's probability still comes straight "
+             "from the walk-forward model, unadjusted - see calibration.py. Once there "
+             f"are {calibration.MIN_DECIDED_FOR_CALIBRATION} real decided predictions "
+             "in the ledger, this app starts nudging new probabilities toward what the "
+             "ledger has actually shown, and that correction keeps updating itself as "
+             "more games grade. Below that, any adjustment would just be fitting noise "
+             "and calling it learning - exactly what this page tries not to do.")
+    else:
+        a, b = cal["params"]
+        direction = ("overconfident" if a < 1 else "underconfident") if abs(a - 1) > 0.05 else "about right"
+        strip([(cal["n"], "decided predictions used"),
+              (f"{cal['raw_brier']:.3f}", "Brier before correction"),
+              (f"{cal['calibrated_brier']:.3f}", "Brier after correction")])
+        st.markdown(
+            f'<div class="panel"><p class="hint">Fit: a={a:.2f}, b={b:.2f} (Platt scaling). '
+            f"Reading the fit: this app's stated probabilities have run <b>{direction}</b> "
+            "relative to what actually happened, across every prediction graded so far. "
+            "Every new prediction's probability - on Top Picks, Tonight, Game Lines, and "
+            "the automated ledger logging - now passes through this correction before "
+            "it's shown or saved.</p></div>", unsafe_allow_html=True)
+        hint("Brier before/after is measured on the exact same predictions the "
+             "correction was fit from, not a held-out set - with this little data, "
+             "splitting further would leave too little of either to mean anything. "
+             "That makes 'after' an optimistic, in-sample number: real evidence this "
+             "isn't doing anything obviously wrong, not proof it will keep helping on "
+             "picks logged after today. This refits from scratch, from the whole "
+             "ledger, every time it's used - it updates on its own as more games grade, "
+             "with no separate step to trigger.")
 
     show_all_graded()
 
