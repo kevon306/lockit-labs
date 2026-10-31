@@ -27,10 +27,14 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 
 import db
 
 ET = ZoneInfo("America/New_York")
+ESPN_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
 MARKET_TO_STAT = {"player_points": "points",
                   "player_rebounds": "rebounds",
                   "player_assists": "assists",
@@ -80,6 +84,12 @@ def to_minutes(value):
         return None
 
 
+class NBAComUnavailable(Exception):
+    """Raised after 3 failed tries against stats.nba.com - cmd_pull decides what to
+    do about it (falls back to ESPN for the gap, see fetch_espn_game_log) rather than
+    this function exiting the process outright."""
+
+
 def fetch_game_log(season, season_type):
     """One call returns every player's line for every game in the season."""
     from nba_api.stats.endpoints import leaguegamelog
@@ -94,10 +104,140 @@ def fetch_game_log(season, season_type):
             return log.get_data_frames()[0]
         except Exception as e:  # NBA.com times out now and then
             if attempt == 2:
-                sys.exit(f"NBA.com didn't respond after 3 tries ({e}). "
-                         "Check your internet and try again in a few minutes.")
+                raise NBAComUnavailable(str(e)) from e
             print(f"NBA.com was slow, retrying in 5 seconds... ({attempt + 1}/3)")
             time.sleep(5)
+
+
+# ---------- ESPN fallback ----------
+#
+# nba_api/stats.nba.com is the primary box-score source (one call gets the whole
+# season) but it times out often enough to matter, and separately is blocked outright
+# from cloud IPs (see this file's own docstring) - a real problem for ever running
+# this app's automation anywhere but a home Mac. ESPN's hidden scoreboard/summary API
+# (the same kind of unofficial endpoint injuries.py already depends on - see that
+# file's own docstring) is fast and has worked from ordinary cloud-style requests in
+# testing, so it's used here as a fallback when nba_api fails, not a replacement:
+# nba_api is still tried first every time, since it's a single request for the whole
+# season instead of one scoreboard call per day plus one summary call per game.
+#
+# Player identity across sources: ESPN's athlete ids are a completely different
+# numbering scheme from nba_api's player ids. Silently using ESPN's own id for a
+# player nba_api has already seen would fork their history into two "different
+# players" and quietly corrupt their rolling-window projection - confirmed as a real
+# risk, not a theoretical one, by checking (ESPN uses "WSH" for Washington where this
+# app's existing data uses "WAS", from nba_api's own abbreviation list - exactly the
+# kind of silent mismatch this guards against). So every ESPN-sourced row is matched
+# back to an existing player_id by normalized name wherever this app has already seen
+# that player; only a genuinely new player (never seen under any source) gets a new,
+# clearly-tagged 'espn:<athlete id>' id. Team abbreviations are resolved the same way,
+# through this app's own team_abbreviations() (built from nba_api's static list), not
+# ESPN's own abbreviation string - so output rows are byte-for-byte consistent with
+# existing nba_api-sourced rows elsewhere in box_scores. game_id is prefixed
+# 'espn:<event id>' so it can never collide with nba_api's own game_id format.
+
+
+def _espn_finished_event_ids(date_str):
+    """Event ids for every FINISHED game on one date (YYYYMMDD)."""
+    r = requests.get(ESPN_SCOREBOARD_URL, params={"dates": date_str},
+                     headers=ESPN_HEADERS, timeout=15)
+    r.raise_for_status()
+    events = r.json().get("events", [])
+    return [e["id"] for e in events
+            if e.get("status", {}).get("type", {}).get("name") == "STATUS_FINAL"]
+
+
+def _espn_box_score(event_id, existing_ids, abbrs):
+    """One finished game's player box score from ESPN, as a list of dicts in
+    clean_game_log()'s exact column shape. existing_ids is a {normalized_name:
+    player_id} map built from this app's own existing box_scores table (see this
+    section's module-level note on why). abbrs is team_abbreviations()'s own
+    full-name -> abbreviation map, passed in so it's only built once per pull."""
+    r = requests.get(ESPN_SUMMARY_URL, params={"event": event_id},
+                     headers=ESPN_HEADERS, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    box = data.get("boxscore", {})
+    players = box.get("players", [])
+    if len(players) != 2:
+        return []
+    competitors = {c["team"]["abbreviation"]: c["homeAway"]
+                  for c in data["header"]["competitions"][0]["competitors"]}
+    # ESPN's own date is UTC - a West Coast tip after ~9pm ET rolls into the next UTC
+    # calendar day, which would silently misdate the game (confirmed on real data: a
+    # 2026-10-30 Lakers-Warriors game came back as "2026-10-31" before this fix).
+    # Convert to ET first, matching nba_api's own GAME_DATE convention (local date),
+    # so ESPN-sourced rows line up with existing data and odds/grading lookups by date.
+    game_date = pd.to_datetime(data["header"]["competitions"][0]["date"], utc=True) \
+        .tz_convert(ET).strftime("%Y-%m-%d")
+
+    def split_pair(stat, key):
+        made, _, att = (stat.get(key) or "0-0").partition("-")
+        return int(made or 0), int(att or 0)
+
+    rows = []
+    for i, side in enumerate(players):
+        espn_abbr = side["team"]["abbreviation"]
+        team_abbr = abbrs.get(side["team"]["displayName"], espn_abbr)
+        is_home = competitors.get(espn_abbr) == "home"
+        opp_abbr = abbrs.get(players[1 - i]["team"]["displayName"],
+                             players[1 - i]["team"]["abbreviation"])
+        for group in side.get("statistics", []):
+            labels = group.get("labels", [])
+            for a in group.get("athletes", []):
+                if a.get("didNotPlay") or not a.get("stats"):
+                    continue
+                stat = dict(zip(labels, a["stats"]))
+                minutes = to_minutes(stat.get("MIN"))
+                if not minutes:
+                    continue  # DNP-CD and similar show up with no real minutes
+                fgm, fga = split_pair(stat, "FG")
+                fg3m, fg3a = split_pair(stat, "3PT")
+                ftm, fta = split_pair(stat, "FT")
+                name = a["athlete"]["displayName"]
+                pid = existing_ids.get(normalize_name(name), f"espn:{a['athlete']['id']}")
+                rows.append({
+                    "game_id": f"espn:{event_id}", "game_date": game_date,
+                    "player_id": pid, "player_name": name, "team": team_abbr,
+                    "opponent": opp_abbr, "is_home": int(is_home), "minutes": minutes,
+                    "points": int(stat.get("PTS") or 0), "rebounds": int(stat.get("REB") or 0),
+                    "assists": int(stat.get("AST") or 0), "fg3m": fg3m, "fgm": fgm, "fga": fga,
+                    "fg3a": fg3a, "ftm": ftm, "fta": fta,
+                    "steals": int(stat.get("STL") or 0), "blocks": int(stat.get("BLK") or 0),
+                    "turnovers": int(stat.get("TO") or 0), "fouls": int(stat.get("PF") or 0),
+                    "oreb": int(stat.get("OREB") or 0), "dreb": int(stat.get("DREB") or 0),
+                })
+    return rows
+
+
+def fetch_espn_game_log(start_date, end_date):
+    """Fallback box-score source for the date range [start_date, end_date] (inclusive
+    'YYYY-MM-DD' strings), used when nba_api fails - see this section's module-level
+    note. Day by day, game by game (ESPN has no single "whole range" endpoint the way
+    nba_api's LeagueGameLog is one call for the whole season) - fine for a short gap,
+    not meant to replace a full-season pull. A failure on one day or one game is
+    logged and skipped, never aborts the rest of the range. Returns a DataFrame ready
+    for save_box_scores(), or empty if nothing could be pulled."""
+    with db.connect() as conn:
+        existing = pd.read_sql("SELECT DISTINCT player_name, player_id FROM box_scores", conn)
+    existing_ids = {normalize_name(n): i
+                    for n, i in zip(existing["player_name"], existing["player_id"])}
+    abbrs = team_abbreviations()
+
+    rows = []
+    for d in pd.date_range(start_date, end_date):
+        date_str = d.strftime("%Y%m%d")
+        try:
+            event_ids = _espn_finished_event_ids(date_str)
+        except Exception as e:
+            print(f"  ESPN scoreboard failed for {d:%Y-%m-%d}: {e}")
+            continue
+        for event_id in event_ids:
+            try:
+                rows.extend(_espn_box_score(event_id, existing_ids, abbrs))
+            except Exception as e:
+                print(f"  ESPN box score failed for event {event_id}: {e}")
+    return pd.DataFrame(rows)
 
 
 def split_finished(raw):
@@ -151,10 +291,45 @@ def save_box_scores(df):
 
 # ---------- commands ----------
 
+def cmd_pull_espn_fallback():
+    """Pulls box scores from ESPN for every day since the last one already saved,
+    through yesterday (today's games may still be in progress - same reasoning
+    cmd_pull's own split_finished has). Called by cmd_pull when nba_api fails
+    outright; also callable directly (see the CLI's pull-espn-fallback command) to
+    backfill a gap by hand without waiting for nba_api to fail again."""
+    with db.connect() as conn:
+        last = conn.execute("SELECT MAX(game_date) FROM box_scores").fetchone()[0]
+    yesterday = (datetime.now(ET) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    start = (pd.Timestamp(last) + pd.Timedelta(days=1)).strftime("%Y-%m-%d") if last else yesterday
+    if start > yesterday:
+        print("Already up to date through yesterday - nothing to backfill from ESPN.")
+        return
+    print(f"Pulling {start} to {yesterday} from ESPN (fallback source)...")
+    df = fetch_espn_game_log(start, yesterday)
+    if df.empty:
+        print("ESPN fallback found no finished games in that range either.")
+        return
+    save_box_scores(df)
+    print(f"Saved {len(df)} player-game rows from ESPN "
+          f"({df['game_id'].nunique()} games, {df['game_date'].min()} to {df['game_date'].max()})")
+    new_ids = df[df["player_id"].str.startswith("espn:")]["player_name"].nunique()
+    if new_ids:
+        print(f"{new_ids} player(s) not yet seen under an nba_api id - tagged "
+              "'espn:...' for now. Once nba_api is reachable again, the next "
+              "successful pull replaces these ESPN-sourced rows outright for any "
+              "date it covers (see cmd_pull), so this is a temporary stand-in, not a "
+              "permanent second identity for these players.")
+
+
 def cmd_pull(season, playoffs):
     season_type = "Playoffs" if playoffs else "Regular Season"
     print(f"Pulling {season} {season_type} box scores from NBA.com...")
-    raw = fetch_game_log(season, season_type)
+    try:
+        raw = fetch_game_log(season, season_type)
+    except NBAComUnavailable as e:
+        print(f"NBA.com didn't respond after 3 tries ({e}).")
+        cmd_pull_espn_fallback()
+        return
     if raw.empty:
         print("NBA.com returned no games for that season yet.")
         return
@@ -169,6 +344,19 @@ def cmd_pull(season, playoffs):
         return
     df = clean_game_log(finished)
     save_box_scores(df)
+    # A prior gap may have been filled in from ESPN (cmd_pull_espn_fallback) under
+    # temporary 'espn:...' game_ids - now that nba_api has confirmed real data for
+    # these same dates, under its own game_id, the ESPN stand-in rows would otherwise
+    # sit alongside them as duplicate games for the same date. Remove them.
+    covered_dates = sorted(df["game_date"].unique())
+    with db.connect() as conn:
+        placeholders = ",".join("?" for _ in covered_dates)
+        removed = conn.execute(
+            f"DELETE FROM box_scores WHERE game_id LIKE 'espn:%' AND game_date IN ({placeholders})",
+            covered_dates).rowcount
+    if removed:
+        print(f"Replaced {removed} temporary ESPN-sourced row(s) now that nba_api "
+              "has confirmed real data for the same date(s).")
     print(f"Saved {len(df)} player-game rows "
           f"({df['game_id'].nunique()} games, {df['player_id'].nunique()} players, "
           f"{df['game_date'].min()} to {df['game_date'].max()})")
@@ -608,6 +796,10 @@ if __name__ == "__main__":
     p.add_argument("--season", default=current_season(), help="like 2025-26")
     p.add_argument("--playoffs", action="store_true", help="playoff games instead")
     sub.add_parser("grade", help="grade saved prop lines against box scores")
+    sub.add_parser("pull-espn-fallback",
+                   help="backfill box scores from ESPN for the gap since the last saved "
+                        "date - normally only runs automatically when nba_api fails, "
+                        "this lets you trigger it by hand")
     sub.add_parser("pull-positions", help="pull each player's position from team rosters")
     pp = sub.add_parser("pull-periods", help="pull 1st quarter/half stats for saved games")
     pp.add_argument("--season", default=current_season(), help="like 2025-26")
@@ -624,6 +816,8 @@ if __name__ == "__main__":
         if not re.fullmatch(r"\d{4}-\d{2}", args.season):
             sys.exit("Season must look like 2025-26")
         cmd_pull(args.season, args.playoffs)
+    elif args.mode == "pull-espn-fallback":
+        cmd_pull_espn_fallback()
     elif args.mode == "pull-positions":
         cmd_pull_positions()
     elif args.mode == "pull-periods":
