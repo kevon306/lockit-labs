@@ -1893,9 +1893,11 @@ def log_predictions(savable):
             else:
                 snap_table, player_col = "game_odds_snapshots", ""
                 params = [r.event_id, r.market, line_for_lookup]
+            # "IS NOT DISTINCT FROM" (not "=") because line_for_lookup can be None
+            # (Moneyline picks have no line) and plain "=" never matches NULL.
             snap_id = conn.execute(
                 f"SELECT id FROM {snap_table} WHERE event_id=? {player_col} AND "
-                "market=? AND line IS ? ORDER BY snapshot_time DESC LIMIT 1",
+                "market=? AND line IS NOT DISTINCT FROM ? ORDER BY snapshot_time DESC LIMIT 1",
                 params).fetchone()
             # p_over here means "probability of the recommended side", not literally
             # Over for spread/moneyline picks - true for every kind this page produces.
