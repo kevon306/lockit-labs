@@ -25,22 +25,23 @@ Snapshot timing (change in your .env file if you want):
   EARLY_SNAPSHOT_HOURS=0  set to 3 to also grab odds 3 hrs out         (10 more/game)
   MIN_CREDITS=15          stop pulling when credits drop this low
 
-Every window pulls the base 3 player markets (points/rebounds/assists) plus the 3
-game markets (moneyline/spread/total) - game lines used to only refresh in the close
-window, which meant Game Lines and "Strongest opportunities tonight" silently showed
-last night's (already-decided) game odds for most of the day, since nothing newer
-existed yet. Confirmed as a real user-facing bug, not a theoretical one. The close
-window alone still pulls the extra 4 player markets (threes/steals/blocks/turnovers)
-on top, since those aren't needed for same-day browsing, only the backtested "closing
-line" record - see closing_line_log_loss(), which takes the latest snapshot per game
-as its closing-line proxy, so an earlier same-day game-market pull here never gets
-mistaken for the close as long as the close window still runs after it. This adds up:
-at a typical 8-game night, (6+6+6+10) x 8 = ~224 credits/night, or ~6,000/month across
-a full season - well past the free plan's 500/month cap. This was turned on
-deliberately after discussing the real cost with an explicit decision to upgrade the
-Odds API plan rather than scale back - if you're back on the free plan, dial windows
-off above or lower MIN_CREDITS's effective headroom by scaling back which windows are
-on.
+Every window pulls pull_props.MARKETS (7 player markets - points/rebounds/assists
+plus the four combo stats PRA/P+R/P+A/R+A, added when Top Picks grew team-by-team
+combo-stat coverage) plus the 3 game markets (moneyline/spread/total) - game lines
+used to only refresh in the close window, which meant Game Lines and "Strongest
+opportunities tonight" silently showed last night's (already-decided) game odds for
+most of the day, since nothing newer existed yet. Confirmed as a real user-facing bug,
+not a theoretical one. The close window alone still pulls the extra 4 player markets
+(threes/steals/blocks/turnovers) on top, since those aren't needed for same-day
+browsing, only the backtested "closing line" record - see closing_line_log_loss(),
+which takes the latest snapshot per game as its closing-line proxy, so an earlier
+same-day game-market pull here never gets mistaken for the close as long as the close
+window still runs after it. This adds up: at a typical 8-game night, (10+10+10+14) x 8
+= ~352 credits/night, or roughly ~9,400/month across a full season - well past the
+free plan's 500/month cap. This was turned on deliberately after discussing the real
+cost with an explicit decision to upgrade the Odds API plan rather than scale back -
+if you're back on the free plan, dial windows off above or lower MIN_CREDITS's
+effective headroom by scaling back which windows are on.
 
 Through October 2026, every snapshots run ended by committing and pushing the local
 SQLite file to GitHub, since that was the only way the deployed Streamlit Cloud site

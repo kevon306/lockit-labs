@@ -40,7 +40,32 @@ MARKET_TO_STAT = {"player_points": "points",
                   "player_threes": "fg3m",
                   "player_steals": "steals",
                   "player_blocks": "blocks",
-                  "player_turnovers": "turnovers"}
+                  "player_turnovers": "turnovers",
+                  "player_points_rebounds_assists": "pra",
+                  "player_points_rebounds": "pr",
+                  "player_points_assists": "pa",
+                  "player_rebounds_assists": "ra"}
+# The 4 combo stats above aren't separate box-score columns - they're sums of
+# points/rebounds/assists already in every saved game. Modeled as their own stat
+# (see add_combo_stats below and model.STATS), not reconstructed from the
+# separately-modeled pieces: model.py's own docstring already found that combining
+# independently-modeled points and made-threes makes calibration worse, because the
+# pieces aren't independent in practice. Modeling the combined number directly
+# sidesteps that correlation problem entirely.
+COMBO_STATS = {"pra": ("points", "rebounds", "assists"),
+              "pr": ("points", "rebounds"),
+              "pa": ("points", "assists"),
+              "ra": ("rebounds", "assists")}
+
+
+def add_combo_stats(box):
+    """Adds the pra/pr/pa/ra columns to a box-scores frame, wherever one is loaded for
+    projection or grading - every place MARKET_TO_STAT's values are looked up as an
+    actual column needs these to exist first."""
+    box = box.copy()
+    for combo, parts in COMBO_STATS.items():
+        box[combo] = box[list(parts)].sum(axis=1)
+    return box
 
 
 # ---------- helpers ----------
@@ -712,6 +737,7 @@ def grade_lines():
         raise ValueError("No odds saved yet. Run pull_props.py first.")
     if box.empty:
         raise ValueError("No box scores saved yet. Run: python3 box_scores.py pull")
+    box = add_combo_stats(box)
 
     # Use the latest snapshot for each game, then the most common line across books.
     odds = odds[odds["market"].isin(MARKET_TO_STAT)].copy()

@@ -67,7 +67,7 @@ def grade_predictions():
     with db.connect() as conn:
         preds = pd.read_sql("SELECT * FROM predictions", conn)
         already = pd.read_sql("SELECT prediction_id FROM prediction_results", conn)
-        box = pd.read_sql("SELECT * FROM box_scores", conn)
+        box = box_scores.add_combo_stats(pd.read_sql("SELECT * FROM box_scores", conn))
         odds = pd.read_sql("SELECT event_id, home_team, away_team, commence_time FROM odds_snapshots", conn)
         game_odds = pd.read_sql(
             "SELECT event_id, home_team, away_team, commence_time FROM game_odds_snapshots", conn)

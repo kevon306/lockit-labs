@@ -48,10 +48,16 @@ import db
 
 BASE_URL = "https://api.the-odds-api.com/v4"
 SPORT = "basketball_nba"
-MARKETS = "player_points,player_rebounds,player_assists"  # what the automated snapshot
-                                                           # job pulls every 15 min - kept
-                                                           # as-is so that job's credit
-                                                           # cost doesn't silently change
+MARKETS = ("player_points,player_rebounds,player_assists,"
+          "player_points_rebounds_assists,player_points_rebounds,"
+          "player_points_assists,player_rebounds_assists")
+# What the automated snapshot job pulls every 15 min. Grew from 3 to 7 markets when
+# Top Picks added combo-stat coverage (PRA/P+R/P+A/R+A) - a deliberate decision to
+# raise the snapshot job's credit cost (was ~224 credits/night at 8 games/night,
+# roughly 10/game x4 windows + 14 at close; now ~352/night, ~10/14 -> see auto.py's
+# own docstring for the full breakdown), not an accident. If credits start running
+# low, trim this back to the original 3-stat MARKETS string instead of disabling
+# whole snapshot windows, which would also lose points/rebounds/assists freshness.
 EXTRA_MARKETS = "player_threes,player_steals,player_blocks,player_turnovers"  # opt-in
                                                            # via --extra-markets, same
                                                            # idea as --game-markets

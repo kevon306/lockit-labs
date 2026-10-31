@@ -47,9 +47,11 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+import box_scores
 import db
 
-STATS = ["points", "rebounds", "assists", "fg3m", "steals", "blocks", "turnovers"]
+STATS = ["points", "rebounds", "assists", "fg3m", "steals", "blocks", "turnovers",
+        "pra", "pr", "pa", "ra"]
 MIN_HISTORY = 10                  # games needed before we'll project a player at all
 SHORT_MIN_W, LONG_MIN_W = 5, 15   # game windows used for the minutes projection
 SHORT_RATE_W, LONG_RATE_W = 10, 40  # game windows used for the rate projection
@@ -243,10 +245,9 @@ def closing_line_log_loss(box, odds_resolved):
 
     proj = add_projections(box.sort_values(["player_id", "game_date"]).reset_index(drop=True))
     proj = proj.set_index(["player_id", "game_date"])
-    market_for_stat = {"player_points": "points", "player_rebounds": "rebounds", "player_assists": "assists"}
 
     eps = 1e-6
-    for market, stat in market_for_stat.items():
+    for market, stat in box_scores.MARKET_TO_STAT.items():
         losses_model, losses_market = [], []
         sub = odds_resolved[odds_resolved["market"] == market]
         for (player_id, game_date), g in sub.groupby(["player_id", "game_date"]):
@@ -298,6 +299,7 @@ def cmd_backtest():
             "SELECT game_id, game_date, player_id, minutes, points, rebounds, assists, fg3m, "
             "steals, blocks, turnovers FROM box_scores", conn)
     box["game_date"] = pd.to_datetime(box["game_date"])
+    box = box_scores.add_combo_stats(box)
     box = add_projections(box)
     box = box[box["games_before"] >= MIN_HISTORY].copy()
 

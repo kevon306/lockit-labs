@@ -51,7 +51,10 @@ def _jsonable(x):
 
 def _load(table):
     with db.connect() as conn:
-        return pd.read_sql(f"SELECT * FROM {table}", conn)
+        df = pd.read_sql(f"SELECT * FROM {table}", conn)
+    # See lockit_app.load()'s matching comment - combo stats (PRA, P+R, P+A, R+A)
+    # need to exist before model.project_tonight/closing_line_log_loss can use them.
+    return box_scores.add_combo_stats(df) if table == "box_scores" else df
 
 
 def _match_player(query, box):

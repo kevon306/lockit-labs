@@ -37,7 +37,11 @@ ET = ZoneInfo("America/New_York")
 MARKET_LABELS = {"player_points": "Points", "player_rebounds": "Rebounds",
                  "player_assists": "Assists", "player_threes": "3PM",
                  "player_steals": "Steals", "player_blocks": "Blocks",
-                 "player_turnovers": "Turnovers"}
+                 "player_turnovers": "Turnovers",
+                 "player_points_rebounds_assists": "Pts+Reb+Ast",
+                 "player_points_rebounds": "Pts+Reb",
+                 "player_points_assists": "Pts+Ast",
+                 "player_rebounds_assists": "Reb+Ast"}
 BOOK_LABELS = {"draftkings": "DraftKings", "fanduel": "FanDuel", "betmgm": "BetMGM",
                "williamhill_us": "Caesars", "betrivers": "BetRivers", "bovada": "Bovada",
                "betonlineag": "BetOnline", "fliff": "Fliff", "espnbet": "ESPN BET",
@@ -393,7 +397,11 @@ div[data-baseweb="input"], div[data-baseweb="select"] > div {{ border-radius: 10
 @st.cache_data(ttl=60)
 def load(table):
     with db.connect() as conn:
-        return pd.read_sql(f"SELECT * FROM {table}", conn)
+        df = pd.read_sql(f"SELECT * FROM {table}", conn)
+    # Combo stats (PRA, P+R, P+A, R+A) are sums of points/rebounds/assists, not their
+    # own saved column - added here so every page that loads box scores already has
+    # them, instead of each caller of model.project_tonight remembering to add them.
+    return box_scores.add_combo_stats(df) if table == "box_scores" else df
 
 
 def implied(price):
@@ -897,6 +905,12 @@ EDGE_THRESHOLD = 8    # minimum gap, in percentage points, between the model's p
 # gap as the best pick would reward exactly that blind spot. Flagged, not shown as picks.
 MAX_PLAUSIBLE_EDGE = 20
 TOP_PICKS_MAX = 5
+TEAM_BOARD_EDGE_THRESHOLD = 10  # the stricter bar for the "every team, every market"
+                                # board below Top Picks' own ranked list - explicitly
+                                # requested higher than EDGE_THRESHOLD, and unlike the
+                                # ranked list above, not capped to a fixed count: every
+                                # player prop across every market that clears it for a
+                                # team playing tonight is shown, not just the top few.
 
 
 def recommendation_tier(edge, side):
@@ -2093,6 +2107,30 @@ def page_top_picks():
         for r in caution.itertuples():
             render_card(r, "Check:")
 
+    section("Strong picks, every team")
+    hint(f"Every team playing tonight with at least one player prop clearing a "
+         f"{TEAM_BOARD_EDGE_THRESHOLD}-point edge (stricter than the {EDGE_THRESHOLD}-"
+         "point bar above) at Medium confidence or better, across every market the "
+         "model projects - points, rebounds, assists, threes, steals, blocks, "
+         "turnovers, and the four combo stats (Pts+Reb+Ast, Pts+Reb, Pts+Ast, "
+         "Reb+Ast). Not capped to a fixed number per team or overall: a team can show "
+         "several props, one, or none at all - this never forces a pick to fill a "
+         "slot, same reasoning as the rest of this page.")
+    team_board = picks[(picks["kind"] == "player")
+                       & (picks["edge"].abs() >= TEAM_BOARD_EDGE_THRESHOLD)
+                       & (picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE)
+                       & (picks["confidence"] != "Low")]
+    if team_board.empty:
+        hint("No player prop on tonight's full slate clears this bar right now.")
+    else:
+        for team in sorted(team_board["team"].dropna().unique()):
+            team_picks = team_board[team_board["team"] == team].sort_values(
+                "edge", key=lambda s: s.abs(), ascending=False)
+            n = len(team_picks)
+            with st.expander(f"{team} — {n} prop{'s' if n != 1 else ''}"):
+                for r in team_picks.itertuples():
+                    render_card(r, "Pick:")
+
     def backtest_row(label, info):
         n = info.get("n", 0)
         if not n:
@@ -2107,8 +2145,8 @@ def page_top_picks():
         bt_rows = (
             [backtest_row(label, game_bt.get(mkt, {})) for mkt, label in
              [("h2h", "Moneyline"), ("spreads", "Spread"), ("totals", "Total")]]
-            + [backtest_row(label, player_bt.get(stat, {})) for stat, label in
-               [("points", "Points"), ("rebounds", "Rebounds"), ("assists", "Assists")]])
+            + [backtest_row(MARKET_LABELS[market], player_bt.get(stat, {}))
+               for market, stat in box_scores.MARKET_TO_STAT.items()])
         st.dataframe(pd.DataFrame(bt_rows), hide_index=True, width="stretch")
         hint("A market's model log loss below its closing-line log loss means the model beat "
              "a real, no-vig market price on this set of settled games - that's what High "
