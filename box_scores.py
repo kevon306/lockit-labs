@@ -19,7 +19,6 @@ Must run from your own computer: NBA.com blocks requests from cloud servers.
 
 import argparse
 import re
-import sqlite3
 import sys
 import time
 import unicodedata
@@ -280,13 +279,8 @@ def clean_game_log(raw):
 def save_box_scores(df):
     """Insert or update. Box scores aren't locked, since the NBA sometimes corrects stats."""
     cols = list(df.columns)
-    rows = df.astype(object).where(pd.notna(df), None).itertuples(index=False, name=None)
-    with db.connect() as conn:
-        conn.executemany(
-            f"INSERT OR REPLACE INTO box_scores ({', '.join(cols)}) "
-            f"VALUES ({', '.join('?' for _ in cols)})",
-            list(rows),
-        )
+    rows = list(df.astype(object).where(pd.notna(df), None).itertuples(index=False, name=None))
+    db.upsert("box_scores", cols, ["game_id", "player_id"], rows)
 
 
 # ---------- commands ----------
@@ -351,9 +345,12 @@ def cmd_pull(season, playoffs):
     covered_dates = sorted(df["game_date"].unique())
     with db.connect() as conn:
         placeholders = ",".join("?" for _ in covered_dates)
+        # The 'espn:%' pattern is a bind parameter, not embedded in the SQL text -
+        # Postgres's driver treats a literal '%' in the query string itself as its
+        # own substitution syntax, which would collide with a hand-written one here.
         removed = conn.execute(
-            f"DELETE FROM box_scores WHERE game_id LIKE 'espn:%' AND game_date IN ({placeholders})",
-            covered_dates).rowcount
+            f"DELETE FROM box_scores WHERE game_id LIKE ? AND game_date IN ({placeholders})",
+            ["espn:%"] + covered_dates).rowcount
     if removed:
         print(f"Replaced {removed} temporary ESPN-sourced row(s) now that nba_api "
               "has confirmed real data for the same date(s).")
@@ -400,10 +397,8 @@ def cmd_pull_positions():
             rows.append((str(r.PLAYER_ID), r.PLAYER, t["abbreviation"], r.POSITION, db.now_utc()))
         time.sleep(0.6)  # be polite to NBA.com's unofficial API
 
-    with db.connect() as conn:
-        conn.executemany(
-            "INSERT OR REPLACE INTO players (player_id, player_name, team, position, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)", rows)
+    db.upsert("players", ["player_id", "player_name", "team", "position", "updated_at"],
+             ["player_id"], rows)
     print(f"Saved positions for {len(rows)} players across {ok}/{len(all_teams)} teams.")
 
 
@@ -457,11 +452,8 @@ def pull_one_game_periods(game_id):
 
 def save_period_box_scores(df):
     cols = list(df.columns)
-    rows = df.astype(object).where(pd.notna(df), None).itertuples(index=False, name=None)
-    with db.connect() as conn:
-        conn.executemany(
-            f"INSERT OR REPLACE INTO period_box_scores ({', '.join(cols)}) "
-            f"VALUES ({', '.join('?' for _ in cols)})", list(rows))
+    rows = list(df.astype(object).where(pd.notna(df), None).itertuples(index=False, name=None))
+    db.upsert("period_box_scores", cols, ["game_id", "player_id"], rows)
 
 
 def cmd_pull_periods(season, limit):
@@ -577,22 +569,21 @@ def cmd_pull_props(season, limit):
             skipped += 1
         else:
             game_props, team_firsts = parse_game_props(pbp)
-            with db.connect() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO game_props (game_id, first_basket_player_id, "
-                    "first_basket_player_name, first_basket_team, first_to_10_player_id, "
-                    "first_to_10_player_name, first_to_10_team) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (game_id, game_props.get("first_basket_player_id"),
-                     game_props.get("first_basket_player_name"),
-                     game_props.get("first_basket_team"),
-                     game_props.get("first_to_10_player_id"),
-                     game_props.get("first_to_10_player_name"),
-                     game_props.get("first_to_10_team")))
-                for team, player_id, player_name in team_firsts:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO team_first_basket "
-                        "(game_id, team, player_id, player_name) VALUES (?, ?, ?, ?)",
-                        (game_id, team, player_id, player_name))
+            db.upsert("game_props",
+                     ["game_id", "first_basket_player_id", "first_basket_player_name",
+                      "first_basket_team", "first_to_10_player_id", "first_to_10_player_name",
+                      "first_to_10_team"], ["game_id"],
+                     [(game_id, game_props.get("first_basket_player_id"),
+                       game_props.get("first_basket_player_name"),
+                       game_props.get("first_basket_team"),
+                       game_props.get("first_to_10_player_id"),
+                       game_props.get("first_to_10_player_name"),
+                       game_props.get("first_to_10_team"))])
+            if team_firsts:
+                db.upsert("team_first_basket", ["game_id", "team", "player_id", "player_name"],
+                         ["game_id", "team"],
+                         [(game_id, team, player_id, player_name)
+                          for team, player_id, player_name in team_firsts])
             saved += 1
         if i % 25 == 0 or i == len(todo):
             print(f"  {i}/{len(todo)} games checked, {saved} saved, {skipped} skipped")
@@ -668,10 +659,8 @@ def cmd_pull_shot_zones(season, limit):
         for z in zone_counts(df).itertuples():
             team_rows.append((t["abbreviation"], season, z.zone, int(z.fga), int(z.fgm), db.now_utc()))
         ok += 1
-    with db.connect() as conn:
-        conn.executemany(
-            "INSERT OR REPLACE INTO team_shot_zones (team, season, zone, fga, fgm, pulled_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)", team_rows)
+    db.upsert("team_shot_zones", ["team", "season", "zone", "fga", "fgm", "pulled_at"],
+             ["team", "season", "zone"], team_rows)
     print(f"Saved team shot zones for {ok}/30 teams.")
 
     start_year = int(season.split("-")[0])
@@ -703,10 +692,8 @@ def cmd_pull_shot_zones(season, limit):
                 buffer.append((p.player_id, season, z.zone, int(z.fga), int(z.fgm), db.now_utc()))
             saved += 1
         if i % 25 == 0 or i == len(todo):
-            with db.connect() as conn:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO player_shot_zones (player_id, season, zone, fga, fgm, pulled_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)", buffer)
+            db.upsert("player_shot_zones", ["player_id", "season", "zone", "fga", "fgm", "pulled_at"],
+                     ["player_id", "season", "zone"], buffer)
             buffer = []
             print(f"  {i}/{len(todo)} players checked, {saved} saved, {skipped} skipped")
 

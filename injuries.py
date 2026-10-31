@@ -99,7 +99,7 @@ def cmd_pull():
         by_status[r["status"]] = by_status.get(r["status"], 0) + 1
 
     print(f"Pulled {len(rows)} reported injuries across the league.")
-    print(f"  database: {new_in_db} new rows added to {db.DB_PATH.name}")
+    print(f"  database: {new_in_db} new rows added to the database")
     print(f"  by status: {', '.join(f'{k}: {v}' for k, v in sorted(by_status.items()))}")
     print("\nSample:")
     for r in rows[:8]:

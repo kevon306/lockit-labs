@@ -42,16 +42,16 @@ Odds API plan rather than scale back - if you're back on the free plan, dial win
 off above or lower MIN_CREDITS's effective headroom by scaling back which windows are
 on.
 
-At the end of every snapshots run, if the database changed, it's committed and pushed
-to GitHub so the deployed Streamlit Cloud site reflects it (the site itself can't
-refresh data: it only reads what's in the repo). Each sync is a normal commit, so the
-repo grows over time - check in on its size occasionally (`du -sh .git`) and consider
-squashing old sync commits if it gets too big.
+Through October 2026, every snapshots run ended by committing and pushing the local
+SQLite file to GitHub, since that was the only way the deployed Streamlit Cloud site
+ever saw new data. That's gone now - this Mac and the deployed site both read and
+write the same live Postgres database directly (see db.py's own docstring for why
+the git-sync approach had to go: it had already pushed the committed .db file past
+50MB). Nothing here pushes to git anymore.
 """
 
 import json
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -203,7 +203,6 @@ def snapshots():
                 save_state(state)
 
     log_todays_picks()
-    git_sync()
 
 
 def log_todays_picks():
@@ -217,7 +216,7 @@ def log_todays_picks():
     is written to run as a Streamlit script (st.set_page_config, nav.run() at module
     level), and ai_tools.py already established the pattern of importing it purely
     for its compute functions; done here the same way, isolated so a problem with it
-    can never take down the rest of the snapshot job (odds capture, git sync)."""
+    can never take down the rest of the snapshot job (odds capture)."""
     try:
         import lockit_app
         new_count = lockit_app.log_todays_qualifying_picks()
@@ -225,27 +224,6 @@ def log_todays_picks():
             log(f"Logged {new_count} new prediction(s) to the ledger")
     except Exception as e:
         log(f"Prediction logging failed (non-fatal): {e}")
-
-
-def git_sync():
-    repo_dir = pp.DATA_DIR.parent
-
-    def run(*args):
-        return subprocess.run(["git", *args], cwd=repo_dir, capture_output=True, text=True)
-
-    run("add", "-f", "data/lockit.db")
-    if run("diff", "--cached", "--quiet", "data/lockit.db").returncode == 0:
-        return  # nothing changed since the last sync
-
-    committed = run("commit", "-m", f"Data sync {datetime.now():%Y-%m-%d %H:%M}")
-    if committed.returncode != 0:
-        log(f"git commit failed: {committed.stderr.strip()}")
-        return
-    pushed = run("push", "origin", "main")
-    if pushed.returncode != 0:
-        log(f"git push failed: {pushed.stderr.strip()}")
-    else:
-        log("Synced database to GitHub for the live site")
 
 
 if __name__ == "__main__":

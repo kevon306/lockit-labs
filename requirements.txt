@@ -5,3 +5,4 @@ nba_api
 streamlit
 scipy
 anthropic
+psycopg2-binary

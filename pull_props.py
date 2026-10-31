@@ -200,7 +200,7 @@ def save(raw, rows, label):
     print(f"\nSaved {len(df)} rows")
     print(f"  raw: {raw_path}")
     print(f"  csv: {csv_path}")
-    print(f"  database: {new_in_db} new rows added to {db.DB_PATH.name}")
+    print(f"  database: {new_in_db} new rows added to the database")
     print(f"\nPlayers: {df['player'].nunique()} | Books: {df['bookmaker'].nunique()} "
           f"| Markets: {', '.join(sorted(df['market'].unique()))}")
     print("\nFirst few rows:")
@@ -216,7 +216,7 @@ def save_game_odds(rows, label):
         return
     new_in_db = db.save_game_odds(rows)
     df = pd.DataFrame(rows)
-    print(f"\nGame markets: {new_in_db} new rows added to {db.DB_PATH.name}")
+    print(f"\nGame markets: {new_in_db} new rows added to the database")
     print(df[["market", "bookmaker", "side", "line", "price_american"]]
           .head(8).to_string(index=False))
 

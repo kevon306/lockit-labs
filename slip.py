@@ -80,9 +80,10 @@ def save_entry(platform, entry_type, stake, potential_return, is_free_bet, notes
     with db.connect() as conn:
         cur = conn.execute(
             "INSERT INTO entries (created_at, placed_at, platform, entry_type, stake, "
-            "is_free_bet, payout_terms, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            "is_free_bet, payout_terms, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?) "
+            "RETURNING id",
             (now_utc(), now_utc(), platform, entry_type, float(stake), int(is_free_bet), terms, notes))
-        entry_id = cur.lastrowid
+        entry_id = cur.fetchone()[0]
         conn.executemany(
             "INSERT INTO entry_legs (entry_id, prediction_id, player, market, line, side, "
             "price_american, result) VALUES (?, NULL, ?, ?, ?, ?, ?, 'pending')",
