@@ -1,0 +1,40 @@
+name: Odds snapshots
+
+# Mirrors `python3 auto.py snapshots` from the Mac's launchd job. auto.py decides
+# internally (using the current ET time and each game's tip-off) whether anything is
+# actually due to be pulled right now - most runs are a quick no-op. Which windows
+# have already fired per game is tracked in the automation_state database table (not a
+# local file), so this and the Mac's own launchd job (while both are still running
+# during the cutover) never double-pull the same window and waste Odds API credits.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: snapshots
+  cancel-in-progress: false
+
+jobs:
+  snapshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run snapshots job
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: python3 auto.py snapshots

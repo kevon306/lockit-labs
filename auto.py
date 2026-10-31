@@ -50,7 +50,6 @@ the git-sync approach had to go: it had already pushed the committed .db file pa
 50MB). Nothing here pushes to git anymore.
 """
 
-import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -59,13 +58,13 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 import box_scores
+import db
 import injuries
 import performance
 import pull_props as pp
 
 load_dotenv(override=True)  # .env always wins - see the comment on pull_props.get_api_key()
 ET = ZoneInfo("America/New_York")
-STATE_FILE = pp.DATA_DIR / "auto_state.json"
 MORNING_ON = os.getenv("MORNING_SNAPSHOT", "on").lower() == "on"
 AFTERNOON_ON = os.getenv("AFTERNOON_SNAPSHOT", "on").lower() == "on"
 PREGAME_90_ON = os.getenv("PREGAME_90_SNAPSHOT", "on").lower() == "on"
@@ -79,15 +78,14 @@ def log(msg):
 
 
 def load_state():
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    """Which odds windows have already fired per game - stored in the database (not a
+    local file) so this Mac and GitHub Actions share one source of truth and never
+    double-pull the same window. See db.automation_state's own comment for why."""
+    return db.load_automation_state()
 
 
 def save_state(state):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    db.save_automation_state(state)
 
 
 def morning():

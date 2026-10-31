@@ -1,0 +1,58 @@
+name: Morning job
+
+# Mirrors `python3 auto.py morning` from the Mac's launchd job: pulls yesterday's box
+# scores (falling back to ESPN, since stats.nba.com blocks cloud IPs - see
+# box_scores.py), grades prop lines and predictions, pulls injuries, logs today's
+# qualifying picks.
+#
+# GitHub Actions cron is UTC-only and doesn't shift for daylight saving, so this fires
+# on both the EST and EDT UTC-equivalents of 9 AM ET and then checks the real ET clock
+# before doing any work - the off-hour trigger exits in a few seconds.
+
+on:
+  schedule:
+    - cron: "0 14 * * *"  # 9:00 AM EST (UTC-5)
+    - cron: "0 13 * * *"  # 9:00 AM EDT (UTC-4)
+  workflow_dispatch: {}
+
+concurrency:
+  group: morning
+  cancel-in-progress: false
+
+jobs:
+  morning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check if it's ~9 AM ET right now
+        id: gate
+        run: |
+          hour=$(TZ="America/New_York" date +%H)
+          echo "ET hour is $hour"
+          if [ "$hour" = "09" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out repo
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Run morning job
+        if: steps.gate.outputs.run == 'true'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: python3 auto.py morning

@@ -393,6 +393,17 @@ CREATE TABLE IF NOT EXISTS ai_usage_log (
     cost_usd    DOUBLE PRECISION,
     error       TEXT        -- set if the request failed, for monitoring without crashing
 );
+
+-- auto.py's "have I already pulled this odds window" bookkeeping (which tip-relative
+-- and clock-time snapshot windows have already fired, per game). Lives in the database
+-- instead of a local JSON file so it's shared correctly between every place the
+-- snapshots job runs (this Mac, GitHub Actions, etc.) - two runners that each kept
+-- their own local copy would both think a window hadn't fired yet and double-pull it,
+-- wasting Odds API credits.
+CREATE TABLE IF NOT EXISTS automation_state (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
 """
 
 ODDS_COLUMNS = ["snapshot_time", "source", "event_id", "commence_time", "home_team",
@@ -593,6 +604,29 @@ def save_injury_reports(rows):
         result = execute_values(cur, sql, values, fetch=True)
         conn.commit()
         return len(result)
+
+
+def load_automation_state():
+    """The dict auto.py's snapshots() uses to track which odds windows have already
+    fired per game - see the automation_state table's own comment for why this lives
+    in the database rather than a local file."""
+    with connect() as conn:
+        cur = conn.execute("SELECT key, value FROM automation_state")
+        return {key: value for key, value in cur.fetchall()}
+
+
+def save_automation_state(state):
+    """Overwrites the whole automation_state table with the given dict - small
+    (one row per game+window, cleared out each season) so a full replace each save
+    is simpler than diffing, and matches how auto.py already treated this as one
+    blob when it was a JSON file."""
+    with connect() as conn:
+        conn.execute("DELETE FROM automation_state")
+        if state:
+            rows = list(state.items())
+            execute_values(conn._conn.cursor(),
+                           "INSERT INTO automation_state (key, value) VALUES %s", rows)
+        conn.commit()
 
 
 def save_parlay_analysis(row):
