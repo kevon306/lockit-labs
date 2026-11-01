@@ -428,14 +428,24 @@ div[data-baseweb="input"], div[data-baseweb="select"] > div {{ border-radius: 10
 
 # ---------- data helpers ----------
 
+@st.cache_data(ttl=900)
+def _load_box_scores():
+    # box_scores only changes once a day (new games finish) or when the morning job
+    # runs - unlike odds, which move every ~15 min. A long ttl here means the full
+    # 80k+ row table and its add_combo_stats computation only re-run every 15 min,
+    # instead of on every page load/click under the old blanket ttl=60.
+    with db.connect() as conn:
+        df = pd.read_sql("SELECT * FROM box_scores", conn)
+    return box_scores.add_combo_stats(df)
+
+
 @st.cache_data(ttl=60)
 def load(table):
+    if table == "box_scores":
+        return _load_box_scores()
     with db.connect() as conn:
         df = pd.read_sql(f"SELECT * FROM {table}", conn)
-    # Combo stats (PRA, P+R, P+A, R+A) are sums of points/rebounds/assists, not their
-    # own saved column - added here so every page that loads box scores already has
-    # them, instead of each caller of model.project_tonight remembering to add them.
-    return box_scores.add_combo_stats(df) if table == "box_scores" else df
+    return df
 
 
 def implied(price):
