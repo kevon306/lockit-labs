@@ -56,9 +56,10 @@ jobs:
           import json
           data = json.load(open('/tmp/hl_box.json'))
           for team in data:
-              for p in team['team']['boxScores']:
+              for p in team['boxScores']:
                   if 'Barnes' in p['player']['name']:
-                      pts = next((s['value'] for s in p['statistics'] if s['name']=='Total Points Scored'), None)
-                      print(p['player']['name'], '-> Total Points Scored:', pts)
+                      stats = {s['name']: s['value'] for s in p['statistics']}
+                      print(p['player']['name'], '-> points:', stats.get('Total Points Scored'),
+                            'rebounds:', stats.get('Total Rebounds'), 'assists:', stats.get('Total Assists'))
           " || echo "could not parse response, see raw output below"
           head -c 300 /tmp/hl_box.json
