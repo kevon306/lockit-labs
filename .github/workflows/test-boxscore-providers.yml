@@ -1,0 +1,51 @@
+name: TEST - box score provider reachability (disposable)
+
+# One-off diagnostic, not part of the app - confirms whether BALLDONTLIE and
+# Highlightly are reachable from a GitHub Actions runner the way stats.nba.com isn't
+# (see box_scores.py's own docstring for why that matters). Delete this file once the
+# cloud-migration decision is made; it's not meant to stay.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: BALLDONTLIE - /v1/teams (free tier, proves reachability only)
+        run: |
+          code=$(curl -s -o /tmp/bdl_teams.json -w "%{http_code}" \
+            -H "Authorization: ${{ secrets.BALLDONTLIE_API_KEY }}" \
+            "https://api.balldontlie.io/v1/teams?per_page=2")
+          echo "HTTP status: $code"
+          head -c 300 /tmp/bdl_teams.json
+          echo
+          if [ "$code" != "200" ]; then
+            echo "::error::BALLDONTLIE not reachable or key rejected from this runner (status $code)"
+            exit 1
+          fi
+          echo "BALLDONTLIE reachable from a GitHub Actions runner: yes"
+
+      - name: BALLDONTLIE - /v1/stats (needs ALL-STAR+; expected 401 on a free key)
+        run: |
+          code=$(curl -s -o /tmp/bdl_stats.json -w "%{http_code}" \
+            -H "Authorization: ${{ secrets.BALLDONTLIE_API_KEY }}" \
+            "https://api.balldontlie.io/v1/stats?dates[]=2026-10-30&per_page=5")
+          echo "HTTP status: $code"
+          head -c 500 /tmp/bdl_stats.json
+          echo
+
+      - name: Highlightly - NBA box score (free tier)
+        if: ${{ secrets.HIGHLIGHTLY_API_KEY != '' }}
+        run: |
+          code=$(curl -s -o /tmp/hl.json -w "%{http_code}" \
+            -H "x-api-key: ${{ secrets.HIGHLIGHTLY_API_KEY }}" \
+            "https://basketball.highlightly.net/games?date=2026-10-30")
+          echo "HTTP status: $code"
+          head -c 500 /tmp/hl.json
+          echo
+
+      - name: Highlightly - skipped (no key yet)
+        if: ${{ secrets.HIGHLIGHTLY_API_KEY == '' }}
+        run: echo "HIGHLIGHTLY_API_KEY secret not set - skipping Highlightly test for now."
