@@ -36,15 +36,34 @@ jobs:
           head -c 500 /tmp/bdl_stats.json
           echo
 
-      - name: Highlightly - NBA box score (free tier)
+      - name: Highlightly - NBA matches list (free tier)
         if: ${{ secrets.HIGHLIGHTLY_API_KEY != '' }}
         run: |
-          code=$(curl -s -o /tmp/hl.json -w "%{http_code}" \
-            -H "x-api-key: ${{ secrets.HIGHLIGHTLY_API_KEY }}" \
-            "https://basketball.highlightly.net/games?date=2026-10-30")
+          code=$(curl -s -o /tmp/hl_matches.json -w "%{http_code}" \
+            -H "x-rapidapi-key: ${{ secrets.HIGHLIGHTLY_API_KEY }}" \
+            "https://nba.highlightly.net/matches?date=2026-10-30")
           echo "HTTP status: $code"
-          head -c 500 /tmp/hl.json
+          head -c 400 /tmp/hl_matches.json
           echo
+
+      - name: Highlightly - NBA per-player box score, Raptors vs Magic 2026-10-30 (free tier)
+        if: ${{ secrets.HIGHLIGHTLY_API_KEY != '' }}
+        run: |
+          code=$(curl -s -o /tmp/hl_box.json -w "%{http_code}" \
+            -H "x-rapidapi-key: ${{ secrets.HIGHLIGHTLY_API_KEY }}" \
+            "https://nba.highlightly.net/box-score/1549057")
+          echo "HTTP status: $code"
+          echo "Looking for Scottie Barnes' known 41 points (ground truth from our own box_scores table):"
+          python3 -c "
+          import json
+          data = json.load(open('/tmp/hl_box.json'))
+          for team in data:
+              for p in team['team']['boxScores']:
+                  if 'Barnes' in p['player']['name']:
+                      pts = next((s['value'] for s in p['statistics'] if s['name']=='Total Points Scored'), None)
+                      print(p['player']['name'], '-> Total Points Scored:', pts)
+          " || echo "could not parse response, see raw output below"
+          head -c 300 /tmp/hl_box.json
 
       - name: Highlightly - skipped (no key yet)
         if: ${{ secrets.HIGHLIGHTLY_API_KEY == '' }}
