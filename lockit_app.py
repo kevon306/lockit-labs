@@ -9,9 +9,11 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from html import escape
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy import stats
@@ -48,6 +50,7 @@ BOOK_LABELS = {"draftkings": "DraftKings", "fanduel": "FanDuel", "betmgm": "BetM
                "fanatics": "Fanatics", "ballybet": "Bally Bet", "hardrockbet": "Hard Rock",
                "mybookieag": "MyBookie", "lowvig": "LowVig", "betus": "BetUS"}
 TEAM_SHORT = box_scores.team_abbreviations()  # "Atlanta Hawks" -> "ATL"
+TEAM_FULL = {v: k for k, v in TEAM_SHORT.items()}  # "ATL" -> "Atlanta Hawks"
 ALL_TEAM_ABBRS = sorted(set(TEAM_SHORT.values()))
 
 # Every stat type the player drill-down can chart. Each entry is a list of
@@ -388,6 +391,37 @@ div[data-baseweb="input"], div[data-baseweb="select"] > div {{ border-radius: 10
     font-size: .7rem; padding: 0 .4rem; margin-left: .25rem; }}
   .block-container {{ padding-bottom: 6rem; }}
 }}
+
+/* left sidebar nav (desktop) - mirrors the canvas design's left column */
+.sidenav-logo {{ font-family: 'Bricolage Grotesque', sans-serif; font-weight: 800;
+  font-size: 1.4rem; color: {TEXT}; letter-spacing: -0.03em; padding: .1rem 0 1.1rem .1rem; }}
+.sidenav-logo b {{ color: {BLUE}; }}
+[data-testid="stSidebar"] [data-testid="stPageLink-NavLink"] {{
+  border-radius: 10px !important; margin-bottom: .1rem; }}
+[data-testid="stSidebar"] [data-testid="stPageLink-NavLink"] p {{
+  font-weight: 600 !important; font-size: .92rem !important; }}
+[data-testid="stSidebar"] [data-testid="stPageLink-NavLink"][aria-current="page"] {{
+  background: {PANEL2} !important; }}
+.sidenav-label {{ color: {MUTED}; font-size: .72rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; margin: 1.1rem 0 .5rem .1rem; }}
+.sport-row {{ display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .35rem; }}
+.sport-chip {{ border-radius: 10px; border: 1px solid {EDGE}; padding: .35rem .7rem;
+  font-size: .82rem; font-weight: 600; color: {MUTED}; background: {PANEL}; }}
+.sport-chip.active {{ border-color: {BLUE}; color: #fff; background: rgba(30,144,255,.18); }}
+.sport-chip.soon {{ opacity: .45; }}
+
+/* on desktop the logo lives in the sidebar instead of the top bar */
+@media (min-width: 761px) {{
+  .topbar .logo {{ display: none; }}
+  .topbar {{ justify-content: flex-end; }}
+}}
+
+/* the Players page's player picker, styled to read as a search box like the canvas */
+.search-box div[data-baseweb="select"] > div {{
+  background: {PANEL}; border: 1px solid {EDGE}; font-size: 1rem; }}
+.search-box {{ position: relative; }}
+.search-box::before {{ content: "\\1F50D"; position: absolute; left: .7rem; top: .5rem;
+  color: {MUTED}; font-size: .95rem; z-index: 1; opacity: .7; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -633,13 +667,43 @@ def topbar(odds, here="tonight"):
         f'<a href="{href}" target="_self" class="{"on" if key == here else ""}">{label}'
         f'{f"<i>{n}</i>" if key == "bets" and n else ""}</a>' for href, key, label in links)
     # The draft slip only lives in the sidebar, which is collapsed by default on phones,
-    # so without this a mobile user has no way to tell they have picks queued up.
+    # so without this a mobile user has no way to tell they have picks queued up. The
+    # logo is hidden here on desktop widths (CSS) since it now lives in sidebar_nav()
+    # instead - it still needs to render here for mobile, where the sidebar is collapsed.
     slip_pill = (f'<a href="./bets" target="_self" class="slip-pill">'
                 f'<i></i>{n} pick{"s" if n != 1 else ""} in your slip</a>') if n else ""
     st.markdown(f'<div class="topbar"><div class="logo">LOCK IT <b>Labs</b></div>'
                 f'<div class="top-right">{slip_pill}'
                 f'<div class="fresh"><i></i>{escape(fresh)}</div></div></div>'
                 f'<nav class="botnav">{nav}</nav>', unsafe_allow_html=True)
+
+
+def sidebar_nav(primary_pages, more_research, more_track):
+    """The left-column nav from the canvas design: logo, the 5 pages the design calls
+    out by name, a (currently cosmetic - see below) sport row, and everything else
+    this app already has tucked under a "More pages" expander so nothing is lost.
+
+    Only NBA is wired up (CLAUDE.md: this is an NBA research tool), so the other sports
+    are shown greyed out and labeled, not clickable - never fake functionality."""
+    with st.sidebar:
+        st.markdown('<div class="sidenav-logo">LOCK IT <b>Labs</b></div>', unsafe_allow_html=True)
+        for page in primary_pages:
+            st.page_link(page)
+        st.markdown('<div class="sidenav-label">Sports</div>'
+                    '<div class="sport-row">'
+                    '<span class="sport-chip active">NBA</span>'
+                    '<span class="sport-chip soon">NHL</span>'
+                    '<span class="sport-chip soon">NCAAB</span>'
+                    '<span class="sport-chip soon">NFL</span>'
+                    '</div>', unsafe_allow_html=True)
+        st.caption("Only NBA is tracked right now.")
+        with st.expander("More pages"):
+            st.caption("Research")
+            for page in more_research:
+                st.page_link(page)
+            st.caption("Track")
+            for page in more_track:
+                st.page_link(page)
 
 
 def section(title):
@@ -704,9 +768,15 @@ def pick_table(board, key, height="auto"):
     c3.caption("Tick the boxes on the left of the rows you want, then add them to your slip.")
 
 
-def render_slip():
+def render_slip(container=None):
+    """Renders the draft slip into `container` (defaults to the left sidebar, where it
+    still lives on every page except Tonight - see page_tonight(), which renders it
+    inline in its own right-hand column to match the canvas design, and sets
+    st.session_state["_slip_rendered_inline"] so the fallback call at the bottom of
+    this file skips re-rendering it a second time into the sidebar."""
     legs = slip.load()
-    with st.sidebar:
+    container = container or st.sidebar
+    with container:
         st.markdown(f'<div class="slip-h">My slip<span>{len(legs)}</span></div>',
                     unsafe_allow_html=True)
         if not legs:
@@ -758,6 +828,8 @@ def page_tonight():
     topbar(odds)
     if odds.empty:
         st.info("No odds saved yet. In the terminal, run: `python3 pull_props.py today --game 0`")
+        render_slip()
+        st.session_state["_slip_rendered_inline"] = True
         return
 
     ev = events_table(odds)
@@ -775,17 +847,20 @@ def page_tonight():
         boards[r.event_id] = b
     allb = pd.concat(boards.values(), ignore_index=True) if boards else pd.DataFrame()
 
-    title = "Tonight's board" if day == today else f"Board for {pd.Timestamp(day):%A, %b %-d}"
+    is_today = day == today
+    title = "Tonight" if is_today else f"{pd.Timestamp(day):%A, %b %-d}"
+    date_part = f"{pd.Timestamp(day):%A, %b %-d} &middot; " if is_today else ""
+    subtitle = f"{date_part}NBA &middot; {len(slate)} game{'s' if len(slate) != 1 else ''}"
+    if not is_today:
+        subtitle += " &middot; most recent saved slate"
     st.markdown(
-        f'<div class="hero">{COURT_SVG}<h1>{escape(title)}</h1>'
-        '<p>Game lines first, then every prop line we tracked, the best price across '
-        'books, and how the market moved.</p>'
-        '<div class="nums">'
-        f'<div><b>{len(slate)}</b><span>games</span></div>'
-        f'<div><b>{len(allb)}</b><span>props tracked</span></div>'
-        f'<div><b>{slate_odds["bookmaker"].nunique()}</b><span>sportsbooks</span></div>'
-        f'<div><b>{slate_odds["snapshot_time"].nunique()}</b><span>snapshots</span></div>'
-        '</div></div>', unsafe_allow_html=True)
+        f'<div style="display:flex;justify-content:space-between;align-items:flex-end;'
+        f'flex-wrap:wrap;gap:.6rem;margin-bottom:1.1rem;">'
+        f'<div><h1 style="margin:0;padding:0;font-size:2.1rem;">{escape(title)}</h1>'
+        f'<p class="hint" style="margin:.2rem 0 0 0;">{subtitle}</p></div></div>',
+        unsafe_allow_html=True)
+    hint(f"{len(allb)} props tracked across {slate_odds['bookmaker'].nunique()} sportsbooks, "
+         f"{slate_odds['snapshot_time'].nunique()} snapshot(s) so far.")
 
     section("Tonight's games")
     if slate_game_odds.empty:
@@ -800,7 +875,7 @@ def page_tonight():
         hint("Real market data only, no model comparison - see Game Lines for the team "
              "model's own projection next to each side, and how it was backtested.")
 
-    section("Strongest opportunities tonight")
+    section("Top picks")
     if box.empty:
         hint("Need box scores saved before the model can project anything.")
     else:
@@ -826,7 +901,7 @@ def page_tonight():
             else:
                 context = pick_render_context(box)
                 for rank, r in enumerate(top.itertuples(), 1):
-                    render_pick_card(r, f"#{rank}", *context)
+                    render_pick_card(r, f"#{rank}", *context, link_to_detail=True)
                 hint(f"Top {len(top)} of {len(qualifying)} qualifying pick(s) tonight, "
                      "across player props and game lines, ranked by expected value at "
                      "the best available price - see Top Picks for the complete, "
@@ -863,6 +938,8 @@ def page_tonight():
              "previous snapshot: green is a better payout, red is worse.")
 
     with side:
+        render_slip(container=side)
+        st.session_state["_slip_rendered_inline"] = True
         gaps = allb[allb["Price gap"] > 0].sort_values("Price gap", ascending=False).head(6) \
             if not allb.empty else allb
         rows = "".join(
@@ -887,6 +964,156 @@ def page_tonight():
             for x in moved.itertuples()) or '<p class="hint">No moves yet. They appear once a game is captured more than once.</p>'
         st.markdown(f'<div class="panel"><div class="panel-title">Line moves</div>{rows}</div>',
                     unsafe_allow_html=True)
+
+
+# ---------- Pick Detail ----------
+
+def nearby_line_probs(mean, var, center_line, steps=(-2, -1, 0, 1, 2)):
+    """The model's own P(stat > line) at a handful of lines around the real posted
+    one, from the exact same fitted distribution project_tonight() already produced
+    - not a separate projection, just that one distribution read at other points.
+    Half-point steps, same spacing real alternate lines use."""
+    lines = [center_line + s for s in steps]
+    mean_s, var_s = pd.Series([mean] * len(lines)), pd.Series([var] * len(lines))
+    is_nb_s, r_s, p_s = model.fit_dist(mean_s, var_s)
+    probs = model.p_over(np.array(lines, dtype=float), mean_s, r_s, p_s, is_nb_s)
+    return lines, probs * 100
+
+
+def bullet_list(items, color, icon):
+    return "<ul style='list-style:none;padding-left:0;margin:0;'>" + "".join(
+        f"<li style='margin-bottom:.55rem;line-height:1.4;'>"
+        f"<span style='color:{color};margin-right:.4rem;'>{icon}</span>{s}</li>"
+        for s in items) + "</ul>"
+
+
+def page_pick_detail():
+    d = st.session_state.get("pick_detail")
+    return_page = st.session_state.get("pick_detail_return_to", tonight_page)
+    odds = load("odds_snapshots")
+    topbar(odds, "tonight")
+    st.page_link(return_page, label=f"Back to {return_page.title}", icon=":material/arrow_back:")
+    if not d:
+        st.info("Open a pick from a \"See why\" link to see its detail page.")
+        return
+    r = SimpleNamespace(**d)
+    box = load("box_scores")
+
+    line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
+    color = RED if r.side == "Under" else GREEN
+    st.markdown(
+        f'<p class="hint" style="margin:1rem 0 .15rem 0;">{escape(r.Game)}</p>'
+        f'<h1 style="margin:0;padding:0;font-size:2rem;">{escape(str(r.Player))}</h1>'
+        f'<p style="margin:.15rem 0 .7rem 0;color:{TEXT};">{escape(r.Stat)}'
+        f'{f" {escape(str(r.side))}{line_txt}" if r.Stat != "Moneyline" else f" {escape(str(r.side))}"}</p>'
+        '<span class="badge" style="background:rgba(224,164,88,.15);color:#E0A458;">'
+        'BETA &middot; NOT YET PROVEN AGAINST CLOSING LINES</span>',
+        unsafe_allow_html=True)
+
+    main, side = st.columns([2.1, 1], gap="large")
+
+    with main:
+        bar = lambda pct, c: (f'<div style="height:6px;border-radius:999px;background:{EDGE};'
+                              f'margin-top:.35rem;"><div style="height:6px;border-radius:999px;'
+                              f'background:{c};width:{max(0, min(pct, 100)):.0f}%;"></div></div>')
+        within = abs(r.edge) <= MAX_PLAUSIBLE_EDGE
+        st.markdown(
+            '<div class="panel"><div style="display:grid;'
+            'grid-template-columns:repeat(3,1fr);gap:1.2rem;">'
+            f'<div><div class="hint" style="margin:0;">LOCK IT model</div>'
+            f'<div style="font-family:\'Bricolage Grotesque\',sans-serif;font-size:1.9rem;'
+            f'font-weight:700;color:{color};">{r.model_p:.0f}%</div>{bar(r.model_p, color)}</div>'
+            f'<div><div class="hint" style="margin:0;">Books\' price, cut removed</div>'
+            f'<div style="font-family:\'Bricolage Grotesque\',sans-serif;font-size:1.9rem;'
+            f'font-weight:700;">{r.market_p:.0f}%</div>{bar(r.market_p, MUTED)}</div>'
+            f'<div><div class="hint" style="margin:0;">Edge</div>'
+            f'<div style="font-family:\'Bricolage Grotesque\',sans-serif;font-size:1.9rem;'
+            f'font-weight:700;color:{color};">{r.edge:+.0f} pts</div>'
+            f'<div class="hint" style="margin:.35rem 0 0 0;">'
+            f'{"Within the believable range" if within else f"Flagged - larger than the {MAX_PLAUSIBLE_EDGE}pt bar this app trusts"}'
+            '</div></div></div></div>', unsafe_allow_html=True)
+
+        if not getattr(r, "passed_backtest", True):
+            hint(f"Overconfidence guard: this market hasn't yet beaten the no-vig closing "
+                 f"line in a real backtest (see Model vs. closing line below), so the "
+                 f"probability saved to the ledger is blended 50/50 with the market "
+                 f"({getattr(r, 'shown_p', r.model_p):.0f}%), not the model's own "
+                 f"{r.model_p:.0f}% shown above.")
+
+        if r.kind == "player" and r.Stat != "Moneyline":
+            mean = getattr(r, f"{r.stat}_mean_hat")
+            var = getattr(r, f"{r.stat}_var_hat")
+            if pd.notna(mean) and pd.notna(var):
+                section("Chance of going over, by line")
+                lines, probs = nearby_line_probs(mean, var, r.Line)
+                chart_df = pd.DataFrame({
+                    "Line": [f"{ln:.1f}" for ln in lines], "Probability": probs,
+                    "is_this_line": [ln == r.Line for ln in lines]})
+                bars = alt.Chart(chart_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                    x=alt.X("Line:N", sort=None, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("Probability:Q", title="Chance of going over (%)", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.condition("datum.is_this_line", alt.value(BLUE), alt.value(PANEL2)))
+                labels = bars.mark_text(dy=-8, color=TEXT).encode(text=alt.Text("Probability:Q", format=".0f"))
+                st.altair_chart(chart_style(bars + labels), use_container_width=True)
+                hint("Read directly off the same projected distribution as the model % above - "
+                     "not a separate projection, and not tied to real alternate-line odds.")
+
+        section("Why the model likes it, and what could go wrong")
+        context = pick_render_context(box)
+        if r.kind == "player":
+            likes, risks = player_why_short(r, *context)
+        else:
+            likes, risks = game_why_short(r, context[2], context[4])
+        c1, c2 = st.columns(2)
+        c1.markdown(f'<div class="panel"><div class="panel-title">Why the model likes it</div>'
+                    f'{bullet_list(likes, GREEN, "▲")}</div>', unsafe_allow_html=True)
+        c2.markdown(f'<div class="panel"><div class="panel-title">What could go wrong</div>'
+                    f'{bullet_list(risks, RED, "▼")}</div>', unsafe_allow_html=True)
+        hint("Every bullet above is a real, computed signal - this player's own recent form, "
+             "his team's and the opponent's current ratings, shot-location data, and known "
+             "caveats like injury status - the same evidence the full \"Why we like it\" "
+             "writeup on Top Picks and Players is built from, just the short version.")
+
+    with side:
+        if r.kind == "player":
+            book_rows = odds[(odds["event_id"] == r.event_id)
+                             & (odds["player"].map(box_scores.normalize_name) == r.key)
+                             & (odds["market"] == r.market) & (odds["line"] == r.Line)
+                             & (odds["side"] == r.side)]
+            latest = (book_rows[book_rows["snapshot_time"] == book_rows["snapshot_time"].max()]
+                     if not book_rows.empty else book_rows)
+            latest = latest.sort_values("price_american", ascending=False)
+            price_rows = "".join(
+                f'<div class="row"><div class="who">{escape(book(x.bookmaker))}</div>'
+                f'<div class="val">{fmt_price(x.price_american)}</div></div>'
+                for x in latest.itertuples()) or '<p class="hint">No prices saved for this exact side and line.</p>'
+            best_book = book(latest.iloc[0]["bookmaker"]) if not latest.empty else None
+            foot = (f'<p class="hint">{escape(best_book)} pays the most for the same bet.</p>'
+                   if best_book else "")
+        else:
+            price_rows = (f'<div class="row"><div class="who">{escape(book(r.book))}</div>'
+                          f'<div class="val">{fmt_price(r.price)}</div></div>')
+            foot = ""
+        st.markdown(
+            f'<div class="panel"><div class="panel-title">Prices, '
+            f'{escape(str(r.side))}{line_txt}</div>{price_rows}{foot}</div>',
+            unsafe_allow_html=True)
+
+        if r.kind == "player":
+            if st.button(f"Add {r.side} to slip", type="primary", width="stretch", key="pd_add_main"):
+                added = slip.add([d], r.side)
+                st.toast(f"Added {added} pick to your slip" if added else "Already on your slip")
+                st.rerun()
+            other_side = "Under" if r.side == "Over" else "Over"
+            if st.button(f"Add {other_side} instead", width="stretch", key="pd_add_other"):
+                added = slip.add([d], other_side)
+                st.toast(f"Added {added} pick to your slip" if added else "Already on your slip")
+                st.rerun()
+            hint("Check tonight's injury report before placing. The model doesn't know about "
+                 "late scratches.")
+        else:
+            hint("Game-line picks aren't added to the slip from this page yet - use Game "
+                 "Lines or Lines instead.")
 
 
 # ---------- Top Picks ----------
@@ -1180,6 +1407,29 @@ def expected_value(model_p, price):
     return model_p / 100 * decimal_odds(price) - 1
 
 
+def passed_backtest(key, backtest):
+    """True only once closing_line_log_loss() has actually shown this stat/market
+    beating the no-vig closing line on log loss. backtest=None, or a key with no
+    settled closing-line games yet (model_wins is None, not False), both come back
+    False here - "never shown to work" and "failed to show it" are treated the same
+    by both game_confidence/model.confidence_label (which gate High confidence on
+    this) and shown_probability below (which gates the overconfidence blend on it)."""
+    return bool(backtest and backtest.get(key, {}).get("model_wins"))
+
+
+def shown_probability(model_p, market_p, passed):
+    """The probability actually surfaced to a human and saved as predictions.p_over -
+    an overconfidence guard, not a tuning knob: until a market has *shown* (not just
+    claimed) that it beats the no-vig closing line, this averages the model's own
+    number straight with the market's, 50/50, instead of asserting the model's full
+    confidence. Flat and untuned on purpose - no sliding scale by sample size or edge
+    size, nothing fit to this app's own early picks. The model's raw, unblended number
+    is never thrown away - see raw_model_p in db.py's schema - so a future review can
+    always compare 'what we showed' against 'what the model alone would have said'.
+    Once a market passes, this returns the model's number unchanged."""
+    return model_p if passed else (model_p + market_p) / 2
+
+
 def game_confidence(games_before, market, backtest):
     """Same two-part rule as model.confidence_label(): High requires both a real track
     record (30+ games) and closing_line_log_loss() showing the model beats the no-vig
@@ -1188,8 +1438,7 @@ def game_confidence(games_before, market, backtest):
     awarded on sample size alone."""
     if games_before < 15:
         return "Low"
-    beats_market = bool(backtest and backtest.get(market, {}).get("model_wins"))
-    return "High" if (games_before >= 30 and beats_market) else "Medium"
+    return "High" if (games_before >= 30 and passed_backtest(market, backtest)) else "Medium"
 
 
 @st.cache_data(ttl=60)
@@ -1270,6 +1519,14 @@ def compute_picks(box, odds, player_bt=None):
     picks["edge"] = picks["model_p"] - picks["market_p"]
     picks["confidence"] = picks.apply(
         lambda r: model.confidence_label(r["games_before"], r["stat"], player_bt), axis=1)
+    # shown_p (not model_p) is what gets displayed as a standalone probability and
+    # logged to the ledger - see shown_probability()'s own docstring. edge, EV,
+    # confidence, and qualifying/ranking all keep reading the real model_p, completely
+    # unaffected by this - the blend is a display/ledger safeguard, not a change to
+    # which picks qualify or how they're ranked.
+    picks["passed_backtest"] = picks["stat"].map(lambda s: passed_backtest(s, player_bt))
+    picks["shown_p"] = picks.apply(
+        lambda r: shown_probability(r["model_p"], r["market_p"], r["passed_backtest"]), axis=1)
     picks["price"] = picks.apply(
         lambda r: r["over_price"] if r["side"] == "Over" else r["under_price"], axis=1)
     picks["book"] = picks.apply(
@@ -1363,11 +1620,14 @@ def compute_game_picks(box, game_odds, game_bt=None):
             if edge <= 0:
                 continue  # neither side cleared the market - nothing to show for this market
 
+            passed = passed_backtest(market, game_bt)
             rows.append({
                 "Player": label, "Game": game_label, "Stat": stat_label[market],
                 "Line": line_display, "side": label, "model_p": model_p,
                 "market_p": x.no_vig_pct, "edge": edge,
                 "confidence": game_confidence(games_before, market, game_bt),
+                "passed_backtest": passed,
+                "shown_p": shown_probability(model_p, x.no_vig_pct, passed),
                 "price": x.price, "book": x.book,
                 "event_id": r.event_id, "market": market, "games_before": games_before,
                 "kind": "game", "note": score_note,
@@ -1397,20 +1657,24 @@ def _zone_text(label, share, pct):
     return f"{share*100:.0f}% {label}{pct_txt}"
 
 
-def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries):
-    """The 'Why we like it' panel for a player-prop pick: real basketball reasoning
-    from this player's own game log, his team's and the opponent's current ratings,
-    the opponent's real season-to-date defensive numbers, and (for points) real shot-
-    location data from NBA.com's own shot chart - rim/mid-range/three shares and FG%,
-    both his own shot profile and the opponent's real rim-protection and perimeter-
-    defense numbers. No individual defender assignments or coverage schemes (drop/
-    switch/trap) - box scores and shot charts don't carry that data, and inventing it
-    would violate the project's own no-fabrication rule.
+def player_why_factors(r, box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries):
+    """Every real, non-fabricated signal behind a player-prop pick - this player's own
+    recent form, his team's and the opponent's current ratings, the opponent's real
+    season-to-date defensive numbers, and (for points) real shot-location data from
+    NBA.com's own shot chart - rim/mid-range/three shares and FG%, both his own shot
+    profile and the opponent's real rim-protection and perimeter-defense numbers. No
+    individual defender assignments or coverage schemes (drop/switch/trap) - box
+    scores and shot charts don't carry that data, and inventing it would violate the
+    project's own no-fabrication rule.
 
     injuries (from injury_reports, an unofficial feed checked at most once a day) is
     shown for context only - it is NOT yet folded into mean/var_hat or model_p, which
     is why an Out/Day-To-Day status is always surfaced as a caveat, never silently
-    treated as already accounted for."""
+    treated as already accounted for.
+
+    Computed once, shared by the long section-by-section writeup (player_why_html)
+    and the compact Pick Detail bullet lists (player_why_short), so the two views can
+    never drift apart on what the real evidence actually says - see those functions."""
     stat = r.stat
     mean = getattr(r, f"{stat}_mean_hat")
     var = getattr(r, f"{stat}_var_hat")
@@ -1626,32 +1890,66 @@ def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, t
     if stat == "assists":
         terms += ["turnovers forced"]
 
+    return {
+        "breakdown": breakdown, "support": support, "oppose": oppose, "caveats": caveats,
+        "support_html": support_html, "oppose_html": oppose_html, "needs_html": needs_html,
+        "mean": mean, "std": std, "dist_name": dist_name, "chips": chips,
+        "low": low, "high": high, "key_line": key_line, "tier": tier,
+        "tier_reason": tier_reason, "terms": terms,
+    }
+
+
+def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries):
+    """The long, section-by-section (A-H) 'Why we like it' writeup for a player-prop
+    pick, formatted from player_why_factors()'s shared computation - see that
+    function's docstring for what goes into it and why injuries are shown as a
+    caveat rather than folded into the math."""
+    f = player_why_factors(r, box_keyed, team_ratings, defense_allowed, player_zones,
+                           team_zones, injuries)
+    stat_lower = r.Stat.lower()
     return (
-        f'<p><b>A. The basketball breakdown.</b> {" ".join(breakdown)}</p>'
-        f'<p><b>B. What favors the pick.</b></p><ul>{support_html}</ul>'
-        f'<p><b>C. What works against the pick.</b></p><ul>{oppose_html}</ul>'
-        f'<p><b>D. The key matchup.</b> {key_line}</p>'
-        f'<p><b>E. Statistical evidence.</b> Projected mean {mean:.1f} {escape(stat_lower)} '
-        f'(std dev {std:.1f}), modeled as a {dist_name} distribution, from {int(r.games_before)} '
-        f'games of this player\'s own saved history. Hit-rate splits for this exact side and line:</p>'
-        f'<div class="strip" style="margin:.4rem 0 .8rem;">{chips}</div>'
-        f'<p><b>F. What needs to happen.</b> {needs_html}</p>'
+        f'<p><b>A. The basketball breakdown.</b> {" ".join(f["breakdown"])}</p>'
+        f'<p><b>B. What favors the pick.</b></p><ul>{f["support_html"]}</ul>'
+        f'<p><b>C. What works against the pick.</b></p><ul>{f["oppose_html"]}</ul>'
+        f'<p><b>D. The key matchup.</b> {f["key_line"]}</p>'
+        f'<p><b>E. Statistical evidence.</b> Projected mean {f["mean"]:.1f} {escape(stat_lower)} '
+        f'(std dev {f["std"]:.1f}), modeled as a {f["dist_name"]} distribution, from '
+        f'{int(r.games_before)} games of this player\'s own saved history. Hit-rate splits '
+        'for this exact side and line:</p>'
+        f'<div class="strip" style="margin:.4rem 0 .8rem;">{f["chips"]}</div>'
+        f'<p><b>F. What needs to happen.</b> {f["needs_html"]}</p>'
         f'<p><b>G. What could cause it to miss.</b> Within one standard deviation, a typical '
-        f'outcome lands between {low:.1f} and {high:.1f} {escape(stat_lower)} - the model and '
-        'the market can both be reasonable about the distribution and still land on opposite '
-        f'sides of the line by chance. {caveats[0]}</p>'
-        f'<p><b>H. Final assessment: {tier}.</b> {r.confidence} confidence, a {r.edge:+.0f} '
-        f'point edge against a real market price - {tier_reason} A probability estimate, not '
-        'a recommendation to bet.</p>'
-        f'{glossary_html(terms)}')
+        f'outcome lands between {f["low"]:.1f} and {f["high"]:.1f} {escape(stat_lower)} - the '
+        'model and the market can both be reasonable about the distribution and still land on '
+        f'opposite sides of the line by chance. {f["caveats"][0]}</p>'
+        f'<p><b>H. Final assessment: {f["tier"]}.</b> {r.confidence} confidence, a '
+        f'{r.edge:+.0f} point edge against a real market price - {f["tier_reason"]} A '
+        'probability estimate, not a recommendation to bet.</p>'
+        f'{glossary_html(f["terms"])}')
 
 
-def game_why_html(r, defense_allowed, team_zones):
-    """The 'Why we like it' panel for a spread/total/moneyline pick: real team-level
-    basketball reasoning from both teams' current ratings, real rebounding/turnover
-    numbers, and real rim-protection/perimeter-defense numbers from NBA.com's own
-    shot-location data. No coaching adjustments or individual defensive assignments -
-    not in this data, so not invented."""
+def player_why_short(r, box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries, n=3):
+    """The compact 'Why the model likes it' / 'What could go wrong' bullet lists the
+    Pick Detail page shows - the top `n` real support/risk factors from
+    player_why_factors()'s shared computation. Not a separate analysis: every bullet
+    here is one of the exact same real, non-fabricated signals the long writeup
+    (player_why_html) is built from, just the shortest cut of it."""
+    f = player_why_factors(r, box_keyed, team_ratings, defense_allowed, player_zones,
+                           team_zones, injuries)
+    likes = f["support"][:n] or ["No standout real factor beyond the model's own statistical projection."]
+    risks = (f["oppose"] + f["caveats"])[:n]
+    return likes, risks
+
+
+def game_why_factors(r, defense_allowed, team_zones):
+    """Every real, non-fabricated signal behind a spread/total/moneyline pick: both
+    teams' current ratings, real rebounding/turnover numbers, and real rim-
+    protection/perimeter-defense numbers from NBA.com's own shot-location data. No
+    coaching adjustments or individual defensive assignments - not in this data, so
+    not invented.
+
+    Computed once, shared by the long writeup (game_why_html) and the compact Pick
+    Detail bullet lists (game_why_short) - see those functions."""
     is_total = r.market == "totals"
     center, unit = (r.total, "total points") if is_total else (
         r.margin, f"margin ({r.home_abbr} minus {r.away_abbr})")
@@ -1796,24 +2094,47 @@ def game_why_html(r, defense_allowed, team_zones):
     terms = ["pace", "offensive rating", "defensive rating", "no-vig probability",
             "turnovers forced", "blowout risk", "shot zone", "rim protection"]
 
+    return {
+        "breakdown": breakdown, "support": support, "oppose": oppose, "caveats": caveats,
+        "support_html": support_html, "oppose_html": oppose_html, "needs_html": needs_html,
+        "low": low, "high": high, "unit": unit, "key_line": key_line, "tier": tier,
+        "tier_reason": tier_reason, "terms": terms,
+    }
+
+
+def game_why_html(r, defense_allowed, team_zones):
+    """The long, section-by-section (A-H) 'Why we like it' writeup for a
+    spread/total/moneyline pick, formatted from game_why_factors()'s shared
+    computation - see that function's docstring for what goes into it."""
+    f = game_why_factors(r, defense_allowed, team_zones)
     return (
-        f'<p><b>A. The basketball breakdown.</b> {" ".join(breakdown)}</p>'
-        f'<p><b>B. What favors the pick.</b></p><ul>{support_html}</ul>'
-        f'<p><b>C. What works against the pick.</b></p><ul>{oppose_html}</ul>'
-        f'<p><b>D. The key matchup.</b> {key_line}</p>'
+        f'<p><b>A. The basketball breakdown.</b> {" ".join(f["breakdown"])}</p>'
+        f'<p><b>B. What favors the pick.</b></p><ul>{f["support_html"]}</ul>'
+        f'<p><b>C. What works against the pick.</b></p><ul>{f["oppose_html"]}</ul>'
+        f'<p><b>D. The key matchup.</b> {f["key_line"]}</p>'
         f'<p><b>E. Statistical evidence.</b> Projected score: {escape(r.home_abbr)} '
         f'{r.home_pts:.1f} - {escape(r.away_abbr)} {r.away_pts:.1f} (margin {r.margin:+.1f}, '
         f'total {r.total:.1f}), from {int(r.games_before)} games of saved history for the '
         'shorter-tracked of the two teams.</p>'
-        f'<p><b>F. What needs to happen.</b> {needs_html}</p>'
+        f'<p><b>F. What needs to happen.</b> {f["needs_html"]}</p>'
         f'<p><b>G. What could cause it to miss.</b> The model\'s own measured error for this '
         f'market has a standard deviation of {r.sigma:.1f} points, so a typical result lands '
-        f'between {low:.1f} and {high:.1f} on the {unit}. {caveats[0]}</p>'
-        f'<p><b>H. Final assessment: {tier}.</b> {r.confidence} confidence (based on '
+        f'between {f["low"]:.1f} and {f["high"]:.1f} on the {f["unit"]}. {f["caveats"][0]}</p>'
+        f'<p><b>H. Final assessment: {f["tier"]}.</b> {r.confidence} confidence (based on '
         f'{int(r.games_before)} games of saved history for both teams), a {r.edge:+.0f} point '
-        f'edge against a real market price - {tier_reason} A probability estimate, not a '
+        f'edge against a real market price - {f["tier_reason"]} A probability estimate, not a '
         'recommendation to bet.</p>'
-        f'{glossary_html(terms)}')
+        f'{glossary_html(f["terms"])}')
+
+
+def game_why_short(r, defense_allowed, team_zones, n=3):
+    """The compact 'Why the model likes it' / 'What could go wrong' bullet lists the
+    Pick Detail page shows for a spread/total/moneyline pick - see player_why_short's
+    docstring, same idea, built from game_why_factors() instead."""
+    f = game_why_factors(r, defense_allowed, team_zones)
+    likes = f["support"][:n] or ["No standout real factor beyond the model's own statistical projection."]
+    risks = (f["oppose"] + f["caveats"])[:n]
+    return likes, risks
 
 
 CONF_CLASS = {"High": "b-done", "Medium": "b-wait", "Low": "b-miss"}
@@ -1831,7 +2152,20 @@ def pick_render_context(box):
     return box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries
 
 
-def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones, team_zones, injuries):
+def open_pick_detail(r, return_to=None):
+    """Stashes one pick row's fields in session_state and switches to the Pick Detail
+    page - the row is a plain dict (not the DataFrame it came from), so the detail
+    page re-derives everything else (box scores, odds, the "why" factors) itself
+    instead of carrying stale computed data across the page switch. return_to is the
+    st.Page the detail page's "Back" link should return to - whichever page actually
+    linked here (Tonight, Players, ...), not always the same one."""
+    st.session_state["pick_detail"] = dict(r._asdict())
+    st.session_state["pick_detail_return_to"] = return_to or tonight_page
+    st.switch_page(pick_detail_page)
+
+
+def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones, team_zones,
+                     injuries, link_to_detail=False, return_to_page=None):
     line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
     # Over/Under have a real green/red convention; a team-name side (spread,
     # moneyline) doesn't, so it just gets the same "picked" green.
@@ -1860,13 +2194,24 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
         f'<p class="hint" style="margin-top:.6rem;">{escape(r.note)} The market\'s no-vig '
         f'price implies {r.market_p:.0f}% on {escape(str(r.side))}; the model estimates '
         f'{r.model_p:.0f}%, a gap of {r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
-        f'</div>', unsafe_allow_html=True)
-    with st.expander("Why we like it"):
-        why_html = (player_why_html(r, box_keyed, team_ratings, defense_allowed,
-                                   player_zones, team_zones, injuries)
-                   if r.kind == "player" else
-                   game_why_html(r, defense_allowed, team_zones))
-        st.markdown(why_html, unsafe_allow_html=True)
+        + (f'<p class="hint" style="margin-top:.3rem;color:#E0A458;">Overconfidence guard: this '
+           f'market hasn\'t yet beaten the no-vig closing line in a real backtest, so the '
+           f'probability saved to the ledger is blended 50/50 with the market ({r.shown_p:.0f}%), '
+           f'not the model\'s own {r.model_p:.0f}% shown above.</p>' if not r.passed_backtest else '')
+        + f'</div>', unsafe_allow_html=True)
+    if link_to_detail:
+        # Matches the canvas design: a Top Pick card links out to its own Pick Detail
+        # page instead of expanding inline - see page_pick_detail().
+        key = f"seewhy_{r.event_id}_{r.Player}_{r.market}_{r.Line}_{r.side}"
+        if st.button("See why →", key=key):
+            open_pick_detail(r, return_to=return_to_page)
+    else:
+        with st.expander("Why we like it"):
+            why_html = (player_why_html(r, box_keyed, team_ratings, defense_allowed,
+                                       player_zones, team_zones, injuries)
+                       if r.kind == "player" else
+                       game_why_html(r, defense_allowed, team_zones))
+            st.markdown(why_html, unsafe_allow_html=True)
 
 
 MODEL_VERSION = "walk-forward-v1"
@@ -1891,6 +2236,7 @@ def log_predictions(savable):
     if not new_rows:
         return 0
 
+    actually_inserted = 0
     with db.connect() as conn:
         for r in new_rows:
             line_for_lookup = None if r.Stat == "Moneyline" else r.Line
@@ -1915,10 +2261,16 @@ def log_predictions(savable):
                 params).fetchone()
             # p_over here means "probability of the recommended side", not literally
             # Over for spread/moneyline picks - true for every kind this page produces.
-            p_val = r.model_p / 100
+            # It's shown_p, not model_p: the overconfidence-guard blend (see
+            # shown_probability()) for a market that hasn't beaten its own closing-line
+            # backtest yet, or the model's own number unchanged once it has. The raw,
+            # never-blended model number is saved alongside it as raw_model_p, so a
+            # future review can always tell the two apart.
+            p_val = r.shown_p / 100
             inputs = json.dumps({
                 "note": r.note, "games_before": int(r.games_before),
                 "confidence": r.confidence, "market_p": round(r.market_p, 2),
+                "raw_model_p": round(r.model_p, 2), "passed_backtest": bool(r.passed_backtest),
                 "edge_threshold": EDGE_THRESHOLD, "kind": r.kind,
                 # Recommended side, explicit - for game-kind rows this duplicates
                 # `player` (team abbr, or Over/Under for totals), but for player-prop
@@ -1926,16 +2278,30 @@ def log_predictions(savable):
                 # early test rows were saved before this was added and can't be graded
                 # for win/loss as a result - see performance.py's grading function.
                 "side": r.side})
-            conn.execute(
+            # ON CONFLICT (event_id, player, market) DO NOTHING - the `have` set above
+            # is a cheap pre-filter, not the real guarantee: two writers running at the
+            # same time (expected during the Mac-to-cloud cutover, and generally once
+            # both the Mac and GitHub Actions can fire this job) could both pass that
+            # check for the same pick before either has inserted. The database's own
+            # unique index on (event_id, player, market) - see db.py's SCHEMA - is what
+            # actually prevents a duplicate row; this just makes the second writer's
+            # attempt a no-op instead of an error. RETURNING id, used to count only
+            # rows that actually landed, not rows merely attempted.
+            cur = conn.execute(
                 "INSERT INTO predictions (created_at, model_version, event_id, player, "
                 "market, line, p_over, p_under, p_push, odds_snapshot_id, "
-                "game_odds_snapshot_id, inputs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                "game_odds_snapshot_id, raw_model_p, inputs_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?) "
+                "ON CONFLICT (event_id, player, market) DO NOTHING RETURNING id",
                 (db.now_utc(), MODEL_VERSION, r.event_id, r.Player, r.market,
                  0.0 if r.Stat == "Moneyline" else r.Line, p_val, 1 - p_val,
                  snap_id[0] if (snap_id and r.kind == "player") else None,
-                 snap_id[0] if (snap_id and r.kind != "player") else None, inputs))
+                 snap_id[0] if (snap_id and r.kind != "player") else None,
+                 r.model_p / 100, inputs))
+            if cur.fetchone() is not None:
+                actually_inserted += 1
     st.cache_data.clear()
-    return len(new_rows)
+    return actually_inserted
 
 
 def qualifying_and_caution(view):
@@ -2703,10 +3069,31 @@ def page_players():
     pos_lookup = (players.set_index("player_id")["position"] if not players.empty
                   else pd.Series(dtype=str))
 
-    c1, c2 = st.columns([3, 2])
-    name = c1.selectbox("Player", sorted(box["player_name"].unique()))
-    stat_label = c2.selectbox("Stat", ALL_STAT_LABELS)
+    all_names = sorted(box["player_name"].unique())
+    st.markdown('<div class="search-box">', unsafe_allow_html=True)
+    name = st.selectbox("Search any player", all_names, key="player_select",
+                        label_visibility="collapsed", placeholder="Search any player...")
+    st.markdown('</div>', unsafe_allow_html=True)
+    stat_label = st.selectbox("Stat", ALL_STAT_LABELS, key="stat_select")
     is_binary = stat_label in MILESTONE_DEFS or stat_label in RACE_STATS
+
+    # "Recently viewed" in the left sidebar, matching the canvas design - a real,
+    # session-local list of players actually opened this session, not a guess at
+    # who's popular. Clicking one sets the search box above via its own session_state
+    # key and reruns, the same pattern Streamlit recommends for externally-driven
+    # widget values.
+    recent = st.session_state.setdefault("recent_players", [])
+    if name in recent:
+        recent.remove(name)
+    recent.insert(0, name)
+    st.session_state["recent_players"] = recent = recent[:5]
+    with st.sidebar:
+        st.markdown('<div class="sidenav-label">Recently viewed</div>', unsafe_allow_html=True)
+        for rn in recent:
+            if st.button(rn, key=f"recent_{rn}", width="stretch",
+                        type="primary" if rn == name else "secondary"):
+                st.session_state["player_select"] = rn
+                st.rerun()
 
     games_all = box[box["player_name"] == name].sort_values("game_date").copy()
     player_id = games_all["player_id"].iloc[-1]
@@ -2725,7 +3112,7 @@ def page_players():
                  f"`python3 box_scores.py {command}`")
 
     # Default the H2H opponent to tonight's game if this player has one tracked.
-    default_opp = None
+    default_opp, tip_today = None, None
     key = box_scores.normalize_name(name)
     mine_ev = odds[odds["player"].map(box_scores.normalize_name) == key]
     if not mine_ev.empty:
@@ -2733,22 +3120,37 @@ def page_players():
         home_abbr = short(latest_ev["home_team"].iloc[0])
         away_abbr = short(latest_ev["away_team"].iloc[0])
         default_opp = away_abbr if player_team == home_abbr else home_abbr
+        tip_today = et(latest_ev["commence_time"].iloc[0])
 
     injuries = load("injury_reports")
     inj = player_injury_status(injuries, name)
     if inj is not None:
-        badge_cls = "b-miss" if inj["status"] == "Out" else "b-wait"
         type_txt = f" ({inj['injury_type']})" if inj.get("injury_type") else ""
-        st.markdown(
-            f'<p><span class="badge {badge_cls}">{escape(str(inj["status"]))}{escape(type_txt)}</span> '
-            f'{escape(str(inj["comment"] or ""))}</p>', unsafe_allow_html=True)
-        hint(f"From ESPN's injury feed (not an official NBA source), last checked "
-             f"{ago(inj['pulled_at'])} - not continuously monitored, and not reflected "
-             "in the model probabilities below yet.")
+        status_txt = f"{inj['status']}{type_txt}"
     elif not injuries.empty:
-        hint(f"No injury reported for {name} as of the last check "
-             f"({ago(injuries['pulled_at'].max())}) - that means nothing is on record, "
-             "not that he's confirmed available.")
+        status_txt = "Available, not on injury report"
+    else:
+        status_txt = None
+
+    team_full = TEAM_FULL.get(player_team, player_team)
+    subtitle = f"{escape(team_full)}" + (f" &middot; {escape(player_pos)}" if player_pos else "")
+    tonight_line = (f"Tonight: at {escape(default_opp)}, {tip_today:%-I:%M %p} ET"
+                    if tip_today is not None else "Not on tonight's board")
+    if status_txt:
+        tonight_line += f" &middot; {escape(status_txt)}"
+    st.markdown(
+        f'<p class="hint" style="margin:0 0 .1rem 0;">{subtitle}</p>'
+        f'<h1 style="margin:0;padding:0;font-size:2rem;">{escape(name)}</h1>'
+        f'<p style="margin:.15rem 0 .8rem 0;color:{TEXT};">{tonight_line}</p>',
+        unsafe_allow_html=True)
+    if inj is not None:
+        inj_comment = f" ESPN: \"{escape(str(inj['comment']))}\"" if inj.get("comment") else ""
+        hint(f"From ESPN's injury feed (not an official NBA source), last checked "
+             f"{ago(inj['pulled_at'])}.{inj_comment} Not continuously monitored, and not "
+             "reflected in the model probabilities below yet.")
+    elif not injuries.empty:
+        hint(f"As of the last check ({ago(injuries['pulled_at'].max())}) - that means nothing "
+             "is on record, not that he's confirmed available.")
 
     section(f"Tonight's props for {name}")
     if mine_ev.empty:
@@ -2768,7 +3170,8 @@ def page_players():
             shown = shown.reindex(shown["ev"].sort_values(ascending=False).index)
             context = pick_render_context(box)
             for rank, r in enumerate(shown.itertuples(), 1):
-                render_pick_card(r, f"#{rank}", *context)
+                render_pick_card(r, f"#{rank}", *context, link_to_detail=True,
+                                 return_to_page=players_page)
             if not flagged.empty:
                 with st.expander(f"{len(flagged)} more market(s) excluded - edge too large to be plausible"):
                     hint(f"An edge over {MAX_PLAUSIBLE_EDGE} points against a real, liquid market "
@@ -2907,6 +3310,42 @@ def page_players():
                      f"{'The box starts at the real sportsbook line' if line_is_market else 'No sportsbook line for this stat yet, so the box starts at his own average'}"
                      ", not a LOCK IT prediction - change the number above to test any line. Small "
                      "samples (H2H, last season) can be noisy.")
+
+                def fade_if_thin(chip_html, n):
+                    return chip_html if n >= 5 else chip_html.replace(
+                        'class="split"', 'class="split" style="opacity:.45;"')
+
+                tiles_main, tiles_side = st.columns([2.1, 1], gap="large")
+                with tiles_main:
+                    section(f"How often over {line:g}")
+                    tile_groups = [
+                        ("Last 10", games_all.tail(10)), ("Last 20", games_all.tail(20)),
+                        (f"vs {opponent}", games_all[games_all["opponent"] == opponent]),
+                        ("This season", games_all[games_all["season"] == games_all["season"].max()]),
+                    ]
+                    chips = "".join(fade_if_thin(split_chip(lbl, pct, n), n)
+                                    for lbl, g in tile_groups
+                                    for pct, n in [hit_rate(g, "value", line, "Over")])
+                    st.markdown(f'<div class="splits">{chips}</div>', unsafe_allow_html=True)
+                    hint("Faded tiles have fewer than 5 games - shown as a real result, not hidden, "
+                         "but not a number to lean on yet.")
+                with tiles_side:
+                    recent_min = games_all.tail(5)["minutes"].mean() if len(games_all) else None
+                    season_min = (games_all[games_all["season"] == games_all["season"].max()]["minutes"].mean()
+                                 if len(games_all) else None)
+                    if recent_min is not None and season_min is not None:
+                        trend = ("Steady" if abs(recent_min - season_min) < 3 else
+                                ("Trending up" if recent_min > season_min else "Trending down"))
+                        st.markdown(
+                            '<div class="panel"><div class="panel-title">Minutes and role</div>'
+                            f'<div class="row"><div class="who">Last 5 games</div>'
+                            f'<div class="val">{recent_min:.1f}</div></div>'
+                            f'<div class="row"><div class="who">Season average</div>'
+                            f'<div class="val">{season_min:.1f}</div></div>'
+                            f'<div class="row"><div class="who">Recent trend</div>'
+                            f'<div class="val">{trend}</div></div></div>', unsafe_allow_html=True)
+                        hint("A real comparison of recent minutes to his season average - not a "
+                             "model projection. This app's model doesn't project minutes.")
 
                 alt_market = ALT_MARKET_FOR_STAT.get(stat_label)
                 if alt_market:
@@ -4010,26 +4449,42 @@ def page_ai_analyst():
         "and never promises a result.")
 
 
+# Named individually (instead of built inline in the st.navigation() dict below) so
+# sidebar_nav() can st.page_link() the same five the canvas design calls out by name,
+# with everything else tucked under its "More pages" expander.
+tonight_page = st.Page(page_tonight, title="Tonight", icon=":material/sports_basketball:",
+                       url_path="tonight", default=True)
+top_picks_page = st.Page(page_top_picks, title="Top Picks", icon=":material/stars:", url_path="picks")
+game_lines_page = st.Page(page_game_lines, title="Game Lines", icon=":material/scoreboard:",
+                          url_path="game-lines")
+parlay_page = st.Page(page_parlay, title="Parlay", icon=":material/calculate:", url_path="parlay")
+trends_page = st.Page(page_trends, title="Trends", icon=":material/trending_up:", url_path="trends")
+lines_page = st.Page(page_lines, title="Lines", icon=":material/table_rows:", url_path="lines")
+players_page = st.Page(page_players, title="Players", icon=":material/person:", url_path="players")
+ai_analyst_page = st.Page(page_ai_analyst, title="AI Analyst", icon=":material/forum:", url_path="ai-analyst")
+learn_page = st.Page(page_learn, title="Key / Learn", icon=":material/menu_book:", url_path="learn")
+bets_page = st.Page(page_bets, title="My bets", icon=":material/receipt_long:", url_path="bets")
+results_page = st.Page(page_results, title="Results", icon=":material/fact_check:", url_path="results")
+model_perf_page = st.Page(page_model_performance, title="Model Performance",
+                          icon=":material/monitoring:", url_path="model-performance")
+system_page = st.Page(page_system, title="System", icon=":material/settings:", url_path="system")
+# Not in sidebar_nav()'s lists below - reached only by clicking "See why" on a Top
+# Pick card (open_pick_detail()), matching the canvas design's drill-through flow.
+pick_detail_page = st.Page(page_pick_detail, title="Pick Detail", icon=":material/insights:",
+                           url_path="pick")
+
 nav = st.navigation({
-    "Research": [
-        st.Page(page_tonight, title="Tonight", icon=":material/sports_basketball:",
-                url_path="tonight", default=True),
-        st.Page(page_top_picks, title="Top Picks", icon=":material/stars:", url_path="picks"),
-        st.Page(page_game_lines, title="Game Lines", icon=":material/scoreboard:", url_path="game-lines"),
-        st.Page(page_parlay, title="Parlay", icon=":material/calculate:", url_path="parlay"),
-        st.Page(page_trends, title="Trends", icon=":material/trending_up:", url_path="trends"),
-        st.Page(page_lines, title="Lines", icon=":material/table_rows:", url_path="lines"),
-        st.Page(page_players, title="Players", icon=":material/person:", url_path="players"),
-        st.Page(page_ai_analyst, title="AI Analyst", icon=":material/forum:", url_path="ai-analyst"),
-        st.Page(page_learn, title="Key / Learn", icon=":material/menu_book:", url_path="learn"),
-    ],
-    "Track": [
-        st.Page(page_bets, title="My bets", icon=":material/receipt_long:", url_path="bets"),
-        st.Page(page_results, title="Results", icon=":material/fact_check:", url_path="results"),
-        st.Page(page_model_performance, title="Model Performance", icon=":material/monitoring:",
-                url_path="model-performance"),
-        st.Page(page_system, title="System", icon=":material/settings:", url_path="system"),
-    ],
-})
-render_slip()
+    "Research": [tonight_page, top_picks_page, game_lines_page, parlay_page, trends_page,
+                 lines_page, players_page, ai_analyst_page, learn_page, pick_detail_page],
+    "Track": [bets_page, results_page, model_perf_page, system_page],
+}, position="hidden")  # replaced by sidebar_nav()'s custom, canvas-matched list below
+
+sidebar_nav(primary_pages=[tonight_page, lines_page, trends_page, players_page, bets_page],
+           more_research=[top_picks_page, game_lines_page, parlay_page, ai_analyst_page, learn_page],
+           more_track=[results_page, model_perf_page, system_page])
+st.session_state["_slip_rendered_inline"] = False
 nav.run()
+# page_tonight() renders the slip inline in its own right column and sets the flag
+# above to True; every other page still gets it in the left sidebar, unchanged.
+if not st.session_state.get("_slip_rendered_inline"):
+    render_slip()

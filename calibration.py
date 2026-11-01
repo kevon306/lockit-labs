@@ -102,9 +102,16 @@ def current_calibration():
     leave too little of either to mean anything. That makes calibrated_brier an
     optimistic, in-sample number, not proof the correction generalizes - shown for
     transparency (so a human can see the fit isn't doing anything bizarre), not as
-    evidence it's actually improving future predictions."""
+    evidence it's actually improving future predictions.
+
+    Fits against raw_model_p, not p_over - p_over can now be blended with the market
+    for a market that hasn't beaten its own closing-line backtest yet (see
+    lockit_app.py's shown_probability()), and fitting a correction against a
+    market-blended number would be learning to correct the market, not the model.
+    COALESCE falls back to p_over for rows logged before raw_model_p existed - back
+    then p_over always was the raw model value, so the fallback is exact, not a guess."""
     with db.connect() as conn:
-        preds = pd.read_sql("SELECT id, p_over FROM predictions", conn)
+        preds = pd.read_sql("SELECT id, COALESCE(raw_model_p, p_over) AS raw_model_p FROM predictions", conn)
         results = pd.read_sql("SELECT prediction_id, result FROM prediction_results", conn)
     merged = preds.merge(results, left_on="id", right_on="prediction_id")
     decided = merged[merged["result"].isin(["WON", "LOST"])]
@@ -113,7 +120,7 @@ def current_calibration():
         return {"params": None, "n": 0, "raw_brier": None, "calibrated_brier": None}
 
     outcomes = (decided["result"] == "WON").to_numpy(dtype=float)
-    p_pct = (decided["p_over"] * 100).to_numpy()
+    p_pct = (decided["raw_model_p"] * 100).to_numpy()
     params = fit(p_pct, outcomes)
     raw_brier = float(np.mean((p_pct / 100 - outcomes) ** 2))
     calibrated_brier = None

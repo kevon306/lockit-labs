@@ -2,7 +2,12 @@
 db.py  -  the LOCK IT Labs database (hosted Postgres, via Supabase)
 
 Commands:
-  python3 db.py setup        create the database and tables (safe to run again)
+  python3 db.py setup        create/migrate the database and tables (safe to run again) -
+                              run this once after a fresh deploy or whenever SCHEMA below
+                              changes. connect() deliberately does NOT do this on its own
+                              any more (see its own docstring - it used to, and that was
+                              the real cause of "tuple concurrently updated" errors under
+                              concurrent writers).
   python3 db.py import-csv   load every CSV in data/props into the database
   python3 db.py summary      show what's in the database
 
@@ -263,6 +268,9 @@ CREATE TABLE IF NOT EXISTS predictions (
     p_over           DOUBLE PRECISION NOT NULL,   -- really "probability of the recommended side" -
                                       -- see page_top_picks' save-to-ledger comment. Not
                                       -- literally P(Over) for game-market rows (side is a team).
+                                      -- Can be blended 50/50 with the market's own no-vig
+                                      -- price instead of the model's raw number - see
+                                      -- raw_model_p below for the unblended figure.
     p_under          DOUBLE PRECISION NOT NULL,
     p_push           DOUBLE PRECISION NOT NULL DEFAULT 0,
     odds_snapshot_id INTEGER REFERENCES odds_snapshots(id),  -- player-prop rows only (see
@@ -270,8 +278,20 @@ CREATE TABLE IF NOT EXISTS predictions (
                       -- early bug where this column held a game_odds_snapshots id that
                       -- happened not to violate the FK only by coincidental id overlap)
     game_odds_snapshot_id INTEGER REFERENCES game_odds_snapshots(id),
+    raw_model_p      DOUBLE PRECISION,  -- the model's own probability, never blended with
+                      -- the market - NULL on rows logged before this column existed, back
+                      -- when p_over always was this value (see NEW_PREDICTIONS_COLUMNS)
     inputs_json      TEXT            -- what the model knew at the time
 );
+
+-- One prediction per (event, player/team, market), enforced by Postgres itself, not
+-- just the Python-side dedupe check in log_predictions(). The Python check reads
+-- "has this already been logged?" and inserts if not - correct for one writer, but
+-- a real race under concurrent writers (two automation paths running at once, which
+-- is exactly what happens during the Mac-to-cloud cutover): both can pass the check
+-- before either has inserted. ON CONFLICT (see log_predictions()) makes the second
+-- writer's insert a no-op instead of a duplicate row, regardless of timing.
+CREATE UNIQUE INDEX IF NOT EXISTS predictions_pick_uniq ON predictions (event_id, player, market);
 
 -- Predictions are permanent. This function + the two triggers below block any edit
 -- or delete - Postgres has no CREATE TRIGGER IF NOT EXISTS, so each is dropped and
@@ -427,7 +447,18 @@ NEW_BOX_SCORE_COLUMNS = {"fgm": "INTEGER", "fga": "INTEGER", "fg3a": "INTEGER",
 NEW_PERIOD_BOX_SCORE_COLUMNS = {"q1_steals": "INTEGER", "q1_blocks": "INTEGER",
                                 "q1_turnovers": "INTEGER", "h1_steals": "INTEGER",
                                 "h1_blocks": "INTEGER", "h1_turnovers": "INTEGER"}
-NEW_PREDICTIONS_COLUMNS = {"game_odds_snapshot_id": "INTEGER"}
+NEW_PREDICTIONS_COLUMNS = {
+    "game_odds_snapshot_id": "INTEGER",
+    # The model's own probability of the recommended side, before any overconfidence-
+    # guard blending with the market (see lockit_app.py's shown_probability()). p_over
+    # itself can now be a 50/50 blend with the market for a market that hasn't yet
+    # beaten its own closing-line backtest - this column is what review.py and
+    # calibration.py need to judge the model on its own, never touched by the blend.
+    # NULL on rows logged before this column existed - their p_over already was the
+    # raw model value (blending didn't exist yet), so callers should read
+    # COALESCE(raw_model_p, p_over), not this column alone.
+    "raw_model_p": "DOUBLE PRECISION",
+}
 
 
 def migrate(conn):
@@ -493,7 +524,28 @@ class _Connection:
 
     def __init__(self):
         self._pool = _pool()
-        self._conn = self._pool.getconn()
+        self._conn = self._checked_out_connection()
+
+    def _checked_out_connection(self):
+        """Gets a connection from the pool and makes sure it's actually alive before
+        handing it back. A connection can go stale while just sitting in the pool -
+        confirmed as the real cause of a live 'connection already closed' failure
+        after an ~11-hour gap in activity (Supabase, like most hosted Postgres, closes
+        idle connections server-side; the pool doesn't know until something tries to
+        use it). One retry with a fresh connection, not a loop - if the pool itself
+        can't produce a single live connection, that's a real outage to surface, not
+        something to keep retrying silently."""
+        conn = self._pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return conn
+        except psycopg2.Error:
+            self._pool.putconn(conn, close=True)  # discard the dead one, don't return it to the pool
+            conn = self._pool.getconn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")  # let this raise if the replacement is also bad
+            return conn
 
     def cursor(self):
         return _Cursor(self._conn.cursor())
@@ -537,11 +589,26 @@ class _Connection:
 
 
 def connect():
+    """A plain pooled connection - no schema DDL here. It used to re-run the entire
+    SCHEMA script (including DROP TRIGGER/CREATE TRIGGER and CREATE OR REPLACE
+    FUNCTION) on every single call, from every process: every Streamlit session,
+    every auto.py run, every GitHub Actions run. Those are catalog-level operations,
+    and two of them landing at the same instant is exactly what Postgres's "tuple
+    concurrently updated" error means - confirmed as the real cause of that error
+    recurring in production, not a one-off fluke. Schema setup is now a deliberate,
+    explicit, rarely-run step - see ensure_schema() / `python3 db.py setup` - run
+    once after a schema change or a fresh deploy, never implicitly per-connection."""
+    return _Connection()
+
+
+def ensure_schema():
+    """Creates anything missing and migrates existing tables - safe to run again,
+    but meant to be run deliberately (once per schema change or fresh deploy), not
+    on every connect(). See connect()'s docstring for why this split exists."""
     conn = _Connection()
-    conn.executescript(SCHEMA)  # creates anything missing; leaves existing data alone
+    conn.executescript(SCHEMA)
     migrate(conn)
-    conn.commit()  # setup runs outside any caller's own transaction/context
-    return conn
+    conn.commit()
 
 
 def upsert(table, cols, pk_cols, rows):
@@ -820,7 +887,7 @@ def correct_entry(entry_id, changes, reason):
 # ---------- commands ----------
 
 def cmd_setup():
-    connect()
+    ensure_schema()
     print("Database ready (Supabase/Postgres).")
 
 

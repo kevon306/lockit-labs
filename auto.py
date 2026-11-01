@@ -53,6 +53,7 @@ the git-sync approach had to go: it had already pushed the committed .db file pa
 
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -105,9 +106,10 @@ def morning():
         log(f"Graded predictions: {summary}")
     except Exception as e:  # never take the morning job down over a grading bug
         log(f"Prediction grading failed (non-fatal): {e}")
-    log_todays_picks()  # also runs after every snapshots() pull - here too as a
-                        # same-day safety net, since log_predictions() dedupes
+    ok = log_todays_picks()  # also runs after every snapshots() pull - here too as a
+                             # same-day safety net, since log_predictions() dedupes
     log("Morning job done")
+    return ok
 
 
 def snapshots():
@@ -146,13 +148,13 @@ def snapshots():
         clock_windows.append(("afternoon", 13, 15))
 
     if not tip_windows and not clock_windows:
-        return
+        return True
 
     try:
         events = pp.call_api(f"/sports/{pp.SPORT}/events", {})  # free
     except SystemExit as e:
         log(f"Couldn't list games: {e}")
-        return
+        return True
 
     state = load_state()
     now = datetime.now(timezone.utc)
@@ -182,7 +184,7 @@ def snapshots():
         for label, key, markets in todo:
             if pp.LAST_REMAINING is not None and pp.LAST_REMAINING < MIN_CREDITS:
                 log(f"Skipping {label} snapshot: only {pp.LAST_REMAINING} credits left")
-                return
+                return True
             game = f"{event['away_team']} at {event['home_team']}"
             log(f"{label} snapshot: {game} ({minutes_to_tip:.0f} min to tip)")
             try:
@@ -201,7 +203,7 @@ def snapshots():
                 state[key] = pp.iso(now)
                 save_state(state)
 
-    log_todays_picks()
+    return log_todays_picks()
 
 
 def log_todays_picks():
@@ -215,18 +217,42 @@ def log_todays_picks():
     is written to run as a Streamlit script (st.set_page_config, nav.run() at module
     level), and ai_tools.py already established the pattern of importing it purely
     for its compute functions; done here the same way, isolated so a problem with it
-    can never take down the rest of the snapshot job (odds capture)."""
-    try:
-        import lockit_app
-        new_count = lockit_app.log_todays_qualifying_picks()
-        if new_count:
-            log(f"Logged {new_count} new prediction(s) to the ledger")
-    except Exception as e:
-        log(f"Prediction logging failed (non-fatal): {e}")
+    can never take down the rest of the snapshot job (odds capture).
+
+    One retry on failure, since the two real failures seen in production so far
+    (concurrent schema DDL contention, a stale pooled connection) are both transient -
+    see db.py's connect()/ensure_schema() split and _Connection's health check, which
+    fix the underlying causes but don't guarantee every single call lands first try.
+    Returns True if logging ultimately succeeded (or there was nothing to log), False
+    if it failed twice - the caller uses that to decide the process's exit code, since
+    a failure here should be visible (a failed GitHub Actions run emails the repo
+    owner) rather than just sitting in a log line nobody reads."""
+    import lockit_app
+    for attempt in (1, 2):
+        try:
+            new_count = lockit_app.log_todays_qualifying_picks()
+            if new_count:
+                log(f"Logged {new_count} new prediction(s) to the ledger")
+            return True
+        except Exception as e:
+            if attempt == 1:
+                log(f"Prediction logging failed, retrying once: {e}")
+                time.sleep(3)
+            else:
+                log(f"Prediction logging failed twice - not recovering this run: {e}")
+                return False
 
 
 if __name__ == "__main__":
     jobs = {"morning": morning, "snapshots": snapshots}
     if len(sys.argv) != 2 or sys.argv[1] not in jobs:
         sys.exit("Use: python3 auto.py morning | snapshots")
-    jobs[sys.argv[1]]()
+    # A non-zero exit here is the alert: box scores, grading, and odds capture (the
+    # jobs' own real priorities) already ran and are never blocked on this - only
+    # prediction logging failing twice in a row makes the process exit non-zero, which
+    # GitHub Actions surfaces as a failed run (red X, email to the repo owner) with no
+    # new infrastructure needed. The Mac's own launchd job doesn't notify on a non-zero
+    # exit by itself; this matters once GitHub Actions is the primary runner.
+    ok = jobs[sys.argv[1]]()
+    if ok is False:
+        sys.exit(1)
