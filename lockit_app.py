@@ -1191,10 +1191,11 @@ def build_roster(box, odds):
     names["away_abbr"] = names["away_team"].map(TEAM_SHORT)
     names["opponent"] = names.apply(
         lambda r: r.away_abbr if r.team == r.home_abbr else r.home_abbr, axis=1)
+    names["is_home"] = (names["team"] == names["home_abbr"]).astype(int)
     names["player_id"] = names["key"].map(last_id)
     names["player_name"] = names["player"]
     roster = names.dropna(subset=["player_id", "team", "opponent"])
-    return roster[["key", "player_id", "player_name", "team", "opponent"]], slate, slate_odds
+    return roster[["key", "player_id", "player_name", "team", "opponent", "is_home"]], slate, slate_odds
 
 
 def resolve_game_odds_teams(game_odds):
@@ -1474,7 +1475,7 @@ def compute_picks(box, odds, player_bt=None):
     if roster.empty or slate.empty:
         return pd.DataFrame(), None
 
-    proj = model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent"]])
+    proj = model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent", "is_home"]])
 
     boards = []
     for r in slate.itertuples():
@@ -2212,6 +2213,70 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
                        if r.kind == "player" else
                        game_why_html(r, defense_allowed, team_zones))
             st.markdown(why_html, unsafe_allow_html=True)
+        if r.kind == "player":
+            line_adjuster(r)
+
+
+def line_adjuster(r):
+    """A 'what if the line were different' control under a player-prop pick card: pick
+    a number, see the model's probability at that number instead of the real posted
+    line, and whether the edge against today's real market price would still clear
+    EDGE_THRESHOLD.
+
+    Only the MODEL side is recomputed - the market percentage shown stays fixed at the
+    real posted line's actual no-vig price, clearly labeled as such. There's no way to
+    know what a book would actually price a hypothetical line at without real alt-line
+    odds for it, so this doesn't pretend to simulate one; it answers "how far would the
+    model have to be wrong, or the book's number move, before this stops qualifying."
+    """
+    mean_hat = getattr(r, f"{r.stat}_mean_hat", None)
+    var_hat = getattr(r, f"{r.stat}_var_hat", None)
+    if mean_hat is None or pd.isna(mean_hat):
+        return
+    with st.expander("Try a different line"):
+        key = f"altline_{r.event_id}_{r.Player}_{r.market}_{r.side}"
+        new_line = st.number_input(
+            f"{r.Stat} line", min_value=0.0, value=round(float(r.Line) * 2) / 2, step=0.5,
+            key=key,
+            help="See how the model's own probability - and whether this would still "
+                 "qualify as a pick - changes at a different number than the real "
+                 "posted line. The market percentage below stays at the real line's "
+                 "actual price; it isn't simulated to move with your number.")
+        over_p = player_model_prob_at(mean_hat, var_hat, new_line)
+        if over_p is None:
+            st.caption("Not enough history for a projection at this number.")
+            return
+        hyp_model_p = over_p * 100 if r.side == "Over" else 100 - over_p * 100
+        hyp_model_p = float(calibration.apply(pd.Series([hyp_model_p]), cached_calibration()["params"]).iloc[0])
+        # Signed, not abs(): at the real line, model_p > market_p for r.side by
+        # construction (compute_picks only ever picks the side that's ahead) - but at a
+        # hypothetical line that's no longer guaranteed. A negative edge here is a real,
+        # different answer ("the model now favors the other side"), not a smaller
+        # version of the same pick - recommendation_tier() assumes the positive case
+        # (it only ever sees edges compute_picks already picked a winning side for), so
+        # it isn't reused here; this spells out both cases explicitly instead.
+        hyp_edge = hyp_model_p - r.market_p
+        opposite = "Under" if r.side == "Over" else "Over"
+        if hyp_edge < 0:
+            tier, tier_color = f"MODEL NOW FAVORS {opposite.upper()}", RED
+        elif hyp_edge < EDGE_THRESHOLD:
+            tier, tier_color = "NO CLEAR EDGE", "#8A96B0"
+        else:
+            strong_bar = (EDGE_THRESHOLD + MAX_PLAUSIBLE_EDGE) / 2
+            tier = f"{'STRONG LEAN' if hyp_edge >= strong_bar else 'LEAN'} {r.side.upper()}"
+            tier_color = AMBER if hyp_edge >= strong_bar else BLUE
+        st.markdown(
+            f'<div class="strip" style="margin-top:.2rem;">'
+            f'<div><b>{hyp_model_p:.0f}%</b><span>model: {escape(str(r.side))} {new_line:g}</span></div>'
+            f'<div><b>{r.market_p:.0f}%</b><span>market: {escape(str(r.side))} at real line ({r.Line:g})</span></div>'
+            f'<div><b>{hyp_edge:+.0f} pts</b><span>edge at {new_line:g}</span></div>'
+            f'<div><span class="badge" style="background:{tier_color}26;color:{tier_color};">'
+            f'{escape(tier)}</span></div></div>', unsafe_allow_html=True)
+        if hyp_edge >= EDGE_THRESHOLD and hyp_edge > MAX_PLAUSIBLE_EDGE:
+            st.caption(f"A gap this big (over {MAX_PLAUSIBLE_EDGE} points) is past what this app "
+                       "treats as a real edge even on the real line - see MAX_PLAUSIBLE_EDGE's "
+                       "own note on why that's usually the model missing real-world context, "
+                       "not a true mispriced line.")
 
 
 MODEL_VERSION = "walk-forward-v1"
