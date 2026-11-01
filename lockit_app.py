@@ -2214,10 +2214,10 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
                        game_why_html(r, defense_allowed, team_zones))
             st.markdown(why_html, unsafe_allow_html=True)
         if r.kind == "player":
-            line_adjuster(r)
+            line_adjuster(r, label)
 
 
-def line_adjuster(r):
+def line_adjuster(r, label):
     """A 'what if the line were different' control under a player-prop pick card: pick
     a number, see the model's probability at that number instead of the real posted
     line, and whether the edge against today's real market price would still clear
@@ -2234,7 +2234,13 @@ def line_adjuster(r):
     if mean_hat is None or pd.isna(mean_hat):
         return
     with st.expander("Try a different line"):
-        key = f"altline_{r.event_id}_{r.Player}_{r.market}_{r.side}"
+        # label (e.g. "#1", "Pick:") disambiguates the same underlying pick showing up
+        # in more than one section on this page (e.g. a Top Pick that also clears the
+        # stricter "every team" board bar below) - without it, two render_pick_card
+        # calls for the identical (event_id, Player, market, side) row collide on this
+        # widget's key and crash the whole page (StreamlitDuplicateElementKey, hit on
+        # Streamlit Cloud 2026-11-01).
+        key = f"altline_{r.event_id}_{r.Player}_{r.market}_{r.Line}_{r.side}_{label}"
         new_line = st.number_input(
             f"{r.Stat} line", min_value=0.0, value=round(float(r.Line) * 2) / 2, step=0.5,
             key=key,
