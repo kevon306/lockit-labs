@@ -13,20 +13,27 @@ Commands:
   python3 box_scores.py pull-props --limit 50      just the next 50 games (good for testing)
   python3 box_scores.py pull-shot-zones            real shot-location data (team defense + player profiles)
   python3 box_scores.py pull-shot-zones --limit 50 just the next 50 players (good for testing)
+  python3 box_scores.py pull-highlightly-fallback  manually backfill from Highlightly (needs HIGHLIGHTLY_API_KEY)
 
-Must run from your own computer: NBA.com blocks requests from cloud servers.
+Must run from your own computer for the `pull` command's primary path: NBA.com
+blocks requests from cloud servers. Running from the cloud (see auto.py's morning
+job) automatically falls back to Highlightly if HIGHLIGHTLY_API_KEY is set in the
+environment, then to ESPN either way - see the "cloud fallbacks" section below for
+why there are two.
 """
 
 import argparse
+import os
 import re
 import sys
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 
 import db
 
@@ -34,6 +41,7 @@ ET = ZoneInfo("America/New_York")
 ESPN_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
+HIGHLIGHTLY_BASE = "https://nba.highlightly.net"
 MARKET_TO_STAT = {"player_points": "points",
                   "player_rebounds": "rebounds",
                   "player_assists": "assists",
@@ -131,6 +139,166 @@ def fetch_game_log(season, season_type):
                 raise NBAComUnavailable(str(e)) from e
             print(f"NBA.com was slow, retrying in 5 seconds... ({attempt + 1}/3)")
             time.sleep(5)
+
+
+# ---------- Highlightly fallback (cloud) ----------
+#
+# nba_api/stats.nba.com is blocked outright from cloud IPs (see this file's own
+# docstring). Highlightly (nba.highlightly.net) is a documented, paid-or-free API
+# confirmed reachable from a GitHub Actions runner and confirmed accurate against
+# this app's own saved data (Scottie Barnes, 2026-10-30: 41 pts/5 reb/5 ast, an exact
+# match) - see the cloud-migration research that chose it over BALLDONTLIE (whose
+# free tier doesn't include per-player stats at all). Only engages when
+# HIGHLIGHTLY_API_KEY is set - on the Mac, where nba_api already works, it's simply
+# never configured, so this whole path is dormant there. ESPN (below) stays as the
+# final fallback either way - a free, undocumented endpoint getting pulled out from
+# under this app with no warning is exactly the kind of failure a second fallback
+# protects against, not something to bet the whole cloud pipeline on.
+#
+# Player/team identity: same reasoning as the ESPN section below - Highlightly's own
+# player ids are a different numbering scheme from nba_api's, so every row is matched
+# back to an existing player_id by normalized name; only a genuinely new player gets
+# a 'highlightly:<id>' id. Team abbreviations come straight from Highlightly's own
+# response ("TOR", "ORL", ...), which already matches nba_api's convention - confirmed
+# by hand before relying on it, not assumed.
+
+HIGHLIGHTLY_STAT_MAP = {
+    "Total Points Scored": "points", "Total Rebounds": "rebounds",
+    "Total Assists": "assists", "Successful 3PT Field Goals": "fg3m",
+    "Successful Field Goals": "fgm", "Total Field Goals": "fga",
+    "Total 3PT Field Goals": "fg3a", "Successful Free Throws": "ftm",
+    "Total Free Throws": "fta", "Total Steals": "steals", "Total Blocks": "blocks",
+    "Total Turnovers": "turnovers", "Total Fouls": "fouls",
+    "Total Offensive Rebounds": "oreb", "Total Defensive Rebounds": "dreb",
+    "Total Minutes Played": "minutes",
+}
+
+
+def get_highlightly_key():
+    """None (not an exit) if not configured - unlike pull_props.get_api_key(), this
+    source is optional: ESPN still covers the cloud case if this isn't set up."""
+    load_dotenv(override=True)
+    key = os.getenv("HIGHLIGHTLY_API_KEY")
+    return key if key and key != "paste_your_key_here" else None
+
+
+def _highlightly_matches_for_et_date(date_str, key):
+    """Every FINISHED match whose tip-off, converted to ET, falls on date_str.
+    Queries date_str and the next UTC day and filters by the real ET date afterward,
+    rather than trusting the API's own 'date' filter to mean the same thing as ET -
+    a West Coast tip after ~8pm ET lands on the next UTC calendar day, and this app
+    was burned by exactly that kind of silent UTC/ET mismatch once already (see the
+    ESPN section's own game_date comment)."""
+    headers = {"x-rapidapi-key": key}
+    matches = []
+    for q_date in (date_str, (pd.Timestamp(date_str) + timedelta(days=1)).strftime("%Y-%m-%d")):
+        r = requests.get(f"{HIGHLIGHTLY_BASE}/matches", params={"date": q_date},
+                         headers=headers, timeout=15)
+        r.raise_for_status()
+        matches.extend(r.json().get("data", []))
+    out = []
+    for m in matches:
+        if m.get("state", {}).get("description") != "Finished":
+            continue
+        et_date = pd.to_datetime(m["date"], utc=True).tz_convert(ET).strftime("%Y-%m-%d")
+        if et_date == date_str:
+            m["_et_date"] = et_date
+            out.append(m)
+    return out
+
+
+def _highlightly_box_score(match, existing_ids, abbrs, key):
+    """One finished match's player box score, in clean_game_log()'s exact column
+    shape. existing_ids: {normalized_name: player_id} from this app's own box_scores
+    table, same purpose as the ESPN section's own copy. abbrs: team_abbreviations()'s
+    full-name -> abbreviation map - Highlightly's own abbreviation field isn't always
+    nba_api's own convention (confirmed: Highlightly says 'WSH' for the Washington
+    Wizards, this app's existing data says 'WAS' - the exact mismatch the ESPN
+    section below already had to guard against), so it's resolved the same way."""
+    headers = {"x-rapidapi-key": key}
+    r = requests.get(f"{HIGHLIGHTLY_BASE}/box-score/{match['id']}", headers=headers, timeout=20)
+    r.raise_for_status()
+    teams = r.json()
+    if len(teams) != 2:
+        return []
+
+    home_abbr = abbrs.get(match["homeTeam"]["displayName"], match["homeTeam"]["abbreviation"])
+    away_abbr = abbrs.get(match["awayTeam"]["displayName"], match["awayTeam"]["abbreviation"])
+    rows = []
+    for side in teams:
+        is_home_side = side["team"]["id"] == match["homeTeam"]["id"]
+        team_abbr = home_abbr if is_home_side else away_abbr
+        opp_abbr = away_abbr if is_home_side else home_abbr
+        is_home = int(team_abbr == home_abbr)
+        for p in side.get("boxScores", []):
+            stats = {}
+            for s in p["statistics"]:
+                col = HIGHLIGHTLY_STAT_MAP.get(s["name"])
+                if col:
+                    stats[col] = s["value"]
+            minutes = stats.pop("minutes", None)
+            if not minutes:
+                continue  # didn't play
+            name = p["player"]["name"]
+            pid = existing_ids.get(normalize_name(name), f"highlightly:{p['player']['id']}")
+            row = {"game_id": f"highlightly:{match['id']}", "game_date": match["_et_date"],
+                  "player_id": pid, "player_name": name, "team": team_abbr,
+                  "opponent": opp_abbr, "is_home": is_home, "minutes": minutes}
+            for col in ("points", "rebounds", "assists", "fg3m", "fgm", "fga", "fg3a",
+                       "ftm", "fta", "steals", "blocks", "turnovers", "fouls", "oreb", "dreb"):
+                row[col] = stats.get(col, 0)
+            rows.append(row)
+    return rows
+
+
+def fetch_highlightly_game_log(start_date, end_date, key):
+    """Fallback box-score source for [start_date, end_date] inclusive - day by day,
+    same structure as fetch_espn_game_log (no bulk range endpoint here either)."""
+    with db.connect() as conn:
+        existing = pd.read_sql("SELECT DISTINCT player_name, player_id FROM box_scores", conn)
+    existing_ids = {normalize_name(n): i
+                    for n, i in zip(existing["player_name"], existing["player_id"])}
+    abbrs = team_abbreviations()
+
+    rows = []
+    for d in pd.date_range(start_date, end_date):
+        date_str = d.strftime("%Y-%m-%d")
+        try:
+            matches = _highlightly_matches_for_et_date(date_str, key)
+        except Exception as e:
+            print(f"  Highlightly matches lookup failed for {date_str}: {e}")
+            continue
+        for m in matches:
+            try:
+                rows.extend(_highlightly_box_score(m, existing_ids, abbrs, key))
+            except Exception as e:
+                print(f"  Highlightly box score failed for match {m['id']}: {e}")
+    return pd.DataFrame(rows)
+
+
+def cmd_pull_highlightly_fallback():
+    """Same shape as cmd_pull_espn_fallback() but returns True/False (found
+    something or not) so cmd_pull can decide whether ESPN is still worth trying too.
+    Returns False immediately, without an API call, if no key is configured."""
+    key = get_highlightly_key()
+    if not key:
+        return False
+    with db.connect() as conn:
+        last = conn.execute("SELECT MAX(game_date) FROM box_scores").fetchone()[0]
+    yesterday = (datetime.now(ET) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    start = (pd.Timestamp(last) + pd.Timedelta(days=1)).strftime("%Y-%m-%d") if last else yesterday
+    if start > yesterday:
+        print("Already up to date through yesterday - nothing to backfill from Highlightly.")
+        return True
+    print(f"Pulling {start} to {yesterday} from Highlightly (cloud fallback source)...")
+    df = fetch_highlightly_game_log(start, yesterday, key)
+    if df.empty:
+        print("Highlightly found no finished games in that range.")
+        return False
+    save_box_scores(df)
+    print(f"Saved {len(df)} player-game rows from Highlightly "
+          f"({df['game_id'].nunique()} games, {df['game_date'].min()} to {df['game_date'].max()})")
+    return True
 
 
 # ---------- ESPN fallback ----------
@@ -347,6 +515,9 @@ def cmd_pull(season, playoffs):
         raw = fetch_game_log(season, season_type)
     except NBAComUnavailable as e:
         print(f"NBA.com didn't respond after 3 tries ({e}).")
+        if cmd_pull_highlightly_fallback():
+            return
+        print("Trying ESPN as well...")
         cmd_pull_espn_fallback()
         return
     if raw.empty:
@@ -813,6 +984,11 @@ if __name__ == "__main__":
                    help="backfill box scores from ESPN for the gap since the last saved "
                         "date - normally only runs automatically when nba_api fails, "
                         "this lets you trigger it by hand")
+    sub.add_parser("pull-highlightly-fallback",
+                   help="backfill box scores from Highlightly for the gap since the last "
+                        "saved date (needs HIGHLIGHTLY_API_KEY in .env) - normally only "
+                        "runs automatically when nba_api fails, this lets you trigger it "
+                        "by hand")
     sub.add_parser("pull-positions", help="pull each player's position from team rosters")
     pp = sub.add_parser("pull-periods", help="pull 1st quarter/half stats for saved games")
     pp.add_argument("--season", default=current_season(), help="like 2025-26")
@@ -831,6 +1007,10 @@ if __name__ == "__main__":
         cmd_pull(args.season, args.playoffs)
     elif args.mode == "pull-espn-fallback":
         cmd_pull_espn_fallback()
+    elif args.mode == "pull-highlightly-fallback":
+        if not cmd_pull_highlightly_fallback():
+            sys.exit("Nothing pulled - check HIGHLIGHTLY_API_KEY is set in .env, or that "
+                     "there's actually a gap to backfill.")
     elif args.mode == "pull-positions":
         cmd_pull_positions()
     elif args.mode == "pull-periods":
