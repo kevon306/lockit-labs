@@ -37,7 +37,6 @@ jobs:
           echo
 
       - name: Highlightly - NBA matches list (free tier)
-        if: ${{ secrets.HIGHLIGHTLY_API_KEY != '' }}
         run: |
           code=$(curl -s -o /tmp/hl_matches.json -w "%{http_code}" \
             -H "x-rapidapi-key: ${{ secrets.HIGHLIGHTLY_API_KEY }}" \
@@ -47,7 +46,6 @@ jobs:
           echo
 
       - name: Highlightly - NBA per-player box score, Raptors vs Magic 2026-10-30 (free tier)
-        if: ${{ secrets.HIGHLIGHTLY_API_KEY != '' }}
         run: |
           code=$(curl -s -o /tmp/hl_box.json -w "%{http_code}" \
             -H "x-rapidapi-key: ${{ secrets.HIGHLIGHTLY_API_KEY }}" \
@@ -64,7 +62,3 @@ jobs:
                       print(p['player']['name'], '-> Total Points Scored:', pts)
           " || echo "could not parse response, see raw output below"
           head -c 300 /tmp/hl_box.json
-
-      - name: Highlightly - skipped (no key yet)
-        if: ${{ secrets.HIGHLIGHTLY_API_KEY == '' }}
-        run: echo "HIGHLIGHTLY_API_KEY secret not set - skipping Highlightly test for now."
