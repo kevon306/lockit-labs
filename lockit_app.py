@@ -3592,6 +3592,7 @@ def page_players():
                        "turnovers", "fouls"]],
                      hide_index=True, width="stretch")
 
+@st.cache_data(ttl=60)
 def player_model_dist(box, player_id, player_name, team, opponent, model_stat,
                       players=None, is_home=None):
     """This player's fitted (mean, variance) for one model stat tonight, or (None,
