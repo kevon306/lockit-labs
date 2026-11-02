@@ -1477,6 +1477,17 @@ def cached_calibration():
     return calibration.current_calibration()
 
 
+@st.cache_data(ttl=21600)
+def cached_tail_calibration(box, players):
+    """Cached wrapper around model.fit_tail_calibration() - a long (6h) ttl, not the
+    usual 60s, because the fit itself re-runs the full walk-forward backtest across
+    every saved box score (~12s) to get enough synthetic quantile checks per stat.
+    One more day of games out of 70k+ existing player-games moves this fit by nothing
+    worth re-paying that cost every minute for - see model.py's own docstring for why
+    this correction exists (points/steals/blocks' confirmed tail-overconfidence gap)."""
+    return model.fit_tail_calibration(box, players=players)
+
+
 @st.cache_data(ttl=60)
 def compute_picks(box, odds, player_bt=None):
     """Every active prop line with a model projection, with the model's probability,
@@ -1485,7 +1496,10 @@ def compute_picks(box, odds, player_bt=None):
     if roster.empty or slate.empty:
         return pd.DataFrame(), None
 
-    proj = model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent", "is_home"]])
+    players = load("players")
+    proj = model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent", "is_home"]],
+                                 players=players)
+    tail_cal = cached_tail_calibration(box, players)
 
     boards = []
     for r in slate.itertuples():
@@ -1508,8 +1522,13 @@ def compute_picks(box, odds, player_bt=None):
             continue
         mean, var = sub[f"{stat}_mean_hat"], sub[f"{stat}_var_hat"]
         is_nb, r, p = model.fit_dist(mean, var)
-        model_p_over = model.p_over(sub["Line"].to_numpy(), mean, r, p, is_nb)
-        sub["model_p_over"] = model_p_over * 100
+        model_p_over = model.p_over(sub["Line"].to_numpy(), mean, r, p, is_nb) * 100
+        # points/steals/blocks have a confirmed, backtested tail-overconfidence gap
+        # (see model.fit_tail_calibration's docstring) - corrected here, on the raw
+        # Over probability, before it's split into a side or blended with the market.
+        if stat in model.TAIL_CALIBRATED_STATS:
+            model_p_over = calibration.apply(model_p_over, tail_cal[stat]["params"])
+        sub["model_p_over"] = model_p_over
         sub["stat"] = stat
         rows.append(sub)
     picks = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -2820,6 +2839,7 @@ def page_parlay():
     box = load("box_scores")
     odds = load("odds_snapshots")
     game_odds = load("game_odds_snapshots")
+    players = load("players")
     topbar(odds, "parlay")
 
     st.markdown(
@@ -2860,15 +2880,16 @@ def page_parlay():
                         player_id = games_all_p["player_id"].iloc[-1]
                         team = games_all_p["team"].iloc[-1]
                         mine_ev = odds[odds["player"].map(box_scores.normalize_name) == key]
-                        opponent = None
+                        opponent, is_home = None, None
                         if not mine_ev.empty:
                             latest_ev = mine_ev[mine_ev["snapshot_time"] == mine_ev["snapshot_time"].max()]
                             home_abbr = short(latest_ev["home_team"].iloc[0])
                             away_abbr = short(latest_ev["away_team"].iloc[0])
                             opponent = away_abbr if team == home_abbr else home_abbr
+                            is_home = int(team == home_abbr)
                         model_stat = MODEL_STAT_FOR_LABEL[stat_label]
-                        mean_hat, var_hat = player_model_dist(box, player_id, name, team,
-                                                              opponent, model_stat)
+                        mean_hat, var_hat = player_model_dist(box, player_id, name, team, opponent,
+                                                              model_stat, players=players, is_home=is_home)
                         p_over = player_model_prob_at(mean_hat, var_hat, line)
                         model_p = (p_over * 100 if side == "Over" else (100 - p_over * 100)) \
                             if p_over is not None else None
@@ -3341,8 +3362,10 @@ def page_players():
     model_stat = MODEL_STAT_FOR_LABEL.get(stat_label)
     mean_hat = var_hat = None
     if model_stat and not games_all.empty:
+        # No is_home here - opponent is whatever this page's H2H picker has selected,
+        # which isn't necessarily tonight's real, scheduled game.
         mean_hat, var_hat = player_model_dist(box, player_id, name, player_team,
-                                              opponent, model_stat)
+                                              opponent, model_stat, players=players)
 
     def model_prob_at(x):
         return player_model_prob_at(mean_hat, var_hat, x)
@@ -3503,16 +3526,25 @@ def page_players():
                        "turnovers", "fouls"]],
                      hide_index=True, width="stretch")
 
-def player_model_dist(box, player_id, player_name, team, opponent, model_stat):
+def player_model_dist(box, player_id, player_name, team, opponent, model_stat,
+                      players=None, is_home=None):
     """This player's fitted (mean, variance) for one model stat tonight, or (None,
     None) if there's not enough history (model.MIN_HISTORY) or no real projection.
     Same project_tonight() call the Players page and compute_picks() use - one engine,
-    not a second one that could quietly drift from it."""
+    not a second one that could quietly drift from it.
+
+    players enables the opponent/position matchup adjustment (see
+    model.add_opponent_position_factor); omit it only when there's no real position
+    lookup available. is_home enables the home/away adjustment and is left unset (NaN)
+    when the matchup isn't tonight's real, scheduled game - e.g. the Players page's
+    "what if they played this team" H2H opponent picker, where home/away isn't a real
+    fact about a hypothetical matchup."""
     if not model_stat:
         return None, None
     roster_one = pd.DataFrame([{"player_id": player_id, "player_name": player_name,
-                                "team": team, "opponent": opponent}])
-    proj = model.project_tonight(box, roster_one).iloc[0]
+                                "team": team, "opponent": opponent,
+                                "is_home": is_home if is_home is not None else np.nan}])
+    proj = model.project_tonight(box, roster_one, players=players).iloc[0]
     if proj["games_before"] < model.MIN_HISTORY:
         return None, None
     mh, vh = proj[f"{model_stat}_mean_hat"], proj[f"{model_stat}_var_hat"]

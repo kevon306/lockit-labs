@@ -48,6 +48,7 @@ import pandas as pd
 from scipy import stats
 
 import box_scores
+import calibration
 import db
 
 STATS = ["points", "rebounds", "assists", "fg3m", "steals", "blocks", "turnovers",
@@ -563,6 +564,65 @@ def closing_line_log_loss(box, odds_resolved):
         if n:
             ml, kl = float(np.mean(losses_model)), float(np.mean(losses_market))
             results[stat] = {"n": n, "model_log_loss": ml, "market_log_loss": kl, "model_wins": ml < kl}
+    return results
+
+
+TAIL_CALIBRATED_STATS = ("points", "steals", "blocks")  # see confidence_label() - the
+                                                         # three stats with a confirmed
+                                                         # tail-overconfidence gap
+
+
+def fit_tail_calibration(box, players=None, home_away=True, stats_to_fit=TAIL_CALIBRATED_STATS):
+    """Fits calibration.py's same Platt-scaling correction (logit-space 2-parameter
+    curve), but per stat and against the walk-forward backtest's synthetic quantile
+    checks instead of the live prediction ledger - the same (predicted, actual-over)
+    pairs _calibration_check() already builds to print its bucketed report, just kept
+    ungrouped and fed to calibration.fit() directly instead of bucketed for display.
+
+    This exists because calibration.py's live-ledger correction is gated behind
+    MIN_DECIDED_FOR_CALIBRATION (100) real decided predictions and applies one global
+    curve - nowhere near enough volume yet to fix points/steals/blocks' specific,
+    already-confirmed tail gap (see confidence_label()'s docstring). The backtest has
+    hundreds of thousands of synthetic checks per stat instead, with no API cost and no
+    leakage: every projection already only used games strictly before it, and this
+    just fits a static correction from that aggregate evidence - the same category of
+    thing HOME_AWAY_CLIP/OPP_FACTOR_CLIP already do, not a change to any single game's
+    own projection.
+
+    Returns {stat: {params, n, raw_brier, calibrated_brier}}, same shape as
+    calibration.current_calibration(), one entry per stat in stats_to_fit. Applied in
+    lockit_app.py's compute_picks(), on the raw model_p_over for points/steals/blocks,
+    before calibration.py's own live-ledger correction runs - the two stack (this one
+    fixes a known structural gap from a huge historical sample; the live-ledger one
+    nudges toward this app's own real track record once there's enough of it), rather
+    than one replacing the other."""
+    proj = add_projections(box, players=players, home_away=home_away)
+    proj = proj[proj["games_before"] >= MIN_HISTORY].copy()
+
+    results = {}
+    for stat in stats_to_fit:
+        mean, var, actual = proj[f"{stat}_mean_hat"], proj[f"{stat}_var_hat"], proj[stat]
+        is_nb, r, p = fit_dist(mean, var)
+        valid = mean.notna() & (mean > 0) & ~(is_nb & r.isna())
+        mean_v, r_v, p_v, is_nb_v, actual_v = mean[valid], r[valid], p[valid], is_nb[valid], actual[valid]
+
+        preds, outcomes = [], []
+        for q in QUANTILES:
+            line = quantile(q, mean_v, r_v, p_v, is_nb_v) - 0.5
+            pred = p_over(line, mean_v, r_v, p_v, is_nb_v)
+            went_over = (actual_v.values > line).astype(float)
+            ok = ~np.isnan(pred)
+            preds.append(pred[ok] * 100)
+            outcomes.append(went_over[ok])
+        pred_pct = np.concatenate(preds)
+        outcome = np.concatenate(outcomes)
+
+        params = calibration.fit(pred_pct, outcome)
+        raw_brier = float(np.mean((pred_pct / 100 - outcome) ** 2))
+        calibrated_brier = (float(np.mean((calibration.apply(pred_pct, params) / 100 - outcome) ** 2))
+                            if params is not None else None)
+        results[stat] = {"params": params, "n": len(pred_pct),
+                         "raw_brier": raw_brier, "calibrated_brier": calibrated_brier}
     return results
 
 
