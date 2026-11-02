@@ -1499,7 +1499,13 @@ def compute_picks(box, odds, player_bt=None):
     players = load("players")
     proj = model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent", "is_home"]],
                                  players=players)
-    tail_cal = cached_tail_calibration(box, players)
+    try:
+        tail_cal = cached_tail_calibration(box, players)
+    except Exception:
+        # Never let the tail-calibration correction (points/steals/blocks) take down
+        # the whole Top Picks page - fall back to uncorrected probabilities, the exact
+        # same honest default this app shipped with before this correction existed.
+        tail_cal = {}
 
     boards = []
     for r in slate.itertuples():
@@ -1526,7 +1532,7 @@ def compute_picks(box, odds, player_bt=None):
         # points/steals/blocks have a confirmed, backtested tail-overconfidence gap
         # (see model.fit_tail_calibration's docstring) - corrected here, on the raw
         # Over probability, before it's split into a side or blended with the market.
-        if stat in model.TAIL_CALIBRATED_STATS:
+        if stat in model.TAIL_CALIBRATED_STATS and stat in tail_cal:
             model_p_over = calibration.apply(model_p_over, tail_cal[stat]["params"])
         sub["model_p_over"] = model_p_over
         sub["stat"] = stat

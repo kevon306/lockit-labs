@@ -601,28 +601,41 @@ def fit_tail_calibration(box, players=None, home_away=True, stats_to_fit=TAIL_CA
 
     results = {}
     for stat in stats_to_fit:
-        mean, var, actual = proj[f"{stat}_mean_hat"], proj[f"{stat}_var_hat"], proj[stat]
-        is_nb, r, p = fit_dist(mean, var)
-        valid = mean.notna() & (mean > 0) & ~(is_nb & r.isna())
-        mean_v, r_v, p_v, is_nb_v, actual_v = mean[valid], r[valid], p[valid], is_nb[valid], actual[valid]
+        # One stat's fit failing (bad data, a too-small sample, an optimizer hiccup)
+        # should never take the other two down with it, and should never be allowed to
+        # crash whatever live page called this - skip that stat; its caller already
+        # treats a missing entry as "no correction for this stat" (see
+        # lockit_app.py's compute_picks).
+        try:
+            mean, var, actual = proj[f"{stat}_mean_hat"], proj[f"{stat}_var_hat"], proj[stat]
+            is_nb, r, p = fit_dist(mean, var)
+            valid = mean.notna() & (mean > 0) & ~(is_nb & r.isna())
+            mean_v, r_v, p_v, is_nb_v, actual_v = (mean[valid], r[valid], p[valid],
+                                                    is_nb[valid], actual[valid])
 
-        preds, outcomes = [], []
-        for q in QUANTILES:
-            line = quantile(q, mean_v, r_v, p_v, is_nb_v) - 0.5
-            pred = p_over(line, mean_v, r_v, p_v, is_nb_v)
-            went_over = (actual_v.values > line).astype(float)
-            ok = ~np.isnan(pred)
-            preds.append(pred[ok] * 100)
-            outcomes.append(went_over[ok])
-        pred_pct = np.concatenate(preds)
-        outcome = np.concatenate(outcomes)
+            preds, outcomes = [], []
+            for q in QUANTILES:
+                line = quantile(q, mean_v, r_v, p_v, is_nb_v) - 0.5
+                pred = p_over(line, mean_v, r_v, p_v, is_nb_v)
+                went_over = (actual_v.to_numpy(dtype=float) > line).astype(float)
+                ok = ~np.isnan(pred)
+                preds.append(pred[ok] * 100)
+                outcomes.append(went_over[ok])
+            if not preds:
+                continue
+            pred_pct = np.concatenate(preds)
+            outcome = np.concatenate(outcomes)
+            if len(pred_pct) == 0:
+                continue
 
-        params = calibration.fit(pred_pct, outcome)
-        raw_brier = float(np.mean((pred_pct / 100 - outcome) ** 2))
-        calibrated_brier = (float(np.mean((calibration.apply(pred_pct, params) / 100 - outcome) ** 2))
-                            if params is not None else None)
-        results[stat] = {"params": params, "n": len(pred_pct),
-                         "raw_brier": raw_brier, "calibrated_brier": calibrated_brier}
+            params = calibration.fit(pred_pct, outcome)
+            raw_brier = float(np.mean((pred_pct / 100 - outcome) ** 2))
+            calibrated_brier = (float(np.mean((calibration.apply(pred_pct, params) / 100 - outcome) ** 2))
+                                if params is not None else None)
+            results[stat] = {"params": params, "n": len(pred_pct),
+                             "raw_brier": raw_brier, "calibrated_brier": calibrated_brier}
+        except Exception:
+            continue
     return results
 
 
