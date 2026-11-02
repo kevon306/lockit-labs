@@ -3075,8 +3075,9 @@ def page_lines():
     c1, c2 = st.columns([3, 2])
     event_id = c1.selectbox("Game", list(labels), format_func=labels.get)
     search = c2.text_input("Find a player", placeholder="Type a name")
-    stats = st.pills("Stats", ["Points", "Rebounds", "Assists"], selection_mode="multi",
-                     default=["Points", "Rebounds", "Assists"], label_visibility="collapsed")
+    stats = st.pills("Stats", ["Points", "Rebounds", "Assists", "3PM", "Steals", "Blocks", "Turnovers"],
+                     selection_mode="multi", default=["Points", "Rebounds", "Assists"],
+                     label_visibility="collapsed")
 
     r = ev[ev["event_id"] == event_id].iloc[0]
     label, _ = close_status(odds[odds["event_id"] == event_id], r.tip)
