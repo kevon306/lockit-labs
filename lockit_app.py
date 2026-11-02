@@ -3084,6 +3084,66 @@ def page_parlay():
                  "in place.")
 
 
+PROJECTION_STAT_FOR_LABEL = {"Points": "points", "Rebounds": "rebounds", "Assists": "assists",
+                             "3PM": "fg3m", "Steals": "steals", "Blocks": "blocks",
+                             "Turnovers": "turnovers"}
+
+
+def page_model_projections():
+    box = load("box_scores")
+    odds = load("odds_snapshots")
+    players = load("players")
+    topbar(odds, "model_projections")
+    st.markdown(
+        f'<div class="hero">{COURT_SVG}<h1>Model Projections</h1>'
+        "<p>The model's own projected average for tonight's active players, stat by "
+        "stat - no market line, no edge, nothing filtered out. This is purely what the "
+        "walk-forward model itself thinks, straight from box-score history; see Top "
+        "Picks for where that actually disagrees with the market enough to matter.</p></div>",
+        unsafe_allow_html=True)
+
+    if box.empty:
+        hint("No box scores saved yet. In the terminal, run: `python3 box_scores.py pull`")
+        return
+    if odds.empty:
+        hint("No odds saved yet, so tonight's slate isn't known yet. In the terminal, "
+             "run: `python3 pull_props.py today --game 0`")
+        return
+
+    roster, slate, slate_odds = build_roster(box, odds)
+    if roster.empty or slate.empty:
+        hint("No active lines posted for today yet - this roster is built the same way "
+             "Top Picks' is, from tonight's posted props.")
+        return
+
+    proj = model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent", "is_home"]],
+                                 players=players)
+    proj = proj[proj["games_before"] >= model.MIN_HISTORY].merge(
+        roster[["player_id", "is_home"]], on="player_id", how="left")
+
+    c1, c2 = st.columns([2, 1])
+    search = c1.text_input("Find a player", placeholder="Type a name", label_visibility="collapsed")
+    stats = st.pills("Stats", list(PROJECTION_STAT_FOR_LABEL), selection_mode="multi",
+                     default=["Points", "Rebounds", "Assists"], label_visibility="collapsed")
+
+    show = proj[proj["player_name"].str.contains(search, case=False)] if search else proj
+    show = show.assign(Game=show.apply(
+        lambda r: f"vs {r.opponent}" if r.is_home == 1 else
+                 (f"@ {r.opponent}" if r.is_home == 0 else str(r.opponent)), axis=1))
+    display = show[["player_name", "team", "Game", "games_before"]].rename(
+        columns={"player_name": "Player", "team": "Team", "games_before": "Games"})
+    for label in (stats or []):
+        display[label] = show[f"{PROJECTION_STAT_FOR_LABEL[label]}_mean_hat"].round(1).to_numpy()
+    display = display.sort_values("Player").reset_index(drop=True)
+
+    strip([(len(display), "players projected"), (len(slate), "games tonight")])
+    st.dataframe(display, hide_index=True, width="stretch", height=560)
+    hint(f"Only players with at least {model.MIN_HISTORY} games of history are shown - not "
+         "enough data for a real projection below that. Pure model output, not a betting "
+         "recommendation - it has no idea about tonight's injury news or lineup changes "
+         "beyond what's already in box scores.")
+
+
 def page_lines():
     odds = load("odds_snapshots")
     topbar(odds, "lines")
@@ -4574,6 +4634,8 @@ game_lines_page = st.Page(page_game_lines, title="Game Lines", icon=":material/s
 parlay_page = st.Page(page_parlay, title="Parlay", icon=":material/calculate:", url_path="parlay")
 trends_page = st.Page(page_trends, title="Trends", icon=":material/trending_up:", url_path="trends")
 lines_page = st.Page(page_lines, title="Lines", icon=":material/table_rows:", url_path="lines")
+model_projections_page = st.Page(page_model_projections, title="Model Projections",
+                                 icon=":material/query_stats:", url_path="model-projections")
 players_page = st.Page(page_players, title="Players", icon=":material/person:", url_path="players")
 ai_analyst_page = st.Page(page_ai_analyst, title="AI Analyst", icon=":material/forum:", url_path="ai-analyst")
 learn_page = st.Page(page_learn, title="Key / Learn", icon=":material/menu_book:", url_path="learn")
@@ -4589,12 +4651,14 @@ pick_detail_page = st.Page(page_pick_detail, title="Pick Detail", icon=":materia
 
 nav = st.navigation({
     "Research": [tonight_page, top_picks_page, game_lines_page, parlay_page, trends_page,
-                 lines_page, players_page, ai_analyst_page, learn_page, pick_detail_page],
+                 lines_page, model_projections_page, players_page, ai_analyst_page, learn_page,
+                 pick_detail_page],
     "Track": [bets_page, results_page, model_perf_page, system_page],
 }, position="hidden")  # replaced by sidebar_nav()'s custom, canvas-matched list below
 
 sidebar_nav(primary_pages=[tonight_page, lines_page, trends_page, players_page, bets_page],
-           more_research=[top_picks_page, game_lines_page, parlay_page, ai_analyst_page, learn_page],
+           more_research=[top_picks_page, game_lines_page, parlay_page, model_projections_page,
+                          ai_analyst_page, learn_page],
            more_track=[results_page, model_perf_page, system_page])
 st.session_state["_slip_rendered_inline"] = False
 nav.run()
