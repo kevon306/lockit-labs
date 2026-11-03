@@ -616,7 +616,13 @@ def upsert(table, cols, pk_cols, rows):
     Postgres's equivalent of SQLite's INSERT OR REPLACE, which box_scores.py's pull
     commands use heavily (a game's stats can be corrected by the NBA after the fact).
     rows is a list of tuples in `cols` order. No-op (returns immediately) if rows is
-    empty - execute_values would error on an empty values list."""
+    empty - execute_values would error on an empty values list.
+
+    Tries the whole batch in one round trip first. If that fails - confirmed in
+    production when one Highlightly row had a non-NBA placeholder value ("-") in a
+    numeric column and took out an entire day's box scores with it - falls back to
+    one row at a time so a single bad row is skipped and logged instead of losing
+    every good row alongside it."""
     if not rows:
         return
     update_cols = [c for c in cols if c not in pk_cols]
@@ -624,8 +630,23 @@ def upsert(table, cols, pk_cols, rows):
     sql = (f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s "
           f"ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {set_clause}")
     with connect() as conn:
-        execute_values(conn._conn.cursor(), sql, rows)
-        conn.commit()
+        cur = conn._conn.cursor()
+        try:
+            execute_values(cur, sql, rows)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            saved, skipped = 0, 0
+            for row in rows:
+                try:
+                    execute_values(cur, sql, [row])
+                    conn.commit()
+                    saved += 1
+                except Exception as e:
+                    conn.rollback()
+                    skipped += 1
+                    print(f"  upsert: skipped a bad {table} row: {e}")
+            print(f"{table}: saved {saved} row(s), skipped {skipped} bad row(s)")
 
 
 def save_odds(rows):
