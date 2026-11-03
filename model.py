@@ -473,26 +473,25 @@ def project_tonight(box, roster, players=None, usage=False, home_away=True, rest
 def confidence_label(games_before, stat, backtest=None):
     """How much to trust a projection, separate from the probability itself.
 
-    High now requires two things, not just sample size: at least 30 games of history,
+    High requires two things, not just sample size: at least 30 games of history,
     *and* closing_line_log_loss() showing this stat's model beats the no-vig closing
     line on log loss - being well-calibrated against reality isn't the same as being
     sharper than a real market, and only the second one means the model is actually
     adding information. backtest=None (or a stat with no settled closing-line games
     yet) means that hasn't been shown, so High is never awarded on sample size alone.
 
-    Points, steals, and blocks stay capped at Medium regardless - a real, backtested
-    tail-overconfidence issue (see the module docstring for points; steals and blocks
-    were checked the same way when they were added as markets: both show the model
-    predicting ~74-84% in the upper-middle range when the real rate was 5-7 points
-    lower - a similar-sized gap to points', and matches this project's own prior
-    expectation that steals/blocks are more volatile than points or minutes-based
-    stats). Rebounds, assists, three-pointers made, and turnovers all calibrated
-    cleanly in that same check, so they're not capped.
+    No stat is hardcoded to a cap. points/steals/blocks/pa/pr/pra have a confirmed
+    tail-overconfidence gap in their raw probability (see TAIL_CALIBRATED_STATS), but
+    the fix for that is fixing the probability itself - fit_tail_calibration()'s
+    correction, applied before this function ever sees the backtest result (both in
+    compute_picks(), for what's actually shown live, and inside closing_line_log_loss()
+    itself, for the beats_market check this function reads). A stat that's still
+    miscalibrated after that correction legitimately fails beats_market and stays at
+    Medium on its own merits - that's the model being held to a real bar, not a
+    blacklist overriding what the (now-corrected) model says.
     """
     if games_before < 15:
         return "Low"
-    if stat in ("points", "steals", "blocks"):
-        return "Medium"
     beats_market = bool(backtest and backtest.get(stat, {}).get("model_wins"))
     return "High" if (games_before >= 30 and beats_market) else "Medium"
 
@@ -501,13 +500,19 @@ def _implied(price):
     return -price / (-price + 100) if price < 0 else 100 / (price + 100)
 
 
-def closing_line_log_loss(box, odds_resolved):
+def closing_line_log_loss(box, odds_resolved, tail_cal=None):
     """For every settled game where we also saved a player-prop odds snapshot at or
     before tip (the closest thing we have to a closing line), compares the model's own
     walk-forward probability to the books' no-vig probability on log loss, per stat.
 
     odds_resolved must already have player_id/game_date columns added (name-matching
     and date lookups live in lockit_app.py, not here).
+
+    tail_cal, if given (fit_tail_calibration()'s return), is applied to the raw model
+    probability for any stat in TAIL_CALIBRATED_STATS before it's compared to the
+    market - the same correction compute_picks() applies to what's actually shown live.
+    Without it, this would be grading the raw, pre-correction model against the market,
+    which is a different (and for those stats, weaker) thing than what a user sees.
 
     Returns {'points': {...}, 'rebounds': {...}, 'assists': {...}}, each a dict with n
     (games covered), model_log_loss, market_log_loss, model_wins (model_log_loss <
@@ -554,6 +559,8 @@ def closing_line_log_loss(box, odds_resolved):
             p_model = p_over(np.array([line]), pd.Series([mean]), r, p, is_nb)[0]
             if np.isnan(p_model):
                 continue
+            if stat in TAIL_CALIBRATED_STATS and tail_cal and stat in tail_cal:
+                p_model = calibration.apply(np.array([p_model * 100]), tail_cal[stat]["params"])[0] / 100
             y = 1.0 if actual > line else 0.0
             p_model = min(max(p_model, eps), 1 - eps)
             p_market = min(max(p_market, eps), 1 - eps)
@@ -567,9 +574,9 @@ def closing_line_log_loss(box, odds_resolved):
     return results
 
 
-TAIL_CALIBRATED_STATS = ("points", "steals", "blocks")  # see confidence_label() - the
-                                                         # three stats with a confirmed
-                                                         # tail-overconfidence gap
+TAIL_CALIBRATED_STATS = ("points", "steals", "blocks", "pa", "pr", "pra")  # see
+                                 # confidence_label() - the stats with a confirmed
+                                 # tail-overconfidence gap (pa/pr/pra inherit points')
 
 
 def fit_tail_calibration(box, players=None, home_away=True, stats_to_fit=TAIL_CALIBRATED_STATS):

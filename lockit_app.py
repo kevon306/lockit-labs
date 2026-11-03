@@ -1459,8 +1459,18 @@ def cached_player_backtest(box, odds):
     and Players pages. Streamlit reruns the whole script on every widget interaction,
     so without caching this, every single click anywhere on either page would pay
     this cost again - the ttl matches load()'s, so it never serves odds staler than
-    what's already on screen."""
-    return model.closing_line_log_loss(box, resolve_player_odds(odds, box))
+    what's already on screen.
+
+    Fits and passes the tail calibration correction through, so the beats_market
+    check this feeds (confidence_label's real gate, now the only gate - see model.py)
+    is judged against the same corrected probability compute_picks() actually shows,
+    not the raw pre-correction one. A stat that's still miscalibrated after that
+    correction fails this fairly, on its own merits; it's not hardcoded to fail."""
+    try:
+        tail_cal = cached_tail_calibration(box, load("players"))
+    except Exception:
+        tail_cal = {}
+    return model.closing_line_log_loss(box, resolve_player_odds(odds, box), tail_cal=tail_cal)
 
 
 @st.cache_data(ttl=60)
@@ -1484,7 +1494,8 @@ def cached_tail_calibration(box, players):
     every saved box score (~12s) to get enough synthetic quantile checks per stat.
     One more day of games out of 70k+ existing player-games moves this fit by nothing
     worth re-paying that cost every minute for - see model.py's own docstring for why
-    this correction exists (points/steals/blocks' confirmed tail-overconfidence gap)."""
+    this correction exists (points/steals/blocks/pa/pr/pra's confirmed tail-overconfidence
+    gap)."""
     return model.fit_tail_calibration(box, players=players)
 
 
