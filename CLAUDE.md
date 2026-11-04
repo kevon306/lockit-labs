@@ -14,7 +14,8 @@ finish and test each step before starting the next, unless the user says otherwi
 
 ## Files
 - `pull_props.py`: pulls prop odds from The Odds API (key in `.env`, never print or commit it).
-  Free plan: 500 credits/month. Live event odds cost markets x regions; historical costs 10x.
+  On a paid plan now (18,695 credits remaining as of 2026-11-04, not the free 500/month this
+  used to say). Live event odds cost markets x regions; historical costs 10x.
 - `db.py`: SQLite at `data/lockit.db`. Tables: odds_snapshots, box_scores, predictions (LOCKED by
   triggers, never edit or delete), entries, entry_legs, corrections (audit log for entry fixes).
 - `box_scores.py`: NBA box scores via nba_api (blocked from cloud IPs; works from this Mac).

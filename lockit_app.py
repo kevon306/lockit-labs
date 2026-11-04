@@ -949,7 +949,7 @@ def page_tonight():
     main, side = st.columns([2.6, 1.1], gap="large")
 
     with main:
-        stat = st.segmented_control("Stat", ["Points", "Rebounds", "Assists"],
+        stat = st.segmented_control("Stat", ["Points", "Rebounds", "Assists", "3PM", "Steals", "Blocks"],
                                     default="Points", label_visibility="collapsed") or "Points"
         for r in slate.itertuples():
             b = boards[r.event_id]
