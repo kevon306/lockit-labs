@@ -488,7 +488,14 @@ def _pool():
         if not url:
             sys.exit("DATABASE_URL isn't set. Add it to your .env file - see the "
                      "connection string in your Supabase project's Connect panel.")
-        _POOL = pg_pool.ThreadedConnectionPool(1, 10, url)
+        # TCP keepalives so a connection that goes silently dead mid-query (confirmed
+        # in production: the morning job's connection stopped getting any response
+        # from Supabase, and poll() waited over 5 hours for a reply that was never
+        # coming) gets detected and errored out within under a minute instead of
+        # hanging forever - idle 15s, then a probe every 5s, give up after 5 missed.
+        _POOL = pg_pool.ThreadedConnectionPool(
+            1, 10, url, keepalives=1, keepalives_idle=15,
+            keepalives_interval=5, keepalives_count=5)
     return _POOL
 
 
