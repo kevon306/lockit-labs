@@ -211,6 +211,7 @@ h1, h2, h3 {{ font-family: 'Bricolage Grotesque', sans-serif; color: {TEXT}; }}
 .stButton > button:active, [data-testid^="stBaseButton"]:active {{ transform: translateY(0); }}
 [data-testid="stDataFrame"] {{ border-radius: 14px; overflow: hidden;
   border: 1px solid {EDGE}; box-shadow: 0 10px 28px -16px rgba(0,0,0,.55); }}
+[data-testid="stVegaLiteChart"] {{ animation: rise .4s ease both; }}
 [data-testid="stAlert"] {{ border-radius: 14px; border: 1px solid {EDGE};
   background: {PANEL}; box-shadow: 0 10px 28px -16px rgba(0,0,0,.5); }}
 [data-testid="stExpander"] {{ border-radius: 14px !important; border: 1px solid {EDGE} !important;
@@ -260,7 +261,7 @@ div[data-baseweb="input"], div[data-baseweb="select"] > div {{ border-radius: 10
 
 .panel {{ background: {PANEL}; border: 1px solid {EDGE}; border-radius: 16px;
   padding: 1rem 1.1rem; margin-bottom: .9rem; box-shadow: 0 14px 32px -20px rgba(0,0,0,.6);
-  transition: border-color .18s ease, box-shadow .18s ease; }}
+  transition: border-color .18s ease, box-shadow .18s ease; animation: rise .35s ease both; }}
 @media (hover: hover) {{ .panel:hover {{ border-color: #30405F; }} }}
 .panel-title {{ font-family: 'Bricolage Grotesque', sans-serif; font-weight: 600;
   font-size: 1.15rem; color: {TEXT}; margin-bottom: .4rem; }}
@@ -308,7 +309,8 @@ div[data-baseweb="input"], div[data-baseweb="select"] > div {{ border-radius: 10
   letter-spacing: .04em; margin: .2rem 0 .5rem 0; }}
 
 @keyframes rise {{ from {{ opacity: 0; transform: translateY(8px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-@media (prefers-reduced-motion: reduce) {{ .game, .trend-card {{ animation: none; }} }}
+@media (prefers-reduced-motion: reduce) {{ .game, .trend-card, .panel, .strip,
+  [data-testid="stVegaLiteChart"] {{ animation: none; }} }}
 
 .row {{ display: flex; justify-content: space-between; gap: .6rem; padding: .55rem 0;
   border-bottom: 1px solid {EDGE}; }}
@@ -322,7 +324,8 @@ div[data-baseweb="input"], div[data-baseweb="select"] > div {{ border-radius: 10
 .down {{ color: {RED} !important; }}
 
 .strip {{ display: flex; flex-wrap: wrap; background: {PANEL}; border: 1px solid {EDGE};
-  border-radius: 14px; margin: .4rem 0 1rem 0; box-shadow: 0 14px 32px -22px rgba(0,0,0,.6); }}
+  border-radius: 14px; margin: .4rem 0 1rem 0; box-shadow: 0 14px 32px -22px rgba(0,0,0,.6);
+  animation: rise .35s ease both; }}
 .strip > div {{ flex: 1 1 140px; padding: .9rem 1.1rem; border-right: 1px solid {EDGE};
   transition: background .15s ease; }}
 .strip > div:last-child {{ border-right: none; }}
@@ -887,8 +890,15 @@ def page_tonight():
         f'<div><h1 style="margin:0;padding:0;font-size:2.1rem;">{escape(title)}</h1>'
         f'<p class="hint" style="margin:.2rem 0 0 0;">{subtitle}</p></div></div>',
         unsafe_allow_html=True)
-    hint(f"{len(allb)} props tracked across {slate_odds['bookmaker'].nunique()} sportsbooks, "
-         f"{slate_odds['snapshot_time'].nunique()} snapshot(s) so far.")
+    decided = cached_ledger_decided()
+    win_rate = f"{(decided['result'] == 'WON').mean() * 100:.0f}%" if not decided.empty else "–"
+    strip([
+        (len(slate), f"game{'s' if len(slate) != 1 else ''} tonight"),
+        (len(allb), "props tracked"),
+        (slate_odds["bookmaker"].nunique(), "sportsbooks"),
+        (slate_odds["snapshot_time"].nunique(), "snapshot(s) so far"),
+        (win_rate, "model win rate (ledger)"),
+    ])
 
     section("Tonight's games")
     if slate_game_odds.empty:
@@ -1503,6 +1513,23 @@ def cached_calibration():
     calibration.MIN_DECIDED_FOR_CALIBRATION real decided predictions - see that
     module's docstring."""
     return calibration.current_calibration()
+
+
+@st.cache_data(ttl=60)
+def cached_ledger_decided():
+    """Every decided (WON/LOST) row from the locked prediction ledger, oldest first -
+    the same join page_model_performance() does, pulled out so Tonight's hero strip
+    can show a live win rate without duplicating that query inline. Real data only:
+    empty until predictions exist and some have graded, never a placeholder number."""
+    with db.connect() as conn:
+        preds = pd.read_sql("SELECT * FROM predictions", conn)
+        results = pd.read_sql("SELECT * FROM prediction_results", conn)
+    if preds.empty or results.empty:
+        return pd.DataFrame()
+    merged = preds.merge(results, left_on="id", right_on="prediction_id", how="inner",
+                         suffixes=("", "_r"))
+    decided = merged[merged["result"].isin(["WON", "LOST"])].copy()
+    return decided.sort_values("graded_at")
 
 
 @st.cache_data(ttl=21600)
@@ -4086,6 +4113,28 @@ def page_model_performance():
              "sample to draw any real conclusion from a win rate, by-market breakdown, "
              "or calibration check. Shown below for transparency and to verify the "
              "pipeline works, not as evidence the model is good or bad yet.")
+
+    section("Win rate over time")
+    over_time = decided.sort_values("graded_at").copy()
+    over_time["n"] = range(1, len(over_time) + 1)
+    over_time["Cumulative win rate"] = (over_time["result"] == "WON").expanding().mean().to_numpy() * 100
+    over_time["Graded"] = pd.to_datetime(over_time["graded_at"])
+    line = alt.Chart(over_time).mark_line(color=BLUE, strokeWidth=2.5,
+                                          point=alt.OverlayMarkDef(color=BLUE, size=26)).encode(
+        x=alt.X("n:Q", title="Decided predictions, in the order graded"),
+        y=alt.Y("Cumulative win rate:Q", title="Cumulative win rate (%)",
+               scale=alt.Scale(domain=[0, 100])),
+        tooltip=[alt.Tooltip("n:Q", title="#"),
+                alt.Tooltip("Cumulative win rate:Q", format=".1f"),
+                alt.Tooltip("Graded:T")])
+    area = line.mark_area(opacity=.12, color=BLUE)
+    half = alt.Chart(pd.DataFrame({"y": [50]})).mark_rule(
+        color=AMBER, strokeWidth=2, strokeDash=[5, 4]).encode(y="y:Q")
+    altair_show(chart_style((area + line + half).properties(height=280)))
+    hint("The running win rate as each prediction gets decided, in the order it was "
+         "graded - not smoothed, not cherry-picked. Early swings are normal with a "
+         "small sample; what matters is where this settles as more predictions get "
+         "decided. The dashed gold line marks 50% (coin-flip), not a target.")
 
     section("Performance by market")
     by_market = decided.groupby("market").agg(
