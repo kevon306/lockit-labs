@@ -1064,7 +1064,7 @@ def page_pick_detail():
                     y=alt.Y("Probability:Q", title="Chance of going over (%)", scale=alt.Scale(domain=[0, 100])),
                     color=alt.condition("datum.is_this_line", alt.value(BLUE), alt.value(PANEL2)))
                 labels = bars.mark_text(dy=-8, color=TEXT).encode(text=alt.Text("Probability:Q", format=".0f"))
-                st.altair_chart(chart_style(bars + labels), use_container_width=True)
+                st.altair_chart(chart_style(bars + labels), width="stretch")
                 hint("Read directly off the same projected distribution as the model % above - "
                      "not a separate projection, and not tied to real alternate-line odds.")
 
@@ -2789,7 +2789,7 @@ def page_game_lines():
                     })
                 if cmp_rows:
                     with st.expander(f"If {who} {verb} out for {team_label}: real team average"):
-                        st.dataframe(pd.DataFrame(cmp_rows), hide_index=True, use_container_width=True)
+                        st.dataframe(pd.DataFrame(cmp_rows), hide_index=True, width="stretch")
                         hint(f"{team_label}'s own real average this season and last, split by "
                              f"whether {who} {was_were} actually active that game - a direct comparison "
                              "of real games, not run through the team model above (same reason "
@@ -3493,7 +3493,7 @@ def page_players():
                                 day=pd.to_datetime(games["game_date"]).dt.strftime("%b %-d") + " "
                                 + games["opponent"])
             chart = labeled_bar_chart(data, "value", stat_label, line)
-            st.altair_chart(chart_style(chart.properties(height=320)), use_container_width=True)
+            st.altair_chart(chart_style(chart.properties(height=320)), width="stretch")
             if is_binary:
                 hint(f"1 means he got the {stat_label.lower()} that game, 0 means he didn't. The "
                      "gold line is his own hit rate in this split, not a LOCK IT prediction. Small "
@@ -3583,7 +3583,7 @@ def page_players():
             sdata = games.assign(day=pd.to_datetime(games["game_date"]).dt.strftime("%b %-d") + " "
                                  + games["opponent"], sval=made)
             schart = labeled_bar_chart(sdata, "sval", sup_choice, line=None, color=BLUE)
-            st.altair_chart(chart_style(schart.properties(height=200)), use_container_width=True)
+            st.altair_chart(chart_style(schart.properties(height=200)), width="stretch")
 
     with tab_matchup:
         pos_choice = st.pills("Position", ["All", "G", "F", "C"], default="All",
@@ -3992,7 +3992,7 @@ def page_results():
             x=alt.X("Miss:Q", bin=alt.Bin(step=2), title="Actual minus line"),
             y=alt.Y("count():Q", title=None))
         zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color=AMBER, strokeWidth=3).encode(x="x:Q")
-        st.altair_chart(chart_style((hist + zero).properties(height=300)), use_container_width=True)
+        st.altair_chart(chart_style((hist + zero).properties(height=300)), width="stretch")
         hint("Fair lines miss high and low about equally, so the bars should balance around "
              "the gold zero line.")
 
@@ -4406,7 +4406,7 @@ def page_bets():
         run = alt.Chart(daily).mark_line(point=True, color=BLUE, strokeWidth=2.5).encode(
             x=alt.X("label:O", sort=order), y="running:Q")
         area = bars + run
-        st.altair_chart(chart_style(area.properties(height=220)), use_container_width=True)
+        st.altair_chart(chart_style(area.properties(height=220)), width="stretch")
 
     by_mkt = slip.by_market(legs, set(view["id"])) if not legs.empty else pd.DataFrame()
     if not by_mkt.empty:

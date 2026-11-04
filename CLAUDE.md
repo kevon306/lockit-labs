@@ -23,7 +23,8 @@ finish and test each step before starting the next, unless the user says otherwi
   snapshot job every 15 min (closing lines ~10-20 min before tip). Logs in `data/logs/`.
 - `slip.py`: research slip (data/slip.json) and entry tracker (records entries placed elsewhere).
 - `lockit_app.py`: Streamlit dashboard, `streamlit run lockit_app.py`. Theme in `.streamlit/config.toml`.
-  Streamlit 1.50: `st.altair_chart` takes `use_container_width`, not `width`.
+  Use `width="stretch"`, not `use_container_width=True` - deprecated, and removed outright on
+  Streamlit Cloud's newer version (confirmed: it blanked the whole app on 2026-11-04).
 
 ## Rules
 - Never fabricate stats, odds, probabilities, or results. Label market-implied numbers as the market's,
