@@ -901,7 +901,7 @@ def page_tonight():
         else:
             picks["ev"] = picks.apply(lambda r: expected_value(r["model_p"], r["price"]), axis=1)
             in_range = picks[picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
-            qualifying = in_range[(in_range["edge"].abs() >= EDGE_THRESHOLD)
+            qualifying = in_range[(in_range["edge"] >= EDGE_THRESHOLD)
                                   & (in_range["confidence"] != "Low")]
             top = qualifying.reindex(qualifying["ev"].sort_values(ascending=False).index).head(3)
             if top.empty:
@@ -2428,9 +2428,20 @@ def qualifying_and_caution(view):
     shown separately for a human look - see page_top_picks()'s 'Check before trusting'
     section for why). Shared by the page's own display (market-filtered) and
     log_todays_qualifying_picks() (every market, unfiltered - see its docstring for
-    why that distinction matters for the locked ledger)."""
+    why that distinction matters for the locked ledger).
+
+    The lower bound is edge >= EDGE_THRESHOLD, not abs(edge) - side already picks the
+    direction the model favors (compute_picks/compute_game_picks), so by the time this
+    runs, edge should already be positive for that side. It can still go negative here
+    because calibration.py's ledger-learned correction is applied to model_p *after*
+    side was chosen from the raw probability - a real case where the corrected model
+    now disagrees with its own pre-calibration pick, not a data error. abs() on this
+    bound was treating a -12 edge (the model reversing itself) the same as a real +12
+    edge and shipping it as a qualifying pick - confirmed as a real production bug,
+    not hypothetical. Only MAX_PLAUSIBLE_EDGE's upper bound stays symmetric: an
+    implausibly large gap is suspect in either direction."""
     in_range = view[view["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
-    qualified = in_range[(in_range["edge"].abs() >= EDGE_THRESHOLD) & (in_range["confidence"] != "Low")]
+    qualified = in_range[(in_range["edge"] >= EDGE_THRESHOLD) & (in_range["confidence"] != "Low")]
     caution = qualified[qualified["kind"] == "game"]
     caution = caution.reindex(caution["ev"].sort_values(ascending=False).index)
     qualified = qualified[qualified["kind"] == "player"]
@@ -2600,7 +2611,7 @@ def page_top_picks():
          "several props, one, or none at all - this never forces a pick to fill a "
          "slot, same reasoning as the rest of this page.")
     team_board = picks[(picks["kind"] == "player")
-                       & (picks["edge"].abs() >= TEAM_BOARD_EDGE_THRESHOLD)
+                       & (picks["edge"] >= TEAM_BOARD_EDGE_THRESHOLD)
                        & (picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE)
                        & (picks["confidence"] != "Low")]
     if team_board.empty:
