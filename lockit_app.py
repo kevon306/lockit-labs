@@ -5,6 +5,7 @@ Run it with:   streamlit run lockit_app.py
 Press Control+C in the terminal to stop it.
 """
 
+import inspect
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -665,6 +666,23 @@ def chart_style(chart):
             .configure(background="transparent"))
 
 
+# st.altair_chart() only gained a `width=` kwarg in a newer Streamlit than this app
+# pins locally (confirmed: 1.50.0's st.altair_chart has no `width` param at all,
+# use_container_width only - unlike st.dataframe/st.button, which already have both
+# here). Streamlit Cloud rebuilds from this repo's unpinned requirements.txt and
+# does not respect any pin file (confirmed via Streamlit's own docs/forum - Python
+# version can only be set in the dashboard's Advanced Settings, not a repo file), so
+# it can install a different, newer Streamlit on its own schedule. Checking the
+# live signature once and calling with whichever kwarg this exact install actually
+# supports is the only way to stay correct on both without chasing version numbers.
+_ALTAIR_WIDTH_KW = ({"width": "stretch"} if "width" in inspect.signature(st.altair_chart).parameters
+                    else {"use_container_width": True})
+
+
+def altair_show(chart):
+    return st.altair_chart(chart, **_ALTAIR_WIDTH_KW)
+
+
 def topbar(odds, here="tonight"):
     fresh = f"Odds updated {ago(odds['snapshot_time'].max())}" if not odds.empty else "No odds yet"
     n = len(slip.load())
@@ -1064,7 +1082,7 @@ def page_pick_detail():
                     y=alt.Y("Probability:Q", title="Chance of going over (%)", scale=alt.Scale(domain=[0, 100])),
                     color=alt.condition("datum.is_this_line", alt.value(BLUE), alt.value(PANEL2)))
                 labels = bars.mark_text(dy=-8, color=TEXT).encode(text=alt.Text("Probability:Q", format=".0f"))
-                st.altair_chart(chart_style(bars + labels), width="stretch")
+                altair_show(chart_style(bars + labels))
                 hint("Read directly off the same projected distribution as the model % above - "
                      "not a separate projection, and not tied to real alternate-line odds.")
 
@@ -3493,7 +3511,7 @@ def page_players():
                                 day=pd.to_datetime(games["game_date"]).dt.strftime("%b %-d") + " "
                                 + games["opponent"])
             chart = labeled_bar_chart(data, "value", stat_label, line)
-            st.altair_chart(chart_style(chart.properties(height=320)), width="stretch")
+            altair_show(chart_style(chart.properties(height=320)))
             if is_binary:
                 hint(f"1 means he got the {stat_label.lower()} that game, 0 means he didn't. The "
                      "gold line is his own hit rate in this split, not a LOCK IT prediction. Small "
@@ -3583,7 +3601,7 @@ def page_players():
             sdata = games.assign(day=pd.to_datetime(games["game_date"]).dt.strftime("%b %-d") + " "
                                  + games["opponent"], sval=made)
             schart = labeled_bar_chart(sdata, "sval", sup_choice, line=None, color=BLUE)
-            st.altair_chart(chart_style(schart.properties(height=200)), width="stretch")
+            altair_show(chart_style(schart.properties(height=200)))
 
     with tab_matchup:
         pos_choice = st.pills("Position", ["All", "G", "F", "C"], default="All",
@@ -3992,7 +4010,7 @@ def page_results():
             x=alt.X("Miss:Q", bin=alt.Bin(step=2), title="Actual minus line"),
             y=alt.Y("count():Q", title=None))
         zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color=AMBER, strokeWidth=3).encode(x="x:Q")
-        st.altair_chart(chart_style((hist + zero).properties(height=300)), width="stretch")
+        altair_show(chart_style((hist + zero).properties(height=300)))
         hint("Fair lines miss high and low about equally, so the bars should balance around "
              "the gold zero line.")
 
@@ -4406,7 +4424,7 @@ def page_bets():
         run = alt.Chart(daily).mark_line(point=True, color=BLUE, strokeWidth=2.5).encode(
             x=alt.X("label:O", sort=order), y="running:Q")
         area = bars + run
-        st.altair_chart(chart_style(area.properties(height=220)), width="stretch")
+        altair_show(chart_style(area.properties(height=220)))
 
     by_mkt = slip.by_market(legs, set(view["id"])) if not legs.empty else pd.DataFrame()
     if not by_mkt.empty:
