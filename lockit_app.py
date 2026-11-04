@@ -2299,7 +2299,7 @@ def line_adjuster(r, label):
             st.caption("Not enough history for a projection at this number.")
             return
         hyp_model_p = over_p * 100 if r.side == "Over" else 100 - over_p * 100
-        hyp_model_p = float(calibration.apply(pd.Series([hyp_model_p]), cached_calibration()["params"]).iloc[0])
+        hyp_model_p = float(calibration.apply(np.array([hyp_model_p]), cached_calibration()["params"])[0])
         # Signed, not abs(): at the real line, model_p > market_p for r.side by
         # construction (compute_picks only ever picks the side that's ahead) - but at a
         # hypothetical line that's no longer guaranteed. A negative edge here is a real,
