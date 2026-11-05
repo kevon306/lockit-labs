@@ -1217,6 +1217,25 @@ def recommendation_tier(conviction, side):
     return f"{strength} {str(side).upper()}"
 
 
+def odds_today(odds):
+    """odds_snapshots rows for a game actually happening today (ET) - literal today
+    only, no falling back to the most recent date with data (see build_roster()'s
+    docstring just below for why a stale snapshot must never pass as tonight's).
+
+    Pulled out so every "what's actually live right now" lookup filters on the
+    exact same definition - the Players page's H2H default-opponent block, its
+    "Add player leg" flow, player_leg_options(), and alt_line_rows() all now start
+    from this. Before this (confirmed live, 2026-11-05), each of those separately
+    took whichever snapshot was most recently SAVED for a player, with no check
+    that the game it was for was actually today - so a player with no real game
+    tonight but an old saved snapshot (Nikola Jokic, last saved against a past
+    Toronto game, with neither Denver nor Toronto playing tonight) showed up as
+    having a real, current game and active odds."""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    return odds[pd.to_datetime(odds["commence_time"], utc=True)
+               .dt.tz_convert(ET).dt.strftime("%Y-%m-%d") == today]
+
+
 def build_roster(box, odds):
     """player_id/team/opponent for everyone with an active line on tonight's board, built
     the same way the H2H opponent default is on the Players page.
@@ -3089,7 +3108,8 @@ def page_parlay():
                         games_all_p = box[box["player_name"] == name].sort_values("game_date")
                         player_id = games_all_p["player_id"].iloc[-1]
                         team = games_all_p["team"].iloc[-1]
-                        mine_ev = odds[odds["player"].map(box_scores.normalize_name) == key]
+                        mine_ev = odds_today(odds)
+                        mine_ev = mine_ev[mine_ev["player"].map(box_scores.normalize_name) == key]
                         opponent, is_home = None, None
                         if not mine_ev.empty:
                             latest_ev = mine_ev[mine_ev["snapshot_time"] == mine_ev["snapshot_time"].max()]
@@ -3485,9 +3505,13 @@ def page_players():
                  f"`python3 box_scores.py {command}`")
 
     # Default the H2H opponent to tonight's game if this player has one tracked.
+    # odds_today() keeps this - and everything below that reuses mine_ev, like
+    # "Tonight's props" - from showing a stale old snapshot as tonight's game;
+    # see its docstring for why and what this looked like before the fix.
     default_opp, tip_today = None, None
     key = box_scores.normalize_name(name)
-    mine_ev = odds[odds["player"].map(box_scores.normalize_name) == key]
+    mine_ev = odds_today(odds)
+    mine_ev = mine_ev[mine_ev["player"].map(box_scores.normalize_name) == key]
     if not mine_ev.empty:
         latest_ev = mine_ev[mine_ev["snapshot_time"] == mine_ev["snapshot_time"].max()]
         home_abbr = short(latest_ev["home_team"].iloc[0])
@@ -3621,8 +3645,9 @@ def page_players():
 
     default_line, line_is_market = None, False
     if stat_label in MARKET_FOR_STAT:
-        mine = odds[(odds["player"].map(box_scores.normalize_name) == key)
-                    & (odds["market"] == MARKET_FOR_STAT[stat_label])]
+        mine = odds_today(odds)
+        mine = mine[(mine["player"].map(box_scores.normalize_name) == key)
+                    & (mine["market"] == MARKET_FOR_STAT[stat_label])]
         if not mine.empty:
             newest = mine[mine["snapshot_time"] == mine["snapshot_time"].max()]
             default_line = float(newest["line"].mode().iloc[0])
@@ -4071,6 +4096,7 @@ def player_leg_options(odds, key, stat_label):
     lines (see pull_props.py's ALT_MARKETS comment) - so this never offers a side that
     isn't real. Returns {line: {"Over": (price, book) or None, "Under": (...) or None}}."""
     options = {}
+    odds = odds_today(odds)
     if stat_label in MARKET_FOR_STAT:
         mine = odds[(odds["player"].map(box_scores.normalize_name) == key)
                     & (odds["market"] == MARKET_FOR_STAT[stat_label])]
@@ -4101,8 +4127,9 @@ def alt_line_rows(odds, player_key, market):
     """
     if not market:
         return pd.DataFrame()
-    mine = odds[(odds["player"].map(box_scores.normalize_name) == player_key)
-                & (odds["market"] == market) & (odds["side"] == "Over")]
+    mine = odds_today(odds)
+    mine = mine[(mine["player"].map(box_scores.normalize_name) == player_key)
+                & (mine["market"] == market) & (mine["side"] == "Over")]
     if mine.empty:
         return pd.DataFrame()
     newest = mine[mine["snapshot_time"] == mine["snapshot_time"].max()]
