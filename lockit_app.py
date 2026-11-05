@@ -1188,13 +1188,14 @@ CONVICTION_THRESHOLD = 8   # minimum points the model's own probability must sit
                            # probability is, not on how far it sits from the market's.
 STRONG_CONVICTION_THRESHOLD = 14  # the "STRONG LEAN" bar in recommendation_tier()
 TOP_PICKS_MAX = 5
-TEAM_BOARD_CONVICTION_THRESHOLD = 10  # the stricter bar for the "every team, every market"
-                                      # board below Top Picks' own ranked list - explicitly
-                                      # requested higher than CONVICTION_THRESHOLD, and
-                                      # unlike the ranked list above, not capped to a fixed
-                                      # count: every player prop across every market that
-                                      # clears it for a team playing tonight is shown, not
-                                      # just the top few.
+TEAM_BOARD_CONVICTION_THRESHOLD = 8  # the bar for the "every team, every market" board
+                                     # below Top Picks' own ranked list - lowered to match
+                                     # CONVICTION_THRESHOLD on 2026-11-05 (was 10, stricter)
+                                     # since on thin slates it was leaving teams with zero
+                                     # or one qualifying player shown. Unlike the ranked list
+                                     # above, not capped to a fixed count: every player prop
+                                     # across every market that clears it for a team playing
+                                     # tonight is shown, not just the top few.
 
 
 def recommendation_tier(conviction, side):
@@ -2667,8 +2668,8 @@ def page_top_picks():
 
     section("Strong picks, every team")
     hint(f"Every team playing tonight with at least one player prop clearing "
-         f"{TEAM_BOARD_CONVICTION_THRESHOLD} points of conviction (stricter than the "
-         f"{CONVICTION_THRESHOLD}-point bar above) at Medium confidence or better, "
+         f"{TEAM_BOARD_CONVICTION_THRESHOLD} points of conviction (same bar as above) "
+         "at Medium confidence or better, "
          "across every market the model projects - points, rebounds, assists, threes, "
          "steals, blocks, turnovers, and the four combo stats (Pts+Reb+Ast, Pts+Reb, "
          "Pts+Ast, Reb+Ast). Not capped to a fixed number per team or overall: a team "
