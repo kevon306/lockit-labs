@@ -1634,10 +1634,17 @@ def cached_player_projections(box, roster, players):
     return compute_player_projections(box, roster, players)
 
 
-@st.cache_data(ttl=60)
 def compute_picks(box, odds, player_bt=None):
     """Every active prop line with a model projection, with the model's probability,
-    the market's, and the gap between them. Not yet filtered to "qualifying" picks."""
+    the market's, and the gap between them. Not yet filtered to "qualifying" picks.
+
+    Deliberately NOT @st.cache_data - see cached_player_backtest's docstring on why
+    hashing `box`/`odds` as a Streamlit cache key is itself an expensive, Cloud-
+    specific cost. This function's own work (the merge against proj below, then a
+    per-market fit_dist/p_over loop over the active lines) isn't backed by any other
+    cache the way the four functions above are, but it's cheap - well under a second
+    locally even on ~170 rows - so repeating it on every rerun costs far less than
+    what Streamlit's own hashing was costing to avoid repeating it."""
     roster, slate, slate_odds = build_roster(box, odds)
     if roster.empty or slate.empty:
         return pd.DataFrame(), None
