@@ -3604,7 +3604,17 @@ def page_players():
     c3, c4 = st.columns([1.6, 3.6])
     opponent = c3.selectbox(
         "Opponent (for H2H)", ALL_TEAM_ABBRS,
-        index=ALL_TEAM_ABBRS.index(default_opp) if default_opp in ALL_TEAM_ABBRS else 0)
+        index=ALL_TEAM_ABBRS.index(default_opp) if default_opp in ALL_TEAM_ABBRS else 0,
+        # Keyed per player so switching players resets this to THAT player's own
+        # real tonight opponent (the `index=` above), instead of Streamlit keeping
+        # whichever team the previous player's H2H picker was left on - confirmed
+        # live (2026-11-05): without this, switching from one player to another
+        # left the picker on the first player's matchup, which also meant
+        # player_model_dist()'s precomputed-cache shortcut above never matched
+        # (it only fires when this equals the player's real opponent) for any
+        # player after the first one viewed in a session, silently defeating that
+        # whole fix for the normal "search several players" flow.
+        key=f"h2h_opponent_{player_id}")
     split = c4.segmented_control("Split", SPLITS, default="L10", label_visibility="collapsed") or "L10"
 
     games = split_games(games_all, split, opponent)
