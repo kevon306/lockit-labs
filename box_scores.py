@@ -103,6 +103,38 @@ def normalize_name(name):
     return " ".join(name.split())
 
 
+def resolve_player_odds(odds, box):
+    """Player-prop odds rows with player_id/game_date columns added, matched the same
+    way lockit_app.py's build_roster() matches a player name to their most recent
+    box-score record. Lives here (not in lockit_app.py, where it used to be) so
+    auto.py's background backtest precompute can call the exact same matching logic
+    the live dashboard uses, without importing the Streamlit app itself."""
+    if odds.empty or box.empty:
+        return odds.iloc[0:0]
+    o = odds.copy()
+    o["key"] = o["player"].map(normalize_name)
+    box_keyed = box.assign(key=box["player_name"].map(normalize_name))
+    last_id = box_keyed.sort_values("game_date").groupby("key")["player_id"].last()
+    o["player_id"] = o["key"].map(last_id)
+    o["game_date"] = pd.to_datetime(o["commence_time"], utc=True).dt.tz_convert(ET).dt.strftime("%Y-%m-%d")
+    return o.dropna(subset=["player_id"])
+
+
+def resolve_game_odds_teams(game_odds):
+    """game_odds snapshot rows with home_abbr/away_abbr/game_date columns added. Lives
+    here (not in team_model.py, so that module doesn't need to duplicate team-name
+    abbreviation lookups) and here rather than lockit_app.py (where it used to be) for
+    the same reason as resolve_player_odds above - auto.py needs it too."""
+    if game_odds.empty:
+        return game_odds
+    abbrs = team_abbreviations()
+    g = game_odds.copy()
+    g["home_abbr"] = g["home_team"].map(lambda t: abbrs.get(t, t[:3].upper()))
+    g["away_abbr"] = g["away_team"].map(lambda t: abbrs.get(t, t[:3].upper()))
+    g["game_date"] = pd.to_datetime(g["commence_time"], utc=True).dt.tz_convert(ET).dt.strftime("%Y-%m-%d")
+    return g
+
+
 def to_minutes(value):
     """Minutes can come as 34, 34.0, or '34:12'."""
     if value is None or (isinstance(value, float) and pd.isna(value)):

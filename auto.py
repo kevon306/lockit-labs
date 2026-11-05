@@ -120,10 +120,42 @@ def morning():
         log(f"Graded predictions: {summary}")
     except Exception as e:  # never take the morning job down over a grading bug
         log(f"Prediction grading failed (non-fatal): {e}")
+    try:
+        precompute_model_backtests()
+    except Exception as e:  # never take the morning job down over this - the
+                            # dashboard falls back to computing it live if missing
+        log(f"Model backtest precompute failed (non-fatal): {e}")
     ok = log_todays_picks()  # also runs after every snapshots() pull - here too as a
                              # same-day safety net, since log_predictions() dedupes
     log("Morning job done")
     return ok
+
+
+def precompute_model_backtests():
+    """Computes the player-prop and team closing-line backtests - each a full walk-
+    forward recompute over every saved box score, several seconds to tens of seconds
+    - and stores them in model_cache (see db.py) so the live dashboard reads a stored
+    result instead of recomputing on every page load (see lockit_app.py's
+    cached_player_backtest/cached_game_backtest). Run right here, right after grading
+    above: a settled game's closing-line record only changes once a day, the moment
+    it gets graded - there's nothing to gain from recomputing this more often.
+
+    Imports lockit_app lazily, same reasoning as log_todays_picks() below - that file
+    is written to run as a Streamlit script, and ai_tools.py already established the
+    pattern of importing it purely for its compute functions."""
+    import lockit_app
+    box = lockit_app.load("box_scores")
+    if box.empty:
+        log("Skipping model backtest precompute - no box scores saved yet")
+        return
+    # compute_player_backtest/compute_game_backtest, not the cached_* wrappers - those
+    # would just hand back whatever's already stored in model_cache (yesterday's
+    # result), never actually recomputing it.
+    player_bt = lockit_app.compute_player_backtest(box, lockit_app.load("odds_snapshots"))
+    db.save_model_cache("player_backtest", player_bt)
+    game_bt = lockit_app.compute_game_backtest(box, lockit_app.load("game_odds_snapshots"))
+    db.save_model_cache("game_backtest", game_bt)
+    log("Precomputed player and team model backtests")
 
 
 def snapshots():

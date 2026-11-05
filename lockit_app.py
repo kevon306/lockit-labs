@@ -1251,17 +1251,12 @@ def build_roster(box, odds):
     return roster[["key", "player_id", "player_name", "team", "opponent", "is_home"]], slate, slate_odds
 
 
-def resolve_game_odds_teams(game_odds):
-    """game_odds snapshot rows with home_abbr/away_abbr/game_date columns added - kept
-    here (not in team_model.py) so that module doesn't need to duplicate TEAM_SHORT or
-    timezone handling just to run its own backtest."""
-    if game_odds.empty:
-        return game_odds
-    g = game_odds.copy()
-    g["home_abbr"] = g["home_team"].map(short)
-    g["away_abbr"] = g["away_team"].map(short)
-    g["game_date"] = pd.to_datetime(g["commence_time"], utc=True).dt.tz_convert(ET).dt.strftime("%Y-%m-%d")
-    return g
+# resolve_game_odds_teams/resolve_player_odds moved to box_scores.py so auto.py's
+# background backtest precompute (see cached_player_backtest/cached_game_backtest
+# below) can call the exact same matching logic without importing this whole
+# Streamlit app. Kept as names here too - ai_tools.py's AI Analyst tools already call
+# app.resolve_player_odds/app.resolve_game_odds_teams (app == this module).
+resolve_game_odds_teams = box_scores.resolve_game_odds_teams
 
 
 def latest_injury_reports(injuries):
@@ -1289,18 +1284,7 @@ def player_injury_status(injuries, player_name):
     return mine.iloc[0].to_dict()
 
 
-def resolve_player_odds(odds, box):
-    """Player-prop odds rows with player_id/game_date columns added, matched the same
-    way build_roster() matches a player name to their most recent box-score record."""
-    if odds.empty or box.empty:
-        return odds.iloc[0:0]
-    o = odds.copy()
-    o["key"] = o["player"].map(box_scores.normalize_name)
-    box_keyed = box.assign(key=box["player_name"].map(box_scores.normalize_name))
-    last_id = box_keyed.sort_values("game_date").groupby("key")["player_id"].last()
-    o["player_id"] = o["key"].map(last_id)
-    o["game_date"] = pd.to_datetime(o["commence_time"], utc=True).dt.tz_convert(ET).dt.strftime("%Y-%m-%d")
-    return o.dropna(subset=["player_id"])
+resolve_player_odds = box_scores.resolve_player_odds
 
 
 GLOSSARY = {
@@ -1497,14 +1481,11 @@ def game_confidence(games_before, market, backtest):
     return "High" if (games_before >= 30 and passed_backtest(market, backtest)) else "Medium"
 
 
-@st.cache_data(ttl=60)
-def cached_player_backtest(box, odds):
-    """Cached wrapper around model.closing_line_log_loss() - a full walk-forward
-    recompute over every saved box score (~5-7s), now needed on both the Top Picks
-    and Players pages. Streamlit reruns the whole script on every widget interaction,
-    so without caching this, every single click anywhere on either page would pay
-    this cost again - the ttl matches load()'s, so it never serves odds staler than
-    what's already on screen.
+def compute_player_backtest(box, odds):
+    """The actual, slow computation behind cached_player_backtest below - pulled out
+    on its own so auto.py's morning job (see precompute_model_backtests()) can call
+    it directly to force a fresh result, without going through the DB-cache check
+    that would otherwise just hand back yesterday's stored answer.
 
     Fits and passes the tail calibration correction through, so the beats_market
     check this feeds (confidence_label's real gate, now the only gate - see model.py)
@@ -1519,8 +1500,38 @@ def cached_player_backtest(box, odds):
 
 
 @st.cache_data(ttl=60)
-def cached_game_backtest(box, game_odds):
+def cached_player_backtest(box, odds):
+    """Wrapper around compute_player_backtest() - a full walk-forward recompute over
+    every saved box score, needed on both the Top Picks and Players pages.
+
+    Reads auto.py's morning job's precomputed result from model_cache (see db.py) -
+    a cheap database read - instead of recomputing live, since that job already
+    reruns this every day right after new games are graded (the only time a settled
+    game's closing-line record actually changes). Only falls back to computing it
+    live here, in the request path, if that hasn't happened yet (e.g. before the
+    morning job's first run on a brand new setup) - the original slow path, kept as
+    a safety net, not removed. This wrapper's own ttl=60 just controls how often it
+    re-reads that row, not how often the expensive model itself re-runs."""
+    _, cached = db.load_model_cache("player_backtest")
+    if cached is not None:
+        return cached
+    return compute_player_backtest(box, odds)
+
+
+def compute_game_backtest(box, game_odds):
+    """The actual, slow computation behind cached_game_backtest below - see
+    compute_player_backtest's docstring for why it's pulled out on its own."""
     return team_model.closing_line_log_loss(box, resolve_game_odds_teams(game_odds))
+
+
+@st.cache_data(ttl=60)
+def cached_game_backtest(box, game_odds):
+    """Same precompute-first pattern as cached_player_backtest above - see its
+    docstring for why."""
+    _, cached = db.load_model_cache("game_backtest")
+    if cached is not None:
+        return cached
+    return compute_game_backtest(box, game_odds)
 
 
 @st.cache_data(ttl=60)
@@ -2528,7 +2539,16 @@ def log_predictions(savable):
                  r.model_p / 100, inputs))
             if cur.fetchone() is not None:
                 actually_inserted += 1
-    st.cache_data.clear()
+    # Only clear the caches that actually read the predictions/prediction_results
+    # tables this just wrote to - NOT st.cache_data.clear() (used to be), which wiped
+    # every cache in the app, including the full walk-forward backtest
+    # (cached_player_backtest/cached_game_backtest, several seconds to tens of
+    # seconds to recompute) and the 6-hour tail-calibration fit. Since log_predictions
+    # runs on nearly every Top Picks/Tonight page load, that blanket clear forced a
+    # full backtest recompute on almost every page view - the main cause of this app
+    # feeling slow. Neither of those two depends on this table at all.
+    cached_calibration.clear()
+    cached_ledger_decided.clear()
     return actually_inserted
 
 

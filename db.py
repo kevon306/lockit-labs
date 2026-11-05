@@ -441,6 +441,19 @@ CREATE TABLE IF NOT EXISTS automation_state (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+
+-- Precomputed, slow-to-recompute model results (the player-prop and team closing-
+-- line backtests) that used to be recomputed live, in-request, every time Top Picks
+-- or Players loaded - several seconds to tens of seconds, since each one re-runs the
+-- full walk-forward model over every saved box score. auto.py's morning job (see
+-- auto.py) now computes these once a day, right after new games are graded (the only
+-- time their inputs actually change), and the dashboard just reads the stored result
+-- - see lockit_app.py's cached_player_backtest/cached_game_backtest.
+CREATE TABLE IF NOT EXISTS model_cache (
+    key          TEXT PRIMARY KEY,
+    computed_at  TEXT NOT NULL,
+    payload      TEXT NOT NULL   -- JSON
+);
 """
 
 ODDS_COLUMNS = ["snapshot_time", "source", "event_id", "commence_time", "home_team",
@@ -755,6 +768,31 @@ def save_automation_state(state):
             execute_values(conn._conn.cursor(),
                            "INSERT INTO automation_state (key, value) VALUES %s", rows)
         conn.commit()
+
+
+def save_model_cache(key, payload):
+    """Upserts one precomputed, JSON-serializable result under `key` (e.g.
+    "player_backtest", "game_backtest") - see the model_cache table's own comment.
+    Overwrites whatever was there before; there's only ever one current result per
+    key, not a history."""
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO model_cache (key, computed_at, payload) VALUES (?, ?, ?) "
+            "ON CONFLICT (key) DO UPDATE SET computed_at = EXCLUDED.computed_at, "
+            "payload = EXCLUDED.payload",
+            (key, now_utc(), json.dumps(payload)))
+
+
+def load_model_cache(key):
+    """Returns (computed_at, payload) for `key`, or (None, None) if auto.py's morning
+    job hasn't computed it yet - callers must handle that case (e.g. by falling back
+    to computing it live) rather than assuming it's always there."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT computed_at, payload FROM model_cache WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return None, None
+    return row[0], json.loads(row[1])
 
 
 def save_parlay_analysis(row):

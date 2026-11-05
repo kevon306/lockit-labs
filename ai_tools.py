@@ -139,7 +139,11 @@ def player_projection(player_name, stat="points"):
     if name is None:
         return {"error": f"No player matching '{player_name}' found in saved box scores."}
 
-    player_bt = model.closing_line_log_loss(box, app.resolve_player_odds(odds, box))
+    # cached_player_backtest, not a raw model.closing_line_log_loss() call - that
+    # reads auto.py's precomputed result (see db.model_cache) instead of redoing a
+    # full walk-forward recompute on every AI Analyst question, and applies the same
+    # tail-calibration correction Top Picks' own confidence labels are judged against.
+    player_bt = app.cached_player_backtest(box, odds)
     picks, _ = app.compute_picks(box, odds, player_bt)
     if not picks.empty:
         mine = picks[(picks["Player"] == name) & (picks["stat"] == stat)]
@@ -270,8 +274,11 @@ def top_picks(market=None):
     game_odds = _load("game_odds_snapshots")
     if box.empty or odds.empty:
         return {"error": "No box scores or odds saved yet."}
-    player_bt = model.closing_line_log_loss(box, app.resolve_player_odds(odds, box))
-    game_bt = team_model.closing_line_log_loss(box, app.resolve_game_odds_teams(game_odds))
+    # Same reasoning as player_projection() above: the cached/precomputed wrappers,
+    # not raw model/team_model calls, so this doesn't pay for its own full backtest
+    # recompute on every AI Analyst question.
+    player_bt = app.cached_player_backtest(box, odds)
+    game_bt = app.cached_game_backtest(box, game_odds)
     player_picks, _ = app.compute_picks(box, odds, player_bt)
     game_picks, _ = app.compute_game_picks(box, game_odds, game_bt)
     picks = pd.concat([player_picks, game_picks], ignore_index=True) if not game_picks.empty else player_picks
