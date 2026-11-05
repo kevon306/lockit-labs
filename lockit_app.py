@@ -3802,9 +3802,49 @@ def player_model_dist(box, player_id, player_name, team, opponent, model_stat,
     lookup available. is_home enables the home/away adjustment and is left unset (NaN)
     when the matchup isn't tonight's real, scheduled game - e.g. the Players page's
     "what if they played this team" H2H opponent picker, where home/away isn't a real
-    fact about a hypothetical matchup."""
+    fact about a hypothetical matchup.
+
+    Checks auto.py's precomputed model_cache["player_projections"] first (the same
+    cache cached_player_projections() reads) when this player is in it AND the
+    requested opponent matches what that precompute used - tonight's real scheduled
+    matchup. That's a cheap DB read instead of model.project_tonight()'s full
+    walk-forward recompute over the entire box scores table, which this call pays in
+    full on every invocation regardless of roster size (confirmed live, 2026-11-05:
+    ~14.5s locally just for one player, and visibly far worse on Streamlit Cloud's
+    weaker CPU - this call site was never covered by the cached_player_projections
+    fix, since it's called directly here, not through that wrapper, and runs on
+    every single Players-page view). A caller that passed a real is_home must match
+    the cached value too (the "Add player leg" call site below, which always knows
+    tonight's real is_home when it calls this at all); a caller that left is_home
+    unset accepts whichever real is_home the precompute used - once the opponent
+    matches tonight's real scheduled game, that opponent match already means this
+    is that real game, so the cached, home/away-aware number is strictly more
+    correct here than this function's own live-path convention (below) of treating
+    an unset is_home as "unknown, skip the adjustment" - that convention exists for
+    a genuine hypothetical (the H2H picker pointed at a team that ISN'T tonight's
+    opponent), not for this case. Falls back to the live call whenever the opponent
+    doesn't match (a real "what if, different team" H2H lookup), a passed-in
+    is_home disagrees with the cached one, or the player isn't in the precomputed
+    set (not on a team playing tonight, or the morning job hasn't run yet)."""
     if not model_stat:
         return None, None
+    _, cached = db.load_model_cache("player_projections")
+    if cached:
+        cached_df = pd.DataFrame(cached)
+        row = cached_df[cached_df["player_id"] == player_id]
+        if not row.empty:
+            r = row.iloc[0]
+            cached_is_home = r.get("is_home")
+            is_home_matches = (
+                is_home is None
+                or (not pd.isna(cached_is_home) and int(is_home) == int(cached_is_home)))
+            if r["opponent"] == opponent and is_home_matches:
+                if r["games_before"] < model.MIN_HISTORY:
+                    return None, None
+                mh, vh = r[f"{model_stat}_mean_hat"], r[f"{model_stat}_var_hat"]
+                if pd.isna(mh) or mh <= 0:
+                    return None, None
+                return float(mh), float(vh)
     roster_one = pd.DataFrame([{"player_id": player_id, "player_name": player_name,
                                 "team": team, "opponent": opponent,
                                 "is_home": is_home if is_home is not None else np.nan}])

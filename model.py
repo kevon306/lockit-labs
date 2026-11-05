@@ -458,7 +458,7 @@ def project_tonight(box, roster, players=None, usage=False, home_away=True, rest
     combined = pd.concat([box, placeholders], ignore_index=True)
     projected = add_projections(combined, players, usage=usage, home_away=home_away, rest=rest)
     projected = projected[projected["game_id"] == "PROJECTION"]
-    cols = (["player_id", "player_name", "team", "opponent", "games_before"]
+    cols = (["player_id", "player_name", "team", "opponent", "is_home", "games_before"]
             + [f"{s}_mean_hat" for s in STATS] + [f"{s}_var_hat" for s in STATS])
     return projected[cols].reset_index(drop=True)
 
