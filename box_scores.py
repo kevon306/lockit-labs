@@ -135,6 +135,45 @@ def resolve_game_odds_teams(game_odds):
     return g
 
 
+def team_roster_tonight(box, matchups):
+    """Every player currently on one of tonight's teams - built from each player's
+    own most recent box-score row, NOT filtered to who a sportsbook has posted a
+    betting line for yet (that narrower, odds-driven set is lockit_app.py's own
+    build_roster()). Lets auto.py precompute a projection for everyone who might
+    plausibly get a posted prop later in the day, not just whoever already has one
+    at the moment the morning job runs.
+
+    matchups: an iterable of (home_team, away_team) full-name pairs (e.g. auto.py's
+    tonights_matchups(), from the free /events endpoint - so this doesn't have to
+    wait for any odds to post before it knows who's playing).
+
+    Returns player_id/player_name/team/opponent/is_home - the same shape
+    build_roster() returns, so model.project_tonight() can take either.
+
+    Looks up each player's CURRENT team from his single most recent box-score row
+    (globally, not per team) before placing him in a matchup slot - not "has this
+    team abbr ever appeared in his history." A player traded away from one of
+    tonight's teams earlier this season still has old rows under that team's abbr;
+    without this, he'd wrongly get entered under both his old team and his new one
+    (two projection rows, one with stale opponent/is_home) whenever his old and new
+    teams happen to be tonight's two matchup opponents."""
+    columns = ["player_id", "player_name", "team", "opponent", "is_home"]
+    if box.empty:
+        return pd.DataFrame(columns=columns)
+    abbrs = team_abbreviations()
+    latest = box.sort_values("game_date").drop_duplicates("player_id", keep="last")
+    rows = []
+    for home_team, away_team in matchups:
+        home_abbr = abbrs.get(home_team, home_team[:3].upper())
+        away_abbr = abbrs.get(away_team, away_team[:3].upper())
+        for team, opponent, is_home in ((home_abbr, away_abbr, 1), (away_abbr, home_abbr, 0)):
+            team_latest = latest[latest["team"] == team]
+            for r in team_latest.itertuples():
+                rows.append({"player_id": r.player_id, "player_name": r.player_name,
+                            "team": team, "opponent": opponent, "is_home": is_home})
+    return pd.DataFrame(rows, columns=columns)
+
+
 def to_minutes(value):
     """Minutes can come as 34, 34.0, or '34:12'."""
     if value is None or (isinstance(value, float) and pd.isna(value)):

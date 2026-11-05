@@ -1588,6 +1588,42 @@ def cached_tail_calibration(box, players):
     return compute_tail_calibration(box, players)
 
 
+def compute_player_projections(box, roster, players):
+    """The actual, slow computation behind cached_player_projections below - pulled
+    out so auto.py's morning job can call it directly for the FULL candidate roster
+    (every player on tonight's teams, not just who has a posted line yet - see
+    box_scores.team_roster_tonight()), same reasoning as compute_player_backtest
+    above."""
+    return model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent", "is_home"]],
+                                 players=players)
+
+
+@st.cache_data(ttl=60)
+def cached_player_projections(box, roster, players):
+    """Wrapper around compute_player_projections() - a full walk-forward recompute
+    over every saved box score for every player on tonight's roster, the single
+    biggest remaining cost on a cold cache (~15-17s).
+
+    auto.py's morning job precomputes this for every player on EVERY team playing
+    tonight (not just the odds-driven `roster` passed in here, which only covers
+    whoever a sportsbook has already posted a line for at the moment this runs - see
+    box_scores.team_roster_tonight()) and stores it in model_cache. If that precomputed
+    set covers every player_id this specific call actually needs, this returns the
+    matching rows straight from it - a cheap DB read plus a pandas filter, not a
+    recompute. If even one requested player_id is missing from it (a prop posted for
+    someone after the morning job ran, or the job hasn't run yet today), this falls
+    back to computing the full requested roster live - the original behavior, kept as
+    a safety net so a late-posted prop is never silently missing or stale."""
+    _, cached = db.load_model_cache("player_projections")
+    if cached:
+        cached_df = pd.DataFrame(cached)
+        need = set(roster["player_id"])
+        have = set(cached_df["player_id"])
+        if need.issubset(have):
+            return cached_df[cached_df["player_id"].isin(need)].reset_index(drop=True)
+    return compute_player_projections(box, roster, players)
+
+
 @st.cache_data(ttl=60)
 def compute_picks(box, odds, player_bt=None):
     """Every active prop line with a model projection, with the model's probability,
@@ -1597,8 +1633,7 @@ def compute_picks(box, odds, player_bt=None):
         return pd.DataFrame(), None
 
     players = load("players")
-    proj = model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent", "is_home"]],
-                                 players=players)
+    proj = cached_player_projections(box, roster, players)
     proj = apply_injury_adjustment(proj, roster, box, load("injury_reports"))
     try:
         tail_cal = cached_tail_calibration(box, players)

@@ -167,6 +167,57 @@ def precompute_model_backtests():
     db.save_model_cache("game_backtest", game_bt)
     log("Precomputed tail calibration and player/team model backtests")
 
+    try:
+        precompute_player_projections(lockit_app, box, players)
+    except Exception as e:  # never take the morning job down over this - the
+                            # dashboard falls back to computing it live if missing
+        log(f"Player projection precompute failed (non-fatal): {e}")
+
+
+def tonights_matchups():
+    """Today's games as (home_team, away_team) full-name pairs, ET calendar date -
+    the free /events endpoint (same one news.tonights_teams() and snapshots() above
+    use), so this costs zero odds-API credits. Needed for the player-projection
+    precompute below, which must know each team's opponent even before any odds have
+    posted - build_roster() (lockit_app.py) can't do this since it only knows about
+    players sportsbooks have actually posted lines for yet."""
+    events = pp.call_api(f"/sports/{pp.SPORT}/events", {})
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    pairs = []
+    for e in events:
+        tip = pp.parse_time(e["commence_time"])
+        if tip.astimezone(ET).strftime("%Y-%m-%d") == today:
+            pairs.append((e["home_team"], e["away_team"]))
+    return pairs
+
+
+def precompute_player_projections(lockit_app, box, players):
+    """Projects tonight's model stats (points/rebounds/assists/etc, mean and
+    variance) for every player on every team playing tonight - not just whoever
+    already has a posted betting line at the moment this runs, since that set
+    (lockit_app.build_roster()) only grows as sportsbooks post more props through the
+    day. Stores the result in model_cache so the live dashboard's
+    cached_player_projections() (lockit_app.py) can serve it directly instead of
+    repeating this ~15-17s walk-forward recompute on every cold page load - it only
+    falls back to computing live if a prop posts for someone this didn't cover.
+
+    Split out from precompute_model_backtests() above (rather than folded into it) so
+    a missing/empty matchup list - no games tonight, or the free /events endpoint
+    being briefly down - can log its own clear reason and return, without that
+    showing up as a weirdly-worded "model backtest" failure."""
+    matchups = tonights_matchups()
+    if not matchups:
+        log("Skipping player projection precompute - no games tonight")
+        return
+    roster = box_scores.team_roster_tonight(box, matchups)
+    if roster.empty:
+        log("Skipping player projection precompute - no roster could be built for tonight's teams")
+        return
+    proj = lockit_app.compute_player_projections(box, roster, players)
+    db.save_model_cache("player_projections", proj.to_dict(orient="records"))
+    log(f"Precomputed player projections for {len(proj)} players across "
+        f"{len(matchups)} games")
+
 
 def snapshots():
     """Two kinds of capture windows:

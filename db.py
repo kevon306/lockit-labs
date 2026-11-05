@@ -770,6 +770,17 @@ def save_automation_state(state):
         conn.commit()
 
 
+def _json_default(value):
+    """json.dumps' `default` for save_model_cache - lets a numpy scalar (int64,
+    float64, bool_) that leaked out of a pandas DataFrame serialize as its native
+    Python equivalent, instead of every caller having to sanitize its own payload
+    first. Every numpy scalar type has .item() for exactly this; anything else
+    reaching here really isn't serializable, so it still raises."""
+    if hasattr(value, "item"):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def save_model_cache(key, payload):
     """Upserts one precomputed, JSON-serializable result under `key` (e.g.
     "player_backtest", "game_backtest") - see the model_cache table's own comment.
@@ -780,7 +791,7 @@ def save_model_cache(key, payload):
             "INSERT INTO model_cache (key, computed_at, payload) VALUES (?, ?, ?) "
             "ON CONFLICT (key) DO UPDATE SET computed_at = EXCLUDED.computed_at, "
             "payload = EXCLUDED.payload",
-            (key, now_utc(), json.dumps(payload)))
+            (key, now_utc(), json.dumps(payload, default=_json_default)))
 
 
 def load_model_cache(key):
