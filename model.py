@@ -61,8 +61,6 @@ QUANTILES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 POSITIONS = ("G", "F", "C")
 OPP_SHORT_W, OPP_LONG_W = 10, 30  # games THIS OPPONENT has played, same blend idea as team_model.py's SHORT/LONG_TEAM_W
-OPP_MIN_GAMES = 8                 # opponent-position games needed before any adjustment is trusted at all
-OPP_FACTOR_CLIP = (0.85, 1.15)    # even once trusted, keep the nudge modest - never more than +/-15%
 
 USAGE_SHORT_W, USAGE_LONG_W = 10, 40   # same windows as the rate projection itself
 USAGE_MIN_GAMES = 10                   # games needed before a role-trend adjustment is trusted
@@ -111,11 +109,8 @@ def add_opponent_position_factor(box, players):
     state this way, with no special-casing needed for "a game that hasn't happened yet"
     (same trick project_tonight() already relies on for the per-player rolling stats).
 
-    Shrunk smoothly toward 1.0 (no adjustment) when there are fewer than OPP_MIN_GAMES
-    opponent-position games to measure from, and clipped to OPP_FACTOR_CLIP even once
-    trusted, so a thin or noisy read can only nudge a projection, never swing it - the
-    same conservative instinct as this file's MIN_HISTORY and calibration.py's
-    MIN_DECIDED_FOR_CALIBRATION.
+    Applied at full strength from the first game of data - no minimum-sample shrink
+    toward 1.0 and no cap on how far the factor can move, per request.
     """
     pos_lookup = players.set_index("player_id")["position"].map(_primary_position)
 
@@ -162,13 +157,11 @@ def add_opponent_position_factor(box, players):
     per_game = per_game.merge(league[["pos", "game_date"] + [f"{s}_league_rate" for s in STATS]],
                                on=["pos", "game_date"], how="left")
 
-    trust_w = (per_game["games_before"] / (per_game["games_before"] + OPP_MIN_GAMES)).clip(0, 1)
     factor_cols = []
     for stat in STATS:
         raw = per_game[f"{stat}_opp_rate"] / per_game[f"{stat}_league_rate"].replace(0, np.nan)
-        raw = raw.clip(*OPP_FACTOR_CLIP)
         col = f"{stat}_opp_factor"
-        per_game[col] = (1 + trust_w * (raw.fillna(1.0) - 1)).fillna(1.0)
+        per_game[col] = raw.fillna(1.0)
         factor_cols.append(col)
 
     lookup = per_game[["opponent", "pos", "game_date"] + factor_cols].dropna(subset=["opponent", "pos"])
@@ -593,8 +586,8 @@ def fit_tail_calibration(box, players=None, home_away=True, stats_to_fit=TAIL_CA
     hundreds of thousands of synthetic checks per stat instead, with no API cost and no
     leakage: every projection already only used games strictly before it, and this
     just fits a static correction from that aggregate evidence - the same category of
-    thing HOME_AWAY_CLIP/OPP_FACTOR_CLIP already do, not a change to any single game's
-    own projection.
+    thing HOME_AWAY_CLIP already does, not a change to any single game's own
+    projection.
 
     Returns {stat: {params, n, raw_brier, calibrated_brier}}, same shape as
     calibration.current_calibration(), one entry per stat in stats_to_fit. Applied in

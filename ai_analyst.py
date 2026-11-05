@@ -155,7 +155,7 @@ TOOLS = [
                       "properties": {"team_query": {"type": "string"}},
                       "required": ["team_query"]}},
     {"name": "top_picks",
-     "description": "This app's current Top Picks (positive-edge, EV-ranked player "
+     "description": "This app's current Top Picks (conviction-gated, EV-ranked player "
                     "props and game lines).",
      "input_schema": {"type": "object", "properties": {
          "market": {"type": "string",

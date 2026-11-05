@@ -727,14 +727,16 @@ def build_recommendations(cov, acc, miss, merged):
                         "report can be trusted, not just a cosmetic gap."),
         })
     recs.append({
-        "title": "Persist flagged picks (edge > the plausibility cap), not just qualifying ones",
+        "title": "No safety net left for an implausibly confident pick",
         "confidence": "structural finding, not sample-dependent",
-        "evidence": ("`page_top_picks()` computes `flagged` lines for the current page view only and "
-                    "never logs them (see lockit_app.py's log_todays_qualifying_picks, which only logs "
-                    "qualifying + caution). There is no way to retroactively review 'how often was a "
-                    "flagged pick actually right' - which is exactly the kind of check that would say "
-                    "whether MAX_PLAUSIBLE_EDGE is set well. This will be true for every future report "
-                    "until it's fixed, not just today's."),
+        "evidence": ("The model-vs-market plausibility cap that used to flag and exclude an "
+                    "implausibly large gap (MAX_PLAUSIBLE_EDGE) was removed on request along "
+                    "with 'edge' generally - picks now qualify purely on the model's own "
+                    "conviction (points above a coin flip), never compared to the market. "
+                    "Nothing currently catches the case that cap was built for: the model "
+                    "being very confident for a reason that turns out to be a blind spot "
+                    "(an injury, a minutes restriction, a role change) rather than real "
+                    "insight. Worth deciding whether some other safety net should replace it."),
     })
     if cov["void_with_side"] >= 3:
         recs.append({

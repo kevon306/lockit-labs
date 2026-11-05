@@ -928,14 +928,13 @@ def page_tonight():
                  "box-score history for tonight's players and teams.")
         else:
             picks["ev"] = picks.apply(lambda r: expected_value(r["model_p"], r["price"]), axis=1)
-            in_range = picks[picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
-            qualifying = in_range[(in_range["edge"] >= EDGE_THRESHOLD)
-                                  & (in_range["confidence"] != "Low")]
+            qualifying = picks[(picks["conviction"] >= CONVICTION_THRESHOLD)
+                               & (picks["confidence"] != "Low")]
             top = qualifying.reindex(qualifying["ev"].sort_values(ascending=False).index).head(3)
             if top.empty:
-                hint("Nothing clears the edge bar tonight across player props or game "
-                     "lines. That's a real result, not an error - see Top Picks for the "
-                     "full methodology.")
+                hint("Nothing clears the conviction bar tonight across player props or "
+                     "game lines. That's a real result, not an error - see Top Picks for "
+                     "the full methodology.")
             else:
                 context = pick_render_context(box)
                 for rank, r in enumerate(top.itertuples(), 1):
@@ -943,7 +942,7 @@ def page_tonight():
                 hint(f"Top {len(top)} of {len(qualifying)} qualifying pick(s) tonight, "
                      "across player props and game lines, ranked by expected value at "
                      "the best available price - see Top Picks for the complete, "
-                     "ranked list and how confidence and edge are defined.")
+                     "ranked list and how confidence and conviction are defined.")
 
     section("Browse player props")
     main, side = st.columns([2.6, 1.1], gap="large")
@@ -1054,7 +1053,6 @@ def page_pick_detail():
         bar = lambda pct, c: (f'<div style="height:6px;border-radius:999px;background:{EDGE};'
                               f'margin-top:.35rem;"><div style="height:6px;border-radius:999px;'
                               f'background:{c};width:{max(0, min(pct, 100)):.0f}%;"></div></div>')
-        within = abs(r.edge) <= MAX_PLAUSIBLE_EDGE
         st.markdown(
             '<div class="panel"><div style="display:grid;'
             'grid-template-columns:repeat(3,1fr);gap:1.2rem;">'
@@ -1064,12 +1062,12 @@ def page_pick_detail():
             f'<div><div class="hint" style="margin:0;">Books\' price, cut removed</div>'
             f'<div style="font-family:\'Bricolage Grotesque\',sans-serif;font-size:1.9rem;'
             f'font-weight:700;">{r.market_p:.0f}%</div>{bar(r.market_p, MUTED)}</div>'
-            f'<div><div class="hint" style="margin:0;">Edge</div>'
+            f'<div><div class="hint" style="margin:0;">Conviction</div>'
             f'<div style="font-family:\'Bricolage Grotesque\',sans-serif;font-size:1.9rem;'
-            f'font-weight:700;color:{color};">{r.edge:+.0f} pts</div>'
-            f'<div class="hint" style="margin:.35rem 0 0 0;">'
-            f'{"Within the believable range" if within else f"Flagged - larger than the {MAX_PLAUSIBLE_EDGE}pt bar this app trusts"}'
-            '</div></div></div></div>', unsafe_allow_html=True)
+            f'font-weight:700;color:{color};">{r.conviction:+.0f} pts</div>'
+            f'<div class="hint" style="margin:.35rem 0 0 0;">Points above a coin flip (50%), '
+            f'the model\'s own view only - not compared against the market.</div>'
+            '</div></div></div>', unsafe_allow_html=True)
 
         if not getattr(r, "passed_backtest", True):
             hint(f"Overconfidence guard: this market hasn't yet beaten the no-vig closing "
@@ -1156,49 +1154,41 @@ def page_pick_detail():
 
 # ---------- Top Picks ----------
 
-EDGE_THRESHOLD = 8    # minimum gap, in percentage points, between the model's probability
-                      # and the market's, before a prop is even considered a "pick". Made a
-                      # named constant on purpose, not hardcoded inline, since it's a real
-                      # judgment call that should be easy to find and reconsider later.
-# The model only knows box-score history - it has never seen an injury report, a
-# minutes-restriction note, or a beat-writer tweet. A real sportsbook has. So when the
-# gap between the model and a sharp, liquid market gets implausibly large, the far more
-# likely explanation is "the model is missing real-world context" than "the model found
-# an edge no book noticed". Confirmed on real data: a 47-point "edge" on a low-minutes
-# rookie, and a 27-point one on a star whose market line was well below his box-score
-# average (almost certainly a role/health signal the model can't see). Treating a huge
-# gap as the best pick would reward exactly that blind spot. Flagged, not shown as picks.
-MAX_PLAUSIBLE_EDGE = 20
+CONVICTION_THRESHOLD = 8   # minimum points the model's own probability must sit above a
+                           # coin flip (50%) before a prop is even considered a "pick".
+                           # Named constant on purpose, not hardcoded inline, since it's a
+                           # real judgment call that should be easy to find and reconsider.
+                           # No longer compared against the market at all - see the removal
+                           # of EDGE_THRESHOLD/MAX_PLAUSIBLE_EDGE, per request: picks now
+                           # stand or fall purely on how confident the model's own
+                           # probability is, not on how far it sits from the market's.
+STRONG_CONVICTION_THRESHOLD = 14  # the "STRONG LEAN" bar in recommendation_tier()
 TOP_PICKS_MAX = 5
-TEAM_BOARD_EDGE_THRESHOLD = 10  # the stricter bar for the "every team, every market"
-                                # board below Top Picks' own ranked list - explicitly
-                                # requested higher than EDGE_THRESHOLD, and unlike the
-                                # ranked list above, not capped to a fixed count: every
-                                # player prop across every market that clears it for a
-                                # team playing tonight is shown, not just the top few.
+TEAM_BOARD_CONVICTION_THRESHOLD = 10  # the stricter bar for the "every team, every market"
+                                      # board below Top Picks' own ranked list - explicitly
+                                      # requested higher than CONVICTION_THRESHOLD, and
+                                      # unlike the ranked list above, not capped to a fixed
+                                      # count: every player prop across every market that
+                                      # clears it for a team playing tonight is shown, not
+                                      # just the top few.
 
 
-def recommendation_tier(edge, side):
-    """One standardized 5-level call, used everywhere a pick is shown (player props,
-    spreads, totals, moneylines alike) instead of each page inventing its own wording.
+def recommendation_tier(conviction, side):
+    """One standardized label, used everywhere a pick is shown (player props, spreads,
+    totals, moneylines alike) instead of each page inventing its own wording.
 
-    Reuses the two edge bars already established and backtested elsewhere on this page
-    - EDGE_THRESHOLD (the bar a pick must clear to be shown at all) and the midpoint
-    between it and MAX_PLAUSIBLE_EDGE (the bar above which an edge is flagged as
-    implausible, not ranked as a pick) - rather than inventing new cutoffs. A pick that
-    reaches here has already passed the real price-and-probability math (edge = model's
-    probability minus the market's no-vig probability, which is itself derived from the
-    real posted price) - this function only translates that number into one consistent
-    label, it doesn't add a second opinion.
+    `conviction` is how many points above a coin flip (50%) the model's own probability
+    sits for the side actually picked - always >= 0 by construction, since `side` is
+    already chosen as whichever way the model leans. This function no longer compares
+    the model to the market at all (that comparison, "edge", was removed on request) -
+    it only reads the model's own confidence in itself.
 
     `side` is whatever the pick's own side is - "Over"/"Under" for player props and
     totals, a team name for spreads/moneylines - so the label reads naturally for both:
     "STRONG LEAN OVER" or "STRONG LEAN LOS ANGELES LAKERS"."""
-    strong_bar = (EDGE_THRESHOLD + MAX_PLAUSIBLE_EDGE) / 2
-    e = abs(edge)
-    if e < EDGE_THRESHOLD:
-        return "NO CLEAR EDGE"
-    strength = "STRONG LEAN" if e >= strong_bar else "LEAN"
+    if conviction < CONVICTION_THRESHOLD:
+        return "NO CLEAR LEAN"
+    strength = "STRONG LEAN" if conviction >= STRONG_CONVICTION_THRESHOLD else "LEAN"
     return f"{strength} {str(side).upper()}"
 
 
@@ -1420,16 +1410,17 @@ def assessment_tier(confidence, support, oppose):
                 "at least as many real factors cut against this pick as for it.")
     if confidence == "High" and support >= 2 and oppose == 0:
         return ("Strong supporting matchup",
-                "a backtested edge in this market, plus real basketball factors "
-                "pointing the same way, with nothing real pulling the other way.")
+                "a backtested track record in this market, plus real basketball "
+                "factors pointing the same way, with nothing real pulling the "
+                "other way.")
     if support >= 1:
         return ("Favorable matchup, but meaningful risks",
                 "real factors favor the pick, but at least one real risk (sample "
                 "size, a model blind spot, or an opposing factor) keeps this short "
                 "of a strong case.")
     return ("Mixed matchup",
-            "the edge is real, but no single basketball factor stands out as the "
-            "clear driver either way.")
+            "the model's lean is real, but no single basketball factor stands out "
+            "as the clear driver either way.")
 
 
 def decimal_odds(price):
@@ -1438,9 +1429,10 @@ def decimal_odds(price):
 
 def expected_value(model_p, price):
     """Expected profit per $1 staked at the best available price, using the model's own
-    probability. This is the actual ranking metric for Top Picks, not percentage-point
-    edge: a smaller edge at a much better price can be worth more than a bigger edge at
-    a worse one, since the payout is what money is actually won or lost on."""
+    probability. This is the actual ranking metric for Top Picks, not raw conviction
+    (points above a coin flip): a smaller conviction at a much better price can be
+    worth more than a bigger conviction at a worse one, since the payout is what money
+    is actually won or lost on."""
     if pd.isna(price) or pd.isna(model_p):
         return None
     return model_p / 100 * decimal_odds(price) - 1
@@ -1461,8 +1453,8 @@ def shown_probability(model_p, market_p, passed):
     an overconfidence guard, not a tuning knob: until a market has *shown* (not just
     claimed) that it beats the no-vig closing line, this averages the model's own
     number straight with the market's, 50/50, instead of asserting the model's full
-    confidence. Flat and untuned on purpose - no sliding scale by sample size or edge
-    size, nothing fit to this app's own early picks. The model's raw, unblended number
+    confidence. Flat and untuned on purpose - no sliding scale by sample size or
+    conviction size, nothing fit to this app's own early picks. The model's raw, unblended number
     is never thrown away - see raw_model_p in db.py's schema - so a future review can
     always compare 'what we showed' against 'what the model alone would have said'.
     Once a market passes, this returns the model's number unchanged."""
@@ -1598,8 +1590,7 @@ def compute_picks(box, odds, player_bt=None):
     if picks.empty:
         return picks, slate_odds["snapshot_time"].max()
 
-    picks["edge_over"] = picks["model_p_over"] - picks["Market Over %"]
-    picks["side"] = picks["edge_over"].map(lambda e: "Over" if e > 0 else "Under")
+    picks["side"] = picks["model_p_over"].map(lambda p: "Over" if p > 50 else "Under")
     picks["model_p"] = picks.apply(
         lambda r: r["model_p_over"] if r["side"] == "Over" else 100 - r["model_p_over"], axis=1)
     # Nudges the raw walk-forward probability toward what the locked prediction
@@ -1608,11 +1599,11 @@ def compute_picks(box, odds, player_bt=None):
     picks["model_p"] = calibration.apply(picks["model_p"], cached_calibration()["params"])
     picks["market_p"] = picks.apply(
         lambda r: r["Market Over %"] if r["side"] == "Over" else 100 - r["Market Over %"], axis=1)
-    picks["edge"] = picks["model_p"] - picks["market_p"]
+    picks["conviction"] = picks["model_p"] - 50
     picks["confidence"] = picks.apply(
         lambda r: model.confidence_label(r["games_before"], r["stat"], player_bt), axis=1)
     # shown_p (not model_p) is what gets displayed as a standalone probability and
-    # logged to the ledger - see shown_probability()'s own docstring. edge, EV,
+    # logged to the ledger - see shown_probability()'s own docstring. conviction, EV,
     # confidence, and qualifying/ranking all keep reading the real model_p, completely
     # unaffected by this - the blend is a display/ledger safeguard, not a change to
     # which picks qualify or how they're ranked.
@@ -1636,9 +1627,9 @@ def compute_picks(box, odds, player_bt=None):
 @st.cache_data(ttl=60)
 def compute_game_picks(box, game_odds, game_bt=None):
     """Every game+market with a model projection, in the same shape as compute_picks()
-    so the two can be ranked together. Only the side of each game+market the model
-    actually likes more than the market (positive edge) is kept - the other side of
-    the same line is the same disagreement mirrored, not a second, independent pick.
+    so the two can be ranked together. Only the side of each game+market the model's
+    own probability actually favors (over 50%) is kept - the other side of the same
+    line is the same lean mirrored, not a second, independent pick.
 
     Literal today only, no falling back to the most recent date with data - same reason
     as build_roster(). Game-market odds only refresh in the ~20-minutes-before-tip
@@ -1706,17 +1697,17 @@ def compute_game_picks(box, game_odds, game_bt=None):
                 # record (see calibration.py) - a no-op until there's real volume.
                 model_p = round(float(calibration.apply(model_p, cal_params)), 1)
                 label = x.side if market == "totals" else short(x.side)
-                candidates.append((model_p - x.no_vig_pct, label, line_display, model_p, x))
+                candidates.append((model_p, label, line_display, x))
 
-            edge, label, line_display, model_p, x = max(candidates, key=lambda c: c[0])
-            if edge <= 0:
-                continue  # neither side cleared the market - nothing to show for this market
+            model_p, label, line_display, x = max(candidates, key=lambda c: c[0])
+            if model_p <= 50:
+                continue  # the model doesn't actually favor either side for this market
 
             passed = passed_backtest(market, game_bt)
             rows.append({
                 "Player": label, "Game": game_label, "Stat": stat_label[market],
                 "Line": line_display, "side": label, "model_p": model_p,
-                "market_p": x.no_vig_pct, "edge": edge,
+                "market_p": x.no_vig_pct, "conviction": model_p - 50,
                 "confidence": game_confidence(games_before, market, game_bt),
                 "passed_backtest": passed,
                 "shown_p": shown_probability(model_p, x.no_vig_pct, passed),
@@ -2014,9 +2005,9 @@ def player_why_html(r, box_keyed, team_ratings, defense_allowed, player_zones, t
         f'outcome lands between {f["low"]:.1f} and {f["high"]:.1f} {escape(stat_lower)} - the '
         'model and the market can both be reasonable about the distribution and still land on '
         f'opposite sides of the line by chance. {f["caveats"][0]}</p>'
-        f'<p><b>H. Final assessment: {f["tier"]}.</b> {r.confidence} confidence, a '
-        f'{r.edge:+.0f} point edge against a real market price - {f["tier_reason"]} A '
-        'probability estimate, not a recommendation to bet.</p>'
+        f'<p><b>H. Final assessment: {f["tier"]}.</b> {r.confidence} confidence, '
+        f'{r.conviction:+.0f} points above a coin flip in the model\'s own view - '
+        f'{f["tier_reason"]} A probability estimate, not a recommendation to bet.</p>'
         f'{glossary_html(f["terms"])}')
 
 
@@ -2213,9 +2204,9 @@ def game_why_html(r, defense_allowed, team_zones):
         f'market has a standard deviation of {r.sigma:.1f} points, so a typical result lands '
         f'between {f["low"]:.1f} and {f["high"]:.1f} on the {f["unit"]}. {f["caveats"][0]}</p>'
         f'<p><b>H. Final assessment: {f["tier"]}.</b> {r.confidence} confidence (based on '
-        f'{int(r.games_before)} games of saved history for both teams), a {r.edge:+.0f} point '
-        f'edge against a real market price - {f["tier_reason"]} A probability estimate, not a '
-        'recommendation to bet.</p>'
+        f'{int(r.games_before)} games of saved history for both teams), {r.conviction:+.0f} '
+        f'points above a coin flip in the model\'s own view - {f["tier_reason"]} A '
+        'probability estimate, not a recommendation to bet.</p>'
         f'{glossary_html(f["terms"])}')
 
 
@@ -2263,7 +2254,7 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
     # moneyline) doesn't, so it just gets the same "picked" green.
     color = RED if r.side == "Under" else GREEN
     ev_txt = f'{r.ev:+.0%} EV' if r.ev is not None else "EV n/a"
-    tier = recommendation_tier(r.edge, r.side)
+    tier = recommendation_tier(r.conviction, r.side)
     tier_color = AMBER if tier.startswith("STRONG") else (BLUE if tier.startswith("LEAN") else "#8A96B0")
     st.markdown(
         f'<div class="panel">'
@@ -2279,13 +2270,14 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
         f'<div class="hint" style="margin:0;">model estimate</div></div></div>'
         f'<div class="strip" style="margin-top:.8rem;">'
         f'<div><b>{r.market_p:.0f}%</b><span>market-implied</span></div>'
-        f'<div><b>{r.edge:+.0f} pts</b><span>edge</span></div>'
+        f'<div><b>{r.conviction:+.0f} pts</b><span>conviction</span></div>'
         f'<div><b>{ev_txt}</b><span>expected value</span></div>'
         f'<div><b>{fmt_price(r.price)}</b><span>{escape(book(r.book) if pd.notna(r.book) else "-")}</span></div>'
         f'<div><b>{int(r.games_before)}</b><span>games of history</span></div></div>'
-        f'<p class="hint" style="margin-top:.6rem;">{escape(r.note)} The market\'s no-vig '
-        f'price implies {r.market_p:.0f}% on {escape(str(r.side))}; the model estimates '
-        f'{r.model_p:.0f}%, a gap of {r.edge:+.0f} points. {CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
+        f'<p class="hint" style="margin-top:.6rem;">{escape(r.note)} The model estimates '
+        f'{r.model_p:.0f}% on {escape(str(r.side))}, {r.conviction:+.0f} points above a coin '
+        f'flip (shown for context, the market\'s no-vig price implies {r.market_p:.0f}%). '
+        f'{CONFIDENCE_NOTE.get(r.confidence, "")}</p>'
         + (f'<p class="hint" style="margin-top:.3rem;color:#E0A458;">Overconfidence guard: this '
            f'market hasn\'t yet beaten the no-vig closing line in a real backtest, so the '
            f'probability saved to the ledger is blended 50/50 with the market ({r.shown_p:.0f}%), '
@@ -2311,8 +2303,8 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
 def line_adjuster(r, label):
     """A 'what if the line were different' control under a player-prop pick card: pick
     a number, see the model's probability at that number instead of the real posted
-    line, and whether the edge against today's real market price would still clear
-    EDGE_THRESHOLD.
+    line, and whether the model's own conviction there would still clear
+    CONVICTION_THRESHOLD.
 
     Only the MODEL side is recomputed - the market percentage shown stays fixed at the
     real posted line's actual no-vig price, clearly labeled as such. There's no way to
@@ -2345,35 +2337,29 @@ def line_adjuster(r, label):
             return
         hyp_model_p = over_p * 100 if r.side == "Over" else 100 - over_p * 100
         hyp_model_p = float(calibration.apply(np.array([hyp_model_p]), cached_calibration()["params"])[0])
-        # Signed, not abs(): at the real line, model_p > market_p for r.side by
-        # construction (compute_picks only ever picks the side that's ahead) - but at a
-        # hypothetical line that's no longer guaranteed. A negative edge here is a real,
-        # different answer ("the model now favors the other side"), not a smaller
+        # Signed, not abs(): at the real line, model_p > 50 for r.side by construction
+        # (compute_picks only ever picks the side the model itself favors) - but at a
+        # hypothetical line that's no longer guaranteed. A model_p under 50 here is a
+        # real, different answer ("the model now favors the other side"), not a smaller
         # version of the same pick - recommendation_tier() assumes the positive case
-        # (it only ever sees edges compute_picks already picked a winning side for), so
-        # it isn't reused here; this spells out both cases explicitly instead.
-        hyp_edge = hyp_model_p - r.market_p
+        # (it only ever sees a conviction compute_picks already picked a favored side
+        # for), so it isn't reused here; this spells out both cases explicitly instead.
+        hyp_conviction = hyp_model_p - 50
         opposite = "Under" if r.side == "Over" else "Over"
-        if hyp_edge < 0:
+        if hyp_conviction < 0:
             tier, tier_color = f"MODEL NOW FAVORS {opposite.upper()}", RED
-        elif hyp_edge < EDGE_THRESHOLD:
-            tier, tier_color = "NO CLEAR EDGE", "#8A96B0"
+        elif hyp_conviction < CONVICTION_THRESHOLD:
+            tier, tier_color = "NO CLEAR LEAN", "#8A96B0"
         else:
-            strong_bar = (EDGE_THRESHOLD + MAX_PLAUSIBLE_EDGE) / 2
-            tier = f"{'STRONG LEAN' if hyp_edge >= strong_bar else 'LEAN'} {r.side.upper()}"
-            tier_color = AMBER if hyp_edge >= strong_bar else BLUE
+            tier = f"{'STRONG LEAN' if hyp_conviction >= STRONG_CONVICTION_THRESHOLD else 'LEAN'} {r.side.upper()}"
+            tier_color = AMBER if hyp_conviction >= STRONG_CONVICTION_THRESHOLD else BLUE
         st.markdown(
             f'<div class="strip" style="margin-top:.2rem;">'
             f'<div><b>{hyp_model_p:.0f}%</b><span>model: {escape(str(r.side))} {new_line:g}</span></div>'
-            f'<div><b>{r.market_p:.0f}%</b><span>market: {escape(str(r.side))} at real line ({r.Line:g})</span></div>'
-            f'<div><b>{hyp_edge:+.0f} pts</b><span>edge at {new_line:g}</span></div>'
+            f'<div><b>{r.market_p:.0f}%</b><span>market: {escape(str(r.side))} at real line ({r.Line:g}), for context</span></div>'
+            f'<div><b>{hyp_conviction:+.0f} pts</b><span>conviction at {new_line:g}</span></div>'
             f'<div><span class="badge" style="background:{tier_color}26;color:{tier_color};">'
             f'{escape(tier)}</span></div></div>', unsafe_allow_html=True)
-        if hyp_edge >= EDGE_THRESHOLD and hyp_edge > MAX_PLAUSIBLE_EDGE:
-            st.caption(f"A gap this big (over {MAX_PLAUSIBLE_EDGE} points) is past what this app "
-                       "treats as a real edge even on the real line - see MAX_PLAUSIBLE_EDGE's "
-                       "own note on why that's usually the model missing real-world context, "
-                       "not a true mispriced line.")
 
 
 MODEL_VERSION = "walk-forward-v1"
@@ -2433,7 +2419,7 @@ def log_predictions(savable):
                 "note": r.note, "games_before": int(r.games_before),
                 "confidence": r.confidence, "market_p": round(r.market_p, 2),
                 "raw_model_p": round(r.model_p, 2), "passed_backtest": bool(r.passed_backtest),
-                "edge_threshold": EDGE_THRESHOLD, "kind": r.kind,
+                "conviction_threshold": CONVICTION_THRESHOLD, "kind": r.kind,
                 # Recommended side, explicit - for game-kind rows this duplicates
                 # `player` (team abbr, or Over/Under for totals), but for player-prop
                 # rows it's the ONLY place Over/Under is recorded at all. A handful of
@@ -2467,26 +2453,28 @@ def log_predictions(savable):
 
 
 def qualifying_and_caution(view):
-    """The 'qualifies as a pick' filter - edge in [EDGE_THRESHOLD, MAX_PLAUSIBLE_EDGE],
-    not Low confidence - split into `qualifying` (player props, Top Picks' own ranked
-    list, capped at TOP_PICKS_MAX) and `caution` (game lines, held to the same bar but
-    shown separately for a human look - see page_top_picks()'s 'Check before trusting'
+    """The 'qualifies as a pick' filter - conviction >= CONVICTION_THRESHOLD, not Low
+    confidence - split into `qualifying` (player props, Top Picks' own ranked list,
+    capped at TOP_PICKS_MAX) and `caution` (game lines, held to the same bar but shown
+    separately for a human look - see page_top_picks()'s 'Check before trusting'
     section for why). Shared by the page's own display (market-filtered) and
     log_todays_qualifying_picks() (every market, unfiltered - see its docstring for
     why that distinction matters for the locked ledger).
 
-    The lower bound is edge >= EDGE_THRESHOLD, not abs(edge) - side already picks the
-    direction the model favors (compute_picks/compute_game_picks), so by the time this
-    runs, edge should already be positive for that side. It can still go negative here
-    because calibration.py's ledger-learned correction is applied to model_p *after*
-    side was chosen from the raw probability - a real case where the corrected model
-    now disagrees with its own pre-calibration pick, not a data error. abs() on this
-    bound was treating a -12 edge (the model reversing itself) the same as a real +12
-    edge and shipping it as a qualifying pick - confirmed as a real production bug,
-    not hypothetical. Only MAX_PLAUSIBLE_EDGE's upper bound stays symmetric: an
-    implausibly large gap is suspect in either direction."""
-    in_range = view[view["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
-    qualified = in_range[(in_range["edge"] >= EDGE_THRESHOLD) & (in_range["confidence"] != "Low")]
+    This is conviction >= CONVICTION_THRESHOLD, not abs(conviction) >= - side already
+    picks the direction the model favors (compute_picks/compute_game_picks), so by the
+    time this runs, conviction should already be positive for that side. It can still
+    go negative here because calibration.py's ledger-learned correction is applied to
+    model_p *after* side was chosen from the raw probability - a real case where the
+    corrected model now disagrees with its own pre-calibration pick, not a data error.
+    abs() on this bound would treat a -12 conviction (the model reversing itself) the
+    same as a real +12 conviction and ship it as a qualifying pick - the exact
+    production bug this app already hit once with the old edge-based version of this
+    check, so the same signed comparison is kept here. There is no longer an upper-
+    bound plausibility cap (that compared the model to the market; removed along with
+    edge) - a pick is no longer flagged for being implausibly far from the market,
+    since the market no longer enters this decision at all."""
+    qualified = view[(view["conviction"] >= CONVICTION_THRESHOLD) & (view["confidence"] != "Low")]
     caution = qualified[qualified["kind"] == "game"]
     caution = caution.reindex(caution["ev"].sort_values(ascending=False).index)
     qualified = qualified[qualified["kind"] == "player"]
@@ -2557,40 +2545,21 @@ def page_top_picks():
                      "Total": picks["Stat"] == "Total", "Moneyline": picks["Stat"] == "Moneyline"}
     view = picks[market_filter[market_choice]] if market_choice != "All" else picks
 
-    flagged = view[view["edge"].abs() > MAX_PLAUSIBLE_EDGE]
-    # Game-line edges this size are flagged for a human look rather than ranked as Top
-    # Picks - the team model has no visibility into injuries, trades, or rest/lineup
-    # news, and that's a far more likely explanation than a real edge (see MAX_PLAUSIBLE_
-    # EDGE above). Player props aren't affected: their edges have historically tracked
-    # real model/market disagreement, not missing roster news, at this size.
     qualifying, caution = qualifying_and_caution(view)
 
     strip([(len(view), "lines projected"), (len(qualifying), "qualify as picks"),
           (len(caution), "game lines to check first"),
-          (f"{EDGE_THRESHOLD}-{MAX_PLAUSIBLE_EDGE} pts", "edge range to qualify"),
-          (len(flagged), "flagged, not shown"),
+          (f"{CONVICTION_THRESHOLD}+ pts", "conviction to qualify"),
           (ago(last_snap) if last_snap is not None else "–", "odds last captured")])
-
-    if not flagged.empty:
-        with st.expander(f"{len(flagged)} line(s) flagged and excluded - edge too large to be plausible"):
-            st.dataframe(
-                flagged.assign(Edge=flagged["edge"].round(0))[
-                    ["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "Edge"]]
-                .rename(columns={"side": "Side", "model_p": "Model %", "market_p": "Market %"}),
-                hide_index=True, width="stretch")
-            hint(f"An edge over {MAX_PLAUSIBLE_EDGE} points against a real, liquid market almost "
-                 "always means the model is missing something real-world (an injury, a minutes "
-                 "restriction, a role change, a trade) rather than finding value no book noticed. "
-                 "Shown for transparency, not ranked as picks.")
 
     if qualifying.empty and caution.empty:
         st.markdown(
             '<div class="panel"><div class="panel-title">No picks qualify tonight</div>'
-            '<p class="hint">Nothing cleared an edge of {:.0f} points (and under the {:.0f}-point '
-            "plausibility cap) with at least Medium confidence. That's a real result, not an "
-            "error - the model and the market mostly agreeing is normal, and forcing picks when "
-            "they don't disagree would defeat the point of this page.</p></div>"
-            .format(EDGE_THRESHOLD, MAX_PLAUSIBLE_EDGE),
+            '<p class="hint">Nothing cleared {:.0f} points of conviction above a coin flip '
+            "with at least Medium confidence. That's a real result, not an error - the "
+            "model not being confident in anything tonight is normal, and forcing picks "
+            "when it isn't would defeat the point of this page.</p></div>"
+            .format(CONVICTION_THRESHOLD),
             unsafe_allow_html=True)
         return
 
@@ -2602,13 +2571,13 @@ def page_top_picks():
 
     hint("Estimated probability is not the same as betting value, and value isn't the same "
          "as a guaranteed outcome. Ranked by expected value at the best available price, not "
-         "by raw model probability or edge - a smaller edge at a much better price can be "
-         "worth more than a bigger edge at a worse one. Confidence now requires the backtest "
-         "to show the model beating the no-vig closing line on log loss for that market, not "
-         "just being calibrated (see the backtest panel below) - until there's enough settled, "
-         "closing-line history for a market, nothing in it can show High confidence. Player "
-         "points picks are additionally capped at Medium (a known tail-overconfidence issue, "
-         "see model.py).")
+         "by raw model probability or conviction - a smaller conviction at a much better "
+         "price can be worth more than a bigger conviction at a worse one. Confidence now "
+         "requires the backtest to show the model beating the no-vig closing line on log "
+         "loss for that market, not just being calibrated (see the backtest panel below) - "
+         "until there's enough settled, closing-line history for a market, nothing in it can "
+         "show High confidence. Player points picks are additionally capped at Medium (a "
+         "known tail-overconfidence issue, see model.py).")
 
     strongest = qualifying[qualifying["confidence"] == "High"]
     other = qualifying[qualifying["confidence"] != "High"]
@@ -2616,7 +2585,7 @@ def page_top_picks():
     section("Strongest picks")
     hint("High confidence - the backtest shows the model beating the no-vig closing line on "
          "log loss for this exact market, with 30+ games of this player's own history, not "
-         "just a calibrated probability. A real, demonstrated edge, not a guarantee.")
+         "just a calibrated probability. A real, demonstrated track record, not a guarantee.")
     if strongest.empty:
         hint("None of tonight's qualifying picks have cleared the High-confidence bar yet. "
              "That's common while a market's closing-line backtest is still building up "
@@ -2627,44 +2596,44 @@ def page_top_picks():
 
     if not other.empty:
         section("Other qualifying picks")
-        hint("Medium confidence - a real edge against the market, but this market either "
-             "hasn't shown the model beating the closing line on log loss yet (often just "
-             "because too few settled games have a saved closing-ish snapshot), or the stat "
-             "is permanently capped at Medium regardless of track record (points, steals, "
-             "blocks - see model.py).")
+        hint("Medium confidence - a real lean in the model's own probability, but this "
+             "market either hasn't shown the model beating the closing line on log loss "
+             "yet (often just because too few settled games have a saved closing-ish "
+             "snapshot), or the stat is permanently capped at Medium regardless of track "
+             "record (points, steals, blocks - see model.py).")
         for rank, r in enumerate(other.itertuples(), 1):
             render_card(r, f"#{rank}")
 
     if not caution.empty:
         section("Check before trusting")
-        hint(f"Every game-line pick here cleared the {EDGE_THRESHOLD}-point edge bar, same as "
-             "a Top Pick, but spread/total/moneyline edges this size are held to a stricter bar "
-             "than player props: the team model has no visibility into injury reports, trades, "
-             "rest decisions, or lineup news a sportsbook already knows about, and that's the "
-             "far more likely explanation for a gap this size. Worth a look before trusting, "
-             "not ranked alongside Top Picks.")
+        hint(f"Every game-line pick here cleared the {CONVICTION_THRESHOLD}-point "
+             "conviction bar, same as a Top Pick, but spread/total/moneyline picks this "
+             "size are held to a stricter bar than player props: the team model has no "
+             "visibility into injury reports, trades, rest decisions, or lineup news a "
+             "sportsbook already knows about, and that's the far more likely explanation "
+             "for a strong lean here. Worth a look before trusting, not ranked alongside "
+             "Top Picks.")
         for r in caution.itertuples():
             render_card(r, "Check:")
 
     section("Strong picks, every team")
-    hint(f"Every team playing tonight with at least one player prop clearing a "
-         f"{TEAM_BOARD_EDGE_THRESHOLD}-point edge (stricter than the {EDGE_THRESHOLD}-"
-         "point bar above) at Medium confidence or better, across every market the "
-         "model projects - points, rebounds, assists, threes, steals, blocks, "
-         "turnovers, and the four combo stats (Pts+Reb+Ast, Pts+Reb, Pts+Ast, "
-         "Reb+Ast). Not capped to a fixed number per team or overall: a team can show "
-         "several props, one, or none at all - this never forces a pick to fill a "
-         "slot, same reasoning as the rest of this page.")
+    hint(f"Every team playing tonight with at least one player prop clearing "
+         f"{TEAM_BOARD_CONVICTION_THRESHOLD} points of conviction (stricter than the "
+         f"{CONVICTION_THRESHOLD}-point bar above) at Medium confidence or better, "
+         "across every market the model projects - points, rebounds, assists, threes, "
+         "steals, blocks, turnovers, and the four combo stats (Pts+Reb+Ast, Pts+Reb, "
+         "Pts+Ast, Reb+Ast). Not capped to a fixed number per team or overall: a team "
+         "can show several props, one, or none at all - this never forces a pick to "
+         "fill a slot, same reasoning as the rest of this page.")
     team_board = picks[(picks["kind"] == "player")
-                       & (picks["edge"] >= TEAM_BOARD_EDGE_THRESHOLD)
-                       & (picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE)
+                       & (picks["conviction"] >= TEAM_BOARD_CONVICTION_THRESHOLD)
                        & (picks["confidence"] != "Low")]
     if team_board.empty:
         hint("No player prop on tonight's full slate clears this bar right now.")
     else:
         for team in sorted(team_board["team"].dropna().unique()):
             team_picks = team_board[team_board["team"] == team].sort_values(
-                "edge", key=lambda s: s.abs(), ascending=False)
+                "conviction", ascending=False)
             n = len(team_picks)
             with st.expander(f"{team} — {n} prop{'s' if n != 1 else ''}"):
                 for r in team_picks.itertuples():
@@ -2695,9 +2664,10 @@ def page_top_picks():
              "nights are captured and graded.")
 
     with st.expander(f"All {len(view)} projected lines, qualifying or not"):
-        show = view.assign(Edge=view["edge"].round(0)).sort_values("edge", key=abs, ascending=False)
+        show = view.assign(Conviction=view["conviction"].round(0)).sort_values(
+            "conviction", ascending=False)
         st.dataframe(
-            show[["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "Edge", "confidence"]]
+            show[["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "Conviction", "confidence"]]
             .rename(columns={"side": "Side", "model_p": "Model %", "market_p": "Market %",
                              "confidence": "Confidence"}),
             hide_index=True, width="stretch")
@@ -2860,15 +2830,10 @@ def page_game_lines():
                                                       model_row, sigma_margin, sigma_total)
 
                 model_line = ""
-                if model_pct is not None and x.no_vig_pct is not None:
-                    edge = model_pct - x.no_vig_pct
-                    if abs(edge) > MAX_PLAUSIBLE_EDGE:
-                        model_line = f'<div class="model" style="color:{AMBER};">model {model_pct:.0f}% (flagged)</div>'
-                    else:
-                        color = GREEN if edge > 0 else (RED if edge < 0 else MUTED)
-                        model_line = f'<div class="model" style="color:{color};">model {model_pct:.0f}% ({edge:+.0f})</div>'
-                elif model_pct is not None:
-                    model_line = f'<div class="model" style="color:{MUTED};">model {model_pct:.0f}%</div>'
+                if model_pct is not None:
+                    conviction = model_pct - 50
+                    color = GREEN if conviction > 0 else (RED if conviction < 0 else MUTED)
+                    model_line = f'<div class="model" style="color:{color};">model {model_pct:.0f}% ({conviction:+.0f})</div>'
 
                 chips.append(
                     f'<div class="chip"><div class="ln">{escape(str(label))}{line_txt}</div>'
@@ -2883,10 +2848,8 @@ def page_game_lines():
 
     hint("No-vig % is the books' own implied probability with their cut removed, not a LOCK IT "
          "prediction. Model % is this app's own projection. The number in parentheses is the "
-         "gap between them, in points. Edges over "
-         f"{MAX_PLAUSIBLE_EDGE} points are flagged rather than shown as real value, same rule as "
-         "Top Picks: a model with no access to real-world news that disagrees with a sharp market "
-         "by a lot is more likely missing something than finding something.")
+         "model's own conviction - how many points above a coin flip (50%) it sits for that "
+         "side - and no longer compares the model to the market's number at all.")
 
 
 PARLAY_MARKET_KEY = {"Moneyline": "h2h", "Spread": "spreads", "Total": "totals"}
@@ -3401,22 +3364,14 @@ def page_players():
                  "saved game history yet for a model projection.")
         else:
             his_picks["ev"] = his_picks.apply(lambda r: expected_value(r["model_p"], r["price"]), axis=1)
-            flagged = his_picks[his_picks["edge"].abs() > MAX_PLAUSIBLE_EDGE]
-            shown = his_picks[his_picks["edge"].abs() <= MAX_PLAUSIBLE_EDGE]
-            shown = shown.reindex(shown["ev"].sort_values(ascending=False).index)
+            shown = his_picks.reindex(his_picks["ev"].sort_values(ascending=False).index)
             context = pick_render_context(box)
             for rank, r in enumerate(shown.itertuples(), 1):
                 render_pick_card(r, f"#{rank}", *context, link_to_detail=True,
                                  return_to_page=players_page)
-            if not flagged.empty:
-                with st.expander(f"{len(flagged)} more market(s) excluded - edge too large to be plausible"):
-                    hint(f"An edge over {MAX_PLAUSIBLE_EDGE} points against a real, liquid market "
-                         "almost always means the model is missing something real-world (an "
-                         "injury, a minutes restriction, a role change) rather than finding value "
-                         "no book noticed.")
             hint("Ranked by expected value at the best available price, same ranking Top Picks "
                  f"uses - every one of {name}'s markets with a model projection tonight, not "
-                 "just the ones that would clear Top Picks' own edge bar.")
+                 "just the ones that would clear Top Picks' own conviction bar.")
 
             missing_ids = confirmed_out_teammates(injuries, box, player_team, player_id)
             if missing_ids:
@@ -4299,20 +4254,27 @@ this for a full combined parlay price, same formula, just on the multiplied-toge
 odds.</p>""")
     learn_topic("Expected value (EV)", """
 <p>The actual ranking metric this app uses for Top Picks and the Parlay Analyzer - not
-probability alone, and not edge in percentage points alone. EV per $1 staked is:</p>
+probability alone, and not conviction in percentage points alone. EV per $1 staked
+is:</p>
 <p><code>model probability &times; decimal odds - 1</code></p>
-<p>A smaller edge at a much better price can be worth more than a bigger edge at a
-worse price, since the payout is what money is actually won or lost on - this is why
-Top Picks ranks by EV, not by raw model probability or the point-gap "edge" number.</p>""")
-    learn_topic("Projection vs. betting line (\"edge\")", """
-<p>The gap between this app's own model probability and the market's no-vig
-probability, in percentage points. An edge has to clear <b>8 points</b> before
-anything is even shown as a pick (<code>EDGE_THRESHOLD</code>), and anything over
-<b>20 points</b> (<code>MAX_PLAUSIBLE_EDGE</code>) gets flagged and excluded instead
-of celebrated - a gap that large against a real, liquid market is far more likely to
-mean the model is missing real-world context (an injury, a minutes restriction, a
-role change) than that it found value no book noticed. See Top Picks' "flagged" panel
-for exactly which lines got excluded and why.</p>""")
+<p>A smaller conviction at a much better price can be worth more than a bigger
+conviction at a worse price, since the payout is what money is actually won or lost
+on - this is why Top Picks ranks by EV, not by raw model probability or the
+point-gap "conviction" number.</p>""")
+    learn_topic("Model probability vs. a coin flip (\"conviction\")", """
+<p>How many percentage points above 50% (a coin flip) the model's own probability sits
+for whichever side it favors. Conviction has to clear <b>8 points</b> before anything
+is even shown as a pick (<code>CONVICTION_THRESHOLD</code>).</p>
+<p>This app used to compare the model's probability against the market's no-vig
+probability instead ("edge"), including a plausibility cap that flagged and excluded
+an implausibly large gap. That comparison has been removed on request: a pick now
+stands or falls purely on how confident the model's own probability is, with the
+market's number still shown alongside it for context, but no longer deciding anything.
+One consequence: nothing now catches the case the old cap was built to catch - the
+model being very confident for reasons that turn out to be a blind spot (an injury, a
+minutes restriction, a role change) rather than real insight. The market's own number
+is still shown next to the model's for a human to compare, but the app itself no
+longer compares them.</p>""")
 
     section("How this app evaluates a pick")
     learn_topic("Confidence vs. probability", """
@@ -4332,18 +4294,18 @@ it adds information, not just that it's well-calibrated.</li>
 <p>A pick can have a high probability and still be Low confidence (not enough
 history), or a modest probability and High confidence (a well-proven market). They're
 answering different questions.</p>""")
-    learn_topic("The recommendation indicator (STRONG LEAN / LEAN / NO CLEAR EDGE)", """
+    learn_topic("The recommendation indicator (STRONG LEAN / LEAN / NO CLEAR LEAN)", """
 <p>One consistent label, used the same way everywhere a pick is shown - Top Picks,
 Tonight, the Players page, the Parlay Analyzer:</p>
 <ul>
-<li><b>NO CLEAR EDGE</b>: edge under 8 points - not shown as a pick at all.</li>
-<li><b>LEAN [side]</b>: edge of 8-13.9 points.</li>
-<li><b>STRONG LEAN [side]</b>: edge of 14+ points (up to the 20-point plausibility
-cap - above that, it's flagged instead, see "Projection vs. betting line" above).</li>
+<li><b>NO CLEAR LEAN</b>: conviction under 8 points - not shown as a pick at all.</li>
+<li><b>LEAN [side]</b>: conviction of 8-13.9 points.</li>
+<li><b>STRONG LEAN [side]</b>: conviction of 14+ points. No upper cap - see
+"Model probability vs. a coin flip" above for what that means.</li>
 </ul>
 <p>For spreads and moneylines the team name takes the place of Over/Under (e.g.
-"STRONG LEAN LOS ANGELES LAKERS"). This is a straight translation of the edge math
-already described above, not a second opinion layered on top of it.</p>""")
+"STRONG LEAN LOS ANGELES LAKERS"). This is a straight translation of the conviction
+math already described above, not a second opinion layered on top of it.</p>""")
     learn_topic("Correlation", """
 <p>Two bets are correlated when one outcome makes the other more or less likely - most
 obviously, multiple props or a prop and a game line from the <i>same game</i>: pace,

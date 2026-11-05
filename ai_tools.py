@@ -149,7 +149,7 @@ def player_projection(player_name, stat="points"):
                 "player_name": name, "stat": stat, "has_active_line": True,
                 "line": r["Line"], "side_model_prefers": r["side"],
                 "model_probability_pct": r["model_p"], "market_no_vig_pct": r["market_p"],
-                "edge_points": r["edge"], "confidence": r["confidence"],
+                "conviction_points": r["conviction"], "confidence": r["confidence"],
                 "best_price": r["price"], "book": r["book"],
                 "games_of_history": int(r["games_before"]),
             })
@@ -170,7 +170,7 @@ def player_projection(player_name, stat="points"):
         "player_name": name, "stat": stat, "has_active_line": False,
         "projected_mean": row[f"{stat}_mean_hat"], "games_of_history": int(row["games_before"]),
         "note": "No active betting line found for this stat right now, so there's no "
-                "market price or edge to compare against - this is the model's raw projection only.",
+                "market price or conviction to compare against - this is the model's raw projection only.",
     })
 
 
@@ -263,7 +263,7 @@ def game_markets(team_query):
 
 def top_picks(market=None):
     """This app's current Top Picks - the exact same ranked list the Top Picks page
-    shows (positive-edge-only, EV-ranked, game-line picks over the edge threshold
+    shows (conviction-ranked by EV, game-line picks over the conviction threshold
     separated into 'check before trusting')."""
     box, odds = _load("box_scores"), _load("odds_snapshots")
     game_odds = _load("game_odds_snapshots")
@@ -280,16 +280,15 @@ def top_picks(market=None):
     if market:
         picks = picks[picks["Stat"].str.lower() == market.lower()]
 
-    qualified = picks[(picks["edge"].abs() <= app.MAX_PLAUSIBLE_EDGE)
-                      & (picks["edge"].abs() >= app.EDGE_THRESHOLD) & (picks["confidence"] != "Low")]
+    qualified = picks[(picks["conviction"] >= app.CONVICTION_THRESHOLD) & (picks["confidence"] != "Low")]
     caution = qualified[qualified["kind"] == "game"]
     qualifying = qualified[qualified["kind"] == "player"]
     qualifying = qualifying.reindex(qualifying["ev"].sort_values(ascending=False).index).head(app.TOP_PICKS_MAX)
-    cols = ["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "edge", "ev", "confidence"]
+    cols = ["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "conviction", "ev", "confidence"]
     return {
         "qualifying_picks": _jsonable(qualifying[cols].to_dict("records")),
         "check_before_trusting": _jsonable(caution[cols].to_dict("records")),
-        "note": "check_before_trusting picks cleared the edge bar but involve the team "
+        "note": "check_before_trusting picks cleared the conviction bar but involve the team "
                "model, which has no visibility into injuries/trades/lineup news - treat "
                "these with more skepticism than qualifying_picks.",
     }
