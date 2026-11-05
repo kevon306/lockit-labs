@@ -522,11 +522,23 @@ def _pool():
         # TCP keepalives so a connection that goes silently dead mid-query (confirmed
         # in production: the morning job's connection stopped getting any response
         # from Supabase, and poll() waited over 5 hours for a reply that was never
-        # coming) gets detected and errored out within under a minute instead of
-        # hanging forever - idle 15s, then a probe every 5s, give up after 5 missed.
+        # coming) gets detected and errored out quickly instead of hanging forever -
+        # idle 3s, then a probe every 2s, give up after 3 missed (~9s worst case).
+        #
+        # Tightened from the original 15/5/5 (~40s worst case) after confirming live
+        # on Streamlit Cloud (2026-11-05): a page load that's the first request after
+        # the app has sat idle a while - very much Streamlit Community Cloud's normal
+        # usage pattern for a single-user app, not an edge case - can land on a
+        # connection Supabase dropped silently while idle. _checked_out_connection()
+        # below already pings with "SELECT 1" before handing a pooled connection back
+        # out, but on a SILENTLY dead one (no clean close, just dropped packets) that
+        # ping itself is what blocks until a keepalive probe finally notices - so the
+        # keepalive timers ARE the actual latency the user sees, not just a backstop.
+        # Still well above a healthy round trip, so this can't mistake a merely-slow
+        # query for a dead connection.
         _POOL = pg_pool.ThreadedConnectionPool(
-            1, 10, url, keepalives=1, keepalives_idle=15,
-            keepalives_interval=5, keepalives_count=5)
+            1, 10, url, keepalives=1, keepalives_idle=3,
+            keepalives_interval=2, keepalives_count=3)
     return _POOL
 
 
