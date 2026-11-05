@@ -132,13 +132,20 @@ def morning():
 
 
 def precompute_model_backtests():
-    """Computes the player-prop and team closing-line backtests - each a full walk-
-    forward recompute over every saved box score, several seconds to tens of seconds
-    - and stores them in model_cache (see db.py) so the live dashboard reads a stored
-    result instead of recomputing on every page load (see lockit_app.py's
-    cached_player_backtest/cached_game_backtest). Run right here, right after grading
-    above: a settled game's closing-line record only changes once a day, the moment
-    it gets graded - there's nothing to gain from recomputing this more often.
+    """Computes the slowest, least-often-actually-changing model results - the tail-
+    calibration fit and the player-prop/team closing-line backtests, each a full
+    walk-forward recompute over every saved box score, several seconds to tens of
+    seconds - and stores them in model_cache (see db.py) so the live dashboard reads
+    a stored result instead of recomputing on every page load (see lockit_app.py's
+    cached_tail_calibration/cached_player_backtest/cached_game_backtest). Run right
+    here, right after grading above: a settled game's closing-line record only
+    changes once a day, the moment it gets graded - there's nothing to gain from
+    recomputing any of this more often.
+
+    Tail calibration first, on purpose: compute_player_backtest needs it too (via
+    cached_tail_calibration), and saving it to model_cache before calling
+    compute_player_backtest means that inner call finds it already there instead of
+    fitting it a second time in the same run.
 
     Imports lockit_app lazily, same reasoning as log_todays_picks() below - that file
     is written to run as a Streamlit script, and ai_tools.py already established the
@@ -148,14 +155,17 @@ def precompute_model_backtests():
     if box.empty:
         log("Skipping model backtest precompute - no box scores saved yet")
         return
-    # compute_player_backtest/compute_game_backtest, not the cached_* wrappers - those
-    # would just hand back whatever's already stored in model_cache (yesterday's
-    # result), never actually recomputing it.
+    # compute_tail_calibration/compute_player_backtest/compute_game_backtest, not the
+    # cached_* wrappers - those would just hand back whatever's already stored in
+    # model_cache (yesterday's result), never actually recomputing it.
+    players = lockit_app.load("players")
+    tail_cal = lockit_app.compute_tail_calibration(box, players)
+    db.save_model_cache("tail_calibration", tail_cal)
     player_bt = lockit_app.compute_player_backtest(box, lockit_app.load("odds_snapshots"))
     db.save_model_cache("player_backtest", player_bt)
     game_bt = lockit_app.compute_game_backtest(box, lockit_app.load("game_odds_snapshots"))
     db.save_model_cache("game_backtest", game_bt)
-    log("Precomputed player and team model backtests")
+    log("Precomputed tail calibration and player/team model backtests")
 
 
 def snapshots():

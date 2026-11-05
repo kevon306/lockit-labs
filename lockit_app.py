@@ -1560,16 +1560,32 @@ def cached_ledger_decided():
     return decided.sort_values("graded_at")
 
 
+def compute_tail_calibration(box, players):
+    """The actual, slow computation behind cached_tail_calibration below - pulled out
+    on its own so auto.py's morning job (see precompute_model_backtests()) can call
+    it directly to force a fresh result, same reasoning as compute_player_backtest
+    above."""
+    return model.fit_tail_calibration(box, players=players)
+
+
 @st.cache_data(ttl=21600)
 def cached_tail_calibration(box, players):
-    """Cached wrapper around model.fit_tail_calibration() - a long (6h) ttl, not the
-    usual 60s, because the fit itself re-runs the full walk-forward backtest across
-    every saved box score (~12s) to get enough synthetic quantile checks per stat.
-    One more day of games out of 70k+ existing player-games moves this fit by nothing
-    worth re-paying that cost every minute for - see model.py's own docstring for why
-    this correction exists (points/steals/blocks/pa/pr/pra's confirmed tail-overconfidence
-    gap)."""
-    return model.fit_tail_calibration(box, players=players)
+    """Wrapper around compute_tail_calibration() - re-runs the full walk-forward
+    backtest across every saved box score (20s+) to get enough synthetic quantile
+    checks per stat. One more day of games out of 70k+ existing player-games moves
+    this fit by nothing worth re-paying that cost for - see model.py's own docstring
+    for why this correction exists (points/steals/blocks/pa/pr/pra's confirmed
+    tail-overconfidence gap).
+
+    Reads auto.py's morning job's precomputed result from model_cache first (see
+    db.py and cached_player_backtest's own docstring for why), falling back to
+    computing it live only if that hasn't happened yet. The 6h ttl here is just a
+    safety net in case model_cache is ever stale for an unusually long time - in the
+    normal case this is refreshed daily by the morning job, well under 6h old."""
+    _, cached = db.load_model_cache("tail_calibration")
+    if cached is not None:
+        return cached
+    return compute_tail_calibration(box, players)
 
 
 @st.cache_data(ttl=60)
