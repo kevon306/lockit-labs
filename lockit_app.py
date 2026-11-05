@@ -1614,14 +1614,24 @@ def cached_player_projections(box, roster, players):
     someone after the morning job ran, or the job hasn't run yet today), this falls
     back to computing the full requested roster live - the original behavior, kept as
     a safety net so a late-posted prop is never silently missing or stale."""
+    import time as _time
+    _t0 = _time.time()
     _, cached = db.load_model_cache("player_projections")
     if cached:
         cached_df = pd.DataFrame(cached)
         need = set(roster["player_id"])
         have = set(cached_df["player_id"])
         if need.issubset(have):
+            print(f"[projections debug] cache HIT, {_time.time()-_t0:.2f}s, "
+                  f"need={len(need)} have={len(have)}")
             return cached_df[cached_df["player_id"].isin(need)].reset_index(drop=True)
-    return compute_player_projections(box, roster, players)
+        print(f"[projections debug] cache MISS (coverage), {_time.time()-_t0:.2f}s, "
+              f"need={len(need)} have={len(have)} missing={sorted(need - have)}")
+    else:
+        print(f"[projections debug] cache MISS (no row), {_time.time()-_t0:.2f}s")
+    result = compute_player_projections(box, roster, players)
+    print(f"[projections debug] live compute done, total {_time.time()-_t0:.2f}s")
+    return result
 
 
 @st.cache_data(ttl=60)
