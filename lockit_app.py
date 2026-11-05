@@ -2287,7 +2287,7 @@ def open_pick_detail(r, return_to=None):
 
 
 def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones, team_zones,
-                     injuries, link_to_detail=False, return_to_page=None):
+                     injuries, link_to_detail=False, return_to_page=None, show_player=True):
     line_txt = "" if r.Stat == "Moneyline" else f" {r.Line:.1f}"
     # Over/Under have a real green/red convention; a team-name side (spread,
     # moneyline) doesn't, so it just gets the same "picked" green.
@@ -2298,10 +2298,14 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
     injury_badge = (f'<span class="badge" style="margin-left:.4rem;background:{AMBER}26;'
                     f'color:{AMBER};">Injury-adjusted</span>'
                     if r.kind == "player" and getattr(r, "injury_adjusted", False) else "")
+    # show_player=False drops the player's name from the title - used when several of
+    # this same player's props are already grouped together under one name by
+    # render_player_group(), so it isn't repeated on every prop underneath.
+    player_txt = f' {escape(str(r.Player))}' if show_player else ''
     st.markdown(
         f'<div class="panel">'
         f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.8rem;flex-wrap:wrap;">'
-        f'<div><div class="panel-title">{label} {escape(str(r.Player))}'
+        f'<div><div class="panel-title">{label}{player_txt}'
         f'<span class="badge" style="margin-left:.5rem;background:{tier_color}26;color:{tier_color};">{escape(tier)}</span>'
         f'<span class="badge {CONF_CLASS[r.confidence]}" style="margin-left:.4rem;">{r.confidence} confidence</span>'
         f'{injury_badge}</div>'
@@ -2341,6 +2345,32 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
             st.markdown(why_html, unsafe_allow_html=True)
         if r.kind == "player":
             line_adjuster(r, label)
+
+
+def render_player_group(label, rows, box_keyed, team_ratings, defense_allowed, player_zones,
+                        team_zones, injuries):
+    """Renders every qualifying prop for ONE player as one named header followed by a
+    compact card per prop underneath, instead of a separate full card repeating his
+    name, team, and game once per prop - common on a night he clears the bar on
+    several stats at once (e.g. Points AND Pts+Ast for the same game).
+
+    `label` is passed through unchanged to every prop underneath (not just shown
+    once) - it's what keeps this group's widget keys from colliding with the same
+    player/prop shown again in a different section of this page (see line_adjuster's
+    docstring), not just a rank number."""
+    rows = rows.sort_values("ev", ascending=False)
+    first = rows.iloc[0]
+    n = len(rows)
+    st.markdown(
+        f'<div class="panel" style="padding-bottom:.6rem;">'
+        f'<div class="panel-title">{label} {escape(str(first["Player"]))}'
+        f'<span class="badge" style="margin-left:.5rem;background:#8A96B026;color:#8A96B0;">'
+        f'{n} qualifying prop{"s" if n != 1 else ""}</span></div>'
+        f'<div class="hint" style="margin:0;">{escape(first["Game"])}</div></div>',
+        unsafe_allow_html=True)
+    for r in rows.itertuples():
+        render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_zones,
+                         team_zones, injuries, show_player=False)
 
 
 def line_adjuster(r, label):
@@ -2641,8 +2671,12 @@ def page_top_picks():
              "That's common while a market's closing-line backtest is still building up "
              "settled games - see the rest below instead.")
     else:
-        for rank, r in enumerate(strongest.itertuples(), 1):
-            render_card(r, f"#{rank}")
+        # Grouped by player (preserving the existing EV-sorted order groupby sees them
+        # in, sort=False) so the same player clearing the bar on several stats shows
+        # up as one named card with every prop underneath, not N repeats of his name.
+        for rank, (_, grp) in enumerate(strongest.groupby("Player", sort=False), 1):
+            render_player_group(f"#{rank}", grp, box_keyed, team_ratings, defense_allowed,
+                               player_zones, team_zones, injuries)
 
     if not other.empty:
         section("Other qualifying picks")
@@ -2651,8 +2685,9 @@ def page_top_picks():
              "yet (often just because too few settled games have a saved closing-ish "
              "snapshot), or the stat is permanently capped at Medium regardless of track "
              "record (points, steals, blocks - see model.py).")
-        for rank, r in enumerate(other.itertuples(), 1):
-            render_card(r, f"#{rank}")
+        for rank, (_, grp) in enumerate(other.groupby("Player", sort=False), 1):
+            render_player_group(f"#{rank}", grp, box_keyed, team_ratings, defense_allowed,
+                               player_zones, team_zones, injuries)
 
     if not caution.empty:
         section("Check before trusting")
@@ -2686,8 +2721,9 @@ def page_top_picks():
                 "conviction", ascending=False)
             n = len(team_picks)
             with st.expander(f"{team} — {n} prop{'s' if n != 1 else ''}"):
-                for r in team_picks.itertuples():
-                    render_card(r, "Pick:")
+                for _, grp in team_picks.groupby("Player", sort=False):
+                    render_player_group("Pick:", grp, box_keyed, team_ratings,
+                                       defense_allowed, player_zones, team_zones, injuries)
 
     def backtest_row(label, info):
         n = info.get("n", 0)
