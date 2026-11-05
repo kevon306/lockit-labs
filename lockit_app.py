@@ -1616,21 +1616,26 @@ def cached_player_projections(box, roster, players):
     a safety net so a late-posted prop is never silently missing or stale."""
     import time as _time
     _t0 = _time.time()
+    debug = {"started_at": db.now_utc()}
     _, cached = db.load_model_cache("player_projections")
     if cached:
         cached_df = pd.DataFrame(cached)
         need = set(roster["player_id"])
         have = set(cached_df["player_id"])
+        debug.update(outcome="hit" if need.issubset(have) else "miss_coverage",
+                     need=len(need), have=len(have),
+                     need_dtype=str(roster["player_id"].dtype),
+                     have_dtype=str(cached_df["player_id"].dtype),
+                     missing=sorted(str(x) for x in (need - have))[:10])
         if need.issubset(have):
-            print(f"[projections debug] cache HIT, {_time.time()-_t0:.2f}s, "
-                  f"need={len(need)} have={len(have)}")
+            debug["elapsed_s"] = round(_time.time() - _t0, 2)
+            db.save_model_cache("projections_debug", debug)
             return cached_df[cached_df["player_id"].isin(need)].reset_index(drop=True)
-        print(f"[projections debug] cache MISS (coverage), {_time.time()-_t0:.2f}s, "
-              f"need={len(need)} have={len(have)} missing={sorted(need - have)}")
     else:
-        print(f"[projections debug] cache MISS (no row), {_time.time()-_t0:.2f}s")
+        debug.update(outcome="miss_no_row")
     result = compute_player_projections(box, roster, players)
-    print(f"[projections debug] live compute done, total {_time.time()-_t0:.2f}s")
+    debug["elapsed_s"] = round(_time.time() - _t0, 2)
+    db.save_model_cache("projections_debug", debug)
     return result
 
 
