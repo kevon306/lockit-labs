@@ -1547,6 +1547,7 @@ def compute_picks(box, odds, player_bt=None):
     players = load("players")
     proj = model.project_tonight(box, roster[["player_id", "player_name", "team", "opponent", "is_home"]],
                                  players=players)
+    proj = apply_injury_adjustment(proj, roster, box, load("injury_reports"))
     try:
         tail_cal = cached_tail_calibration(box, players)
     except Exception:
@@ -1584,6 +1585,7 @@ def compute_picks(box, odds, player_bt=None):
             model_p_over = calibration.apply(model_p_over, tail_cal[stat]["params"])
         sub["model_p_over"] = model_p_over
         sub["stat"] = stat
+        sub["injury_adjusted"] = sub[f"{stat}_injury_adjusted"]
         rows.append(sub)
     picks = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     picks = picks.dropna(subset=["model_p_over", "Market Over %"])
@@ -1751,9 +1753,13 @@ def player_why_factors(r, box_keyed, team_ratings, defense_allowed, player_zones
     project's own no-fabrication rule.
 
     injuries (from injury_reports, an unofficial feed checked at most once a day) is
-    shown for context only - it is NOT yet folded into mean/var_hat or model_p, which
-    is why an Out/Day-To-Day status is always surfaced as a caveat, never silently
-    treated as already accounted for.
+    shown for context either way. When r.injury_adjusted is True, a confirmed-Out
+    teammate's real with/without split has already been folded into mean/var_hat and
+    model_p (see apply_injury_adjustment) - the caveat below says so honestly instead
+    of claiming no adjustment happened. This player's OWN reported status is never
+    folded in either way (sportsbooks don't usually post lines for a player who's
+    himself ruled out, and a Day-To-Day tag is too uncertain to act on), so it's
+    always surfaced as a caveat, never silently treated as already accounted for.
 
     Computed once, shared by the long section-by-section writeup (player_why_html)
     and the compact Pick Detail bullet lists (player_why_short), so the two views can
@@ -1936,11 +1942,19 @@ def player_why_factors(r, box_keyed, team_ratings, defense_allowed, player_zones
                     "real season-to-date numbers above rather than head-to-head history.")
     breakdown.append(matchup_line)
 
-    caveats = ["The projection itself (mean/variance above) doesn't adjust for reported "
-              "injuries, minutes restrictions, individual defensive assignments, coverage "
-              "schemes (drop coverage, switching, traps), or role changes a sportsbook may "
-              "already be pricing in - none of that is in box-score data or folded into the "
-              "math here, even when a status is shown above."]
+    if getattr(r, "injury_adjusted", False):
+        caveats = ["The projection above already factors in a confirmed-Out teammate's "
+                  "real with/without split (see this player's page for the actual numbers) "
+                  "- but minutes restrictions, individual defensive assignments, coverage "
+                  "schemes (drop coverage, switching, traps), or other role changes a "
+                  "sportsbook may already be pricing in still aren't - none of that is in "
+                  "box-score data or folded into the math here."]
+    else:
+        caveats = ["The projection itself (mean/variance above) doesn't adjust for reported "
+                  "injuries, minutes restrictions, individual defensive assignments, coverage "
+                  "schemes (drop coverage, switching, traps), or role changes a sportsbook may "
+                  "already be pricing in - none of that is in box-score data or folded into the "
+                  "math here, even when a status is shown above."]
     if stat == "points":
         caveats.append("Points specifically still runs a bit overconfident in the tails even "
                        "with a long track record, which is why it's capped at Medium "
@@ -2256,12 +2270,16 @@ def render_pick_card(r, label, box_keyed, team_ratings, defense_allowed, player_
     ev_txt = f'{r.ev:+.0%} EV' if r.ev is not None else "EV n/a"
     tier = recommendation_tier(r.conviction, r.side)
     tier_color = AMBER if tier.startswith("STRONG") else (BLUE if tier.startswith("LEAN") else "#8A96B0")
+    injury_badge = (f'<span class="badge" style="margin-left:.4rem;background:{AMBER}26;'
+                    f'color:{AMBER};">Injury-adjusted</span>'
+                    if r.kind == "player" and getattr(r, "injury_adjusted", False) else "")
     st.markdown(
         f'<div class="panel">'
         f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:.8rem;flex-wrap:wrap;">'
         f'<div><div class="panel-title">{label} {escape(str(r.Player))}'
         f'<span class="badge" style="margin-left:.5rem;background:{tier_color}26;color:{tier_color};">{escape(tier)}</span>'
-        f'<span class="badge {CONF_CLASS[r.confidence]}" style="margin-left:.4rem;">{r.confidence} confidence</span></div>'
+        f'<span class="badge {CONF_CLASS[r.confidence]}" style="margin-left:.4rem;">{r.confidence} confidence</span>'
+        f'{injury_badge}</div>'
         f'<div class="hint" style="margin:0;">{escape(r.Game)} &middot; {escape(r.Stat)} '
         f'{escape(str(r.side))}{line_txt}</div></div>'
         f'<div style="text-align:right;">'
@@ -2420,6 +2438,13 @@ def log_predictions(savable):
                 "confidence": r.confidence, "market_p": round(r.market_p, 2),
                 "raw_model_p": round(r.model_p, 2), "passed_backtest": bool(r.passed_backtest),
                 "conviction_threshold": CONVICTION_THRESHOLD, "kind": r.kind,
+                # r.kind == "player" guard first: game-kind rows never got an
+                # injury_adjusted column of their own (only compute_picks' player
+                # props do), so after concat with game_picks the column is NaN there
+                # - and bool(float('nan')) is True in Python, which would have
+                # mislabeled every logged game pick as injury-adjusted.
+                "injury_adjusted": bool(getattr(r, "injury_adjusted", False))
+                                   if r.kind == "player" else False,
                 # Recommended side, explicit - for game-kind rows this duplicates
                 # `player` (team abbr, or Over/Under for totals), but for player-prop
                 # rows it's the ONLY place Over/Under is recorded at all. A handful of
@@ -3421,9 +3446,10 @@ def page_players():
                      "doesn't hold up on a scattered subset of games across a season or two "
                      "(confirmed on real data before shipping this: for one real case, the model's "
                      "own 'last 10' window landed on old games and gave a number pointing the "
-                     "wrong direction from the real average). Not yet factored into the model "
-                     "probabilities or picks shown above - a separate, real comparison to weigh "
-                     "yourself.")
+                     "wrong direction from the real average). This exact with/without ratio is "
+                     "what Tonight's props above already apply to the projection and picks - "
+                     "shown here as the real numbers behind that adjustment, not a separate, "
+                     "unused comparison.")
     st.divider()
 
     c3, c4 = st.columns([1.6, 3.6])
@@ -3748,6 +3774,95 @@ def team_split_with_without(tg_all, team, team_player_box, missing_ids):
 
     return {col: summarize(with_g, col) + summarize(without_g, col)
             for col in ("points", "opp_points", "pace")}
+
+
+def apply_injury_adjustment(proj, roster, box, injuries):
+    """Nudges tonight's projected mean/variance for every rostered player whose team
+    has a real, currently confirmed-Out teammate - this is what actually feeds that
+    into the live picks, instead of leaving it as the informational "if X stays out"
+    panel the Players/Game Lines pages already show (same confirmed_out_teammates/
+    real_split_with_without helpers those panels use - see their own docstrings for
+    why this is a direct average of real games, not run back through the rolling
+    walk-forward model).
+
+    Deliberately a CLAMP toward the real without-teammate average, not a ratio
+    multiplied onto mean_hat - an earlier version of this function did multiply by
+    (without_mean / with_mean) and badly double-counted on real data: Khaman
+    Maluach's walk-forward mean_hat already sat at 14.7 pts+reb (above his own real
+    9.5 without-Mark-Williams average, since the model's own recency windows had
+    already started picking up his bigger post-injury role) - multiplying that by
+    the 9.5/3.5 ratio anyway pushed the projection to 40.1, a number no real game of
+    his supports. The clamp below only moves mean_hat as far as the real without-
+    average and never past it, and leaves it alone if the walk-forward model has
+    already caught up to (or overshot) that reality on its own - so it can only ever
+    raise/lower a projection into the range real games have actually shown, never
+    beyond it.
+
+    For each stat: if without_mean > with_mean (this player gains from the
+    absence), mean_hat is raised to without_mean only if it's currently below that;
+    if without_mean < with_mean (he's hurt by it), mean_hat is lowered to
+    without_mean only if it's currently above that. var_hat is rescaled by the same
+    ratio the mean actually moved by (adjusted_mean / mean_hat) - never a separate,
+    unrelated ratio. Only applied where both sides of real_split_with_without clear
+    model.MIN_HISTORY - thin samples are left as the plain walk-forward projection,
+    not adjusted at all.
+
+    Deliberately only touches project_tonight's live output, never model.py's
+    backtest: the backtest grades the walk-forward model against real history, where
+    every game already reflects whoever actually played - this adjustment exists
+    because the walk-forward model has no way to see tonight's injury news on its
+    own.
+
+    Adds an `injury_adjusted` column (True/False) so callers/UI can honestly say
+    whether a given player's projection actually changed because of a missing
+    teammate, instead of guessing from whether anyone on his team is reported out -
+    a player whose projection already matched real games needs no change and isn't
+    marked adjusted.
+
+    The flag is per-stat (`{stat}_injury_adjusted`), not per-player: Maluach's own
+    real split only actually moved his blocks projection (steals/points/rebounds/etc
+    all already matched or exceeded the real without-average on their own) - a
+    single per-player flag would have mislabeled his unrelated points and rebounds
+    picks as injury-adjusted too, which real testing caught before this shipped.
+    Mutates and returns `proj`."""
+    if proj.empty:
+        return proj
+    proj = proj.copy()
+    for stat in model.STATS:
+        proj[f"{stat}_injury_adjusted"] = False
+    if injuries.empty:
+        return proj
+    box = box.assign(season=box["game_date"].map(season_of))
+    proj = proj.set_index("player_id")
+    for team in roster["team"].dropna().unique():
+        team_box = box[box["team"] == team]
+        team_missing = confirmed_out_teammates(injuries, box, team, None)
+        if not team_missing:
+            continue
+        for pid in roster.loc[roster["team"] == team, "player_id"]:
+            missing_ids = [m for m in team_missing if m != pid]
+            if not missing_ids or pid not in proj.index:
+                continue
+            games_all = team_box[team_box["player_id"] == pid]
+            for stat in model.STATS:
+                with_mean, with_n, without_mean, without_n = real_split_with_without(
+                    games_all, team_box, missing_ids, stat)
+                if with_mean is None or without_mean is None or with_mean == without_mean:
+                    continue
+                mean_col, var_col, flag_col = (f"{stat}_mean_hat", f"{stat}_var_hat",
+                                               f"{stat}_injury_adjusted")
+                mean_hat = proj.loc[pid, mean_col]
+                if pd.isna(mean_hat):
+                    continue
+                adjusted_mean = (max(mean_hat, without_mean) if without_mean > with_mean
+                                 else min(mean_hat, without_mean))
+                if adjusted_mean == mean_hat:
+                    continue  # the walk-forward model already reflects this (or more) on its own
+                if mean_hat > 0:
+                    proj.loc[pid, var_col] *= (adjusted_mean / mean_hat) ** 2
+                proj.loc[pid, mean_col] = adjusted_mean
+                proj.loc[pid, flag_col] = True
+    return proj.reset_index()
 
 
 def player_leg_options(odds, key, stat_label):

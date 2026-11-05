@@ -152,6 +152,7 @@ def player_projection(player_name, stat="points"):
                 "conviction_points": r["conviction"], "confidence": r["confidence"],
                 "best_price": r["price"], "book": r["book"],
                 "games_of_history": int(r["games_before"]),
+                "injury_adjusted": bool(r.get("injury_adjusted", False)),
             })
 
     # No active line, or the line didn't survive the merge - still give the raw
@@ -284,7 +285,8 @@ def top_picks(market=None):
     caution = qualified[qualified["kind"] == "game"]
     qualifying = qualified[qualified["kind"] == "player"]
     qualifying = qualifying.reindex(qualifying["ev"].sort_values(ascending=False).index).head(app.TOP_PICKS_MAX)
-    cols = ["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "conviction", "ev", "confidence"]
+    cols = ["Player", "Game", "Stat", "side", "Line", "model_p", "market_p", "conviction", "ev",
+            "confidence", "injury_adjusted"]
     return {
         "qualifying_picks": _jsonable(qualifying[cols].to_dict("records")),
         "check_before_trusting": _jsonable(caution[cols].to_dict("records")),
