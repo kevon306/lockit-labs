@@ -913,6 +913,30 @@ def page_tonight():
         hint("Real market data only, no model comparison - see Game Lines for the team "
              "model's own projection next to each side, and how it was backtested.")
 
+    news_df = load("role_news")
+    tonight_teams = set(slate["home"]) | set(slate["away"]) if not slate.empty else set()
+    latest_news = pd.DataFrame()
+    if not news_df.empty:
+        latest_pull = news_df["pulled_at"].max()
+        latest_news = news_df[(news_df["pulled_at"] == latest_pull)
+                              & (news_df["team"].isin(tonight_teams))]
+    if not latest_news.empty:
+        section("Role-change watch")
+        for r in latest_news.itertuples():
+            source = f'<a href="{escape(r.source_url or "")}" target="_blank" ' \
+                     f'style="color:{BLUE};">{escape(r.source_name or "source")}</a>' \
+                     if r.source_url else escape(r.source_name or "")
+            st.markdown(
+                f'<div class="panel" style="padding:.8rem 1rem;margin-bottom:.5rem;">'
+                f'<div style="font-weight:600;">{escape(r.team)}: {escape(r.headline)}</div>'
+                f'<div class="hint" style="margin:.2rem 0 0 0;">{escape(r.summary)}</div>'
+                f'<div class="hint" style="margin:.2rem 0 0 0;">{source}</div></div>',
+                unsafe_allow_html=True)
+        hint(f"AI-summarized from a web search ({ago(latest_news['pulled_at'].iloc[0])}), "
+             "not a verified fact like the injury report above - a lead to check against "
+             "its source, not something this app confirmed itself. Not factored into the "
+             "model or any pick.")
+
     section("Top picks")
     if box.empty:
         hint("Need box scores saved before the model can project anything.")

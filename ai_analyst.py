@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 
 import ai_tools
 import db
+import news
 
 load_dotenv(override=True)  # .env always wins - see the comment on pull_props.get_api_key()
 
@@ -98,6 +99,15 @@ probability, and you must characterize it that way every time you use it.
 - No individual-defender assignments, defensive coverage schemes (drop coverage, switching, \
 traps), or coaching-adjustment claims - this app has no data source for any of that. If asked, \
 say plainly it isn't available rather than reasoning your way to a plausible-sounding guess.
+- role_news and web_search are different from every other tool here: they return an AI-written \
+summary of real, cited web search results, not a verified number from this app's own data. \
+Always attribute a claim from either one to its source by name, and never state it with the \
+same confidence as a tool-verified stat or this app's own model projection. role_news is this \
+app's own daily search, already run and saved - check it first, it's free. Reach for web_search \
+only when role_news has nothing, is stale for what's being asked (it only updates once a day), \
+or the user is asking about something that may have happened today. Both are for role changes \
+(trades, new starters, coaching moves, suspensions) - for basic health/availability, always use \
+injury_status instead, never web_search.
 
 Response style:
 - For a detailed question about a specific pick, or any parlay review, use this structure: \
@@ -185,6 +195,17 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"player_name": {"type": "string"}},
                       "required": ["player_name"]}},
+    {"name": "role_news",
+     "description": "Role-change news (trades, new starters, coaching changes, "
+                    "suspensions) this app's own daily job already found via a web "
+                    "search - optionally filtered to one team. Only updates once a "
+                    "day, so for anything that might have happened today, use "
+                    "web_search instead. An AI-written summary of real, cited "
+                    "sources, not a verified fact - always attribute it.",
+     "input_schema": {"type": "object",
+                      "properties": {"team_query": {"type": "string",
+                                     "description": "Optional team name to filter to"}},
+                      "required": []}},
     {"name": "prediction_track_record",
      "description": "This app's real, locked prediction ledger and its actual graded "
                     "hit rate so far.",
@@ -195,6 +216,16 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}, "required": []}},
 ]
 
+# web_search is Anthropic's own hosted tool, not one of ai_tools.py's - the API
+# performs the search server-side and hands back cited results inside the same
+# response, so it needs no entry in TOOL_FUNCS below (there's nothing for this
+# process to execute). max_uses caps total searches across a whole reply, not per
+# call, so one message can't run away with cost; allowed_domains reuses news.py's
+# own list so there's one definition of "known sports-news source", not two that
+# could drift apart.
+WEB_SEARCH_TOOL = {"type": "web_search_20260318", "name": "web_search", "max_uses": 5,
+                   "allowed_domains": news.ALLOWED_DOMAINS}
+
 # Prompt caching: the system prompt and tool definitions above are large, static, and
 # sent on every single API call (every tool-loop round, every turn of every
 # conversation). Marking the end of each with cache_control lets Anthropic cache that
@@ -203,7 +234,7 @@ TOOLS = [
 # this fixed prefix, not the actual conversation. See _estimate_cost() for the real
 # cost math, including the one-time write cost (1.25x) the first call pays.
 SYSTEM_BLOCKS = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
-CACHED_TOOLS = [dict(t) for t in TOOLS]
+CACHED_TOOLS = [dict(t) for t in TOOLS] + [dict(WEB_SEARCH_TOOL)]
 CACHED_TOOLS[-1] = {**CACHED_TOOLS[-1], "cache_control": {"type": "ephemeral"}}
 
 TOOL_FUNCS = {
@@ -218,6 +249,7 @@ TOOL_FUNCS = {
         kw["player_a"], kw["stat_a"], kw["player_b"], kw["stat_b"]),
     "analyze_parlay": lambda **kw: ai_tools.analyze_parlay(kw["legs"]),
     "injury_status": lambda **kw: ai_tools.injury_status(kw["player_name"]),
+    "role_news": lambda **kw: ai_tools.role_news(kw.get("team_query")),
     "prediction_track_record": lambda **kw: ai_tools.prediction_track_record(),
     "saved_picks": lambda **kw: ai_tools.saved_picks(),
 }
@@ -226,7 +258,11 @@ TOOL_FUNCS = {
 def _estimate_cost(tokens_in, tokens_out, cache_write=0, cache_read=0):
     """Real blended cost, accounting for prompt caching: a cache write costs 1.25x
     normal input price (paid once, the first call), a cache read costs 0.1x (paid on
-    every call after that within the ~5 min cache window)."""
+    every call after that within the ~5 min cache window). Does NOT include
+    web_search's own small per-search server-tool fee (billed separately by
+    Anthropic, outside token pricing) - capped low by WEB_SEARCH_TOOL's max_uses, but
+    the number shown in the UI is still a token-only estimate on a reply that used it,
+    not the true total."""
     rates = PRICING_PER_MTOK.get(MODEL)
     if not rates:
         return None

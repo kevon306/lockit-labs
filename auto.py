@@ -17,6 +17,15 @@ worth revisiting with real evidence, the same way the odds schedule evolved this
 season - not something to guess at upfront. A failed injury pull never takes down the
 rest of the morning job (box scores, grading still run).
 
+Role-change news (news.py) runs right after injuries - a web search (via Claude,
+restricted to known sports-news domains) for trades, new starting lineups, coaching
+changes, and suspensions for tonight's teams, the kind of thing the ESPN injury feed
+doesn't carry. Needs ANTHROPIC_API_KEY (the same one the AI Analyst uses) - skipped,
+not faked, if that isn't set. Unlike every other job here this is an LLM-written
+summary of real, cited search results, not a number from a structured feed - shown
+that way everywhere it's surfaced. A failed or skipped search never takes down the
+rest of the morning job either.
+
 Snapshot timing (change in your .env file if you want):
   MORNING_SNAPSHOT=on     once/day, ~8-10 AM ET, every game that day   (6 credits/game)
   AFTERNOON_SNAPSHOT=on   once/day, ~1-3 PM ET, every game that day    (6 credits/game)
@@ -62,6 +71,7 @@ from dotenv import load_dotenv
 import box_scores
 import db
 import injuries
+import news
 import performance
 import pull_props as pp
 
@@ -101,6 +111,10 @@ def morning():
         injuries.cmd_pull()
     except Exception as e:  # unofficial endpoint, no SLA - never take the morning job down
         log(f"Injury pull failed (non-fatal): {e}")
+    try:
+        news.cmd_pull()
+    except Exception as e:  # a web-search call over the network - never take the morning job down
+        log(f"Role-news search failed (non-fatal): {e}")
     try:
         summary = performance.grade_predictions()
         log(f"Graded predictions: {summary}")

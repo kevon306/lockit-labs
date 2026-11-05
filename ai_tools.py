@@ -393,6 +393,37 @@ def injury_status(player_name):
                    "app - treat 'Day-To-Day' as uncertain, not as a confirmed timeline."}
 
 
+def role_news(team_query=None):
+    """Role-change news (trades, new starters, coaching changes, suspensions) this
+    app's own morning job already found via a web search (news.py) - optionally
+    filtered to one team. This is an LLM-written SUMMARY of real, cited search
+    results, not a verified number from a structured feed - always present it as a
+    lead to mention and point to its source, never with the same confidence as
+    injury_status or a model projection. Prefer a live web_search call instead when
+    the user asks about something that might have happened today, since this table
+    only updates once a day in the morning."""
+    news = _load("role_news")
+    if news.empty:
+        return {"found": False,
+               "note": "No role-change news has been searched for yet - the daily "
+                       "search (news.py) may not have run, or ANTHROPIC_API_KEY may "
+                       "not be configured for it."}
+    latest_pull = news["pulled_at"].max()
+    latest = news[news["pulled_at"] == latest_pull]
+    if team_query:
+        latest = latest[latest["team"].str.contains(team_query, case=False, na=False)]
+    if latest.empty:
+        return {"found": False, "last_checked": latest_pull,
+               "note": f"No role-change news found for '{team_query}' as of the last "
+                       f"search ({latest_pull}). This means nothing turned up, not "
+                       "that nothing has changed."}
+    items = latest[["team", "headline", "summary", "source_name", "source_url"]].to_dict("records")
+    return {"found": True, "last_checked": latest_pull, "items": _jsonable(items),
+           "note": "Each item is an AI-written summary of a real, cited news search, "
+                   "not a verified fact - mention the source and let the user judge "
+                   "it, don't state it as settled."}
+
+
 # ---------- parlay analysis ----------
 
 def analyze_parlay(legs):

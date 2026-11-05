@@ -237,6 +237,23 @@ CREATE TABLE IF NOT EXISTS injury_reports (
     UNIQUE (pulled_at, espn_injury_id)
 );
 
+-- AI-researched role-change news (trades, new starters, coaching changes,
+-- suspensions) for teams playing that day, via Claude's web_search tool - see
+-- news.py. Unlike every other table here, this is an LLM-written SUMMARY of real,
+-- cited search results, not a number pulled from a structured feed - every place
+-- this is shown labels it that way, never presented with the same confidence as
+-- injury_reports or box_scores.
+CREATE TABLE IF NOT EXISTS role_news (
+    id               INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    pulled_at        TEXT NOT NULL,
+    team             TEXT NOT NULL,   -- full team name, as matched against tonight's slate
+    headline         TEXT NOT NULL,
+    summary          TEXT NOT NULL,
+    source_name      TEXT,
+    source_url       TEXT,
+    UNIQUE (pulled_at, team, headline)
+);
+
 -- One row per saved parlay analysis. Never updated - re-analyzing the same legs
 -- later (odds moved, model recalibrated) always inserts a new row, same philosophy
 -- as predictions below, just without the hard DB triggers since this is a user's own
@@ -434,6 +451,7 @@ GAME_ODDS_COLUMNS = ["snapshot_time", "source", "event_id", "commence_time", "ho
                      "price_american", "book_last_update"]
 INJURY_COLUMNS = ["pulled_at", "team", "player_name", "status", "status_code", "comment",
                   "injury_type", "report_date", "return_date", "espn_injury_id"]
+ROLE_NEWS_COLUMNS = ["pulled_at", "team", "headline", "summary", "source_name", "source_url"]
 
 
 def now_utc():
@@ -694,6 +712,21 @@ def save_injury_reports(rows):
     values = [tuple(r.get(c) for c in INJURY_COLUMNS) for r in rows]
     sql = (f"INSERT INTO injury_reports ({', '.join(INJURY_COLUMNS)}) VALUES %s "
           "ON CONFLICT (pulled_at, espn_injury_id) DO NOTHING RETURNING 1")
+    with connect() as conn:
+        cur = conn._conn.cursor()
+        result = execute_values(cur, sql, values, fetch=True)
+        conn.commit()
+        return len(result)
+
+
+def save_role_news(rows):
+    """Insert role-news rows. Same pattern as save_injury_reports - exact duplicates
+    (same pull, same team+headline) are skipped, returns how many were new."""
+    if not rows:
+        return 0
+    values = [tuple(r.get(c) for c in ROLE_NEWS_COLUMNS) for r in rows]
+    sql = (f"INSERT INTO role_news ({', '.join(ROLE_NEWS_COLUMNS)}) VALUES %s "
+          "ON CONFLICT (pulled_at, team, headline) DO NOTHING RETURNING 1")
     with connect() as conn:
         cur = conn._conn.cursor()
         result = execute_values(cur, sql, values, fetch=True)
