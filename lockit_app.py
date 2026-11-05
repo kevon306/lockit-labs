@@ -1499,7 +1499,6 @@ def compute_player_backtest(box, odds):
     return model.closing_line_log_loss(box, resolve_player_odds(odds, box), tail_cal=tail_cal)
 
 
-@st.cache_data(ttl=60)
 def cached_player_backtest(box, odds):
     """Wrapper around compute_player_backtest() - a full walk-forward recompute over
     every saved box score, needed on both the Top Picks and Players pages.
@@ -1510,8 +1509,15 @@ def cached_player_backtest(box, odds):
     game's closing-line record actually changes). Only falls back to computing it
     live here, in the request path, if that hasn't happened yet (e.g. before the
     morning job's first run on a brand new setup) - the original slow path, kept as
-    a safety net, not removed. This wrapper's own ttl=60 just controls how often it
-    re-reads that row, not how often the expensive model itself re-runs."""
+    a safety net, not removed.
+
+    Deliberately NOT @st.cache_data: confirmed live (2026-11-05) that hashing `box`
+    (82k+ rows) as part of Streamlit's own cache key costs real seconds on Streamlit
+    Cloud's weaker/shared CPU - paid on every call whether it's a hit or a miss,
+    since the hash has to be computed before Streamlit can even check for one. The
+    db.load_model_cache() read right below is already the real, fast cache (shared
+    across every user and session, unlike Streamlit's own per-process one); adding
+    Streamlit's cache on top of it was pure overhead with no benefit."""
     _, cached = db.load_model_cache("player_backtest")
     if cached is not None:
         return cached
@@ -1524,10 +1530,9 @@ def compute_game_backtest(box, game_odds):
     return team_model.closing_line_log_loss(box, resolve_game_odds_teams(game_odds))
 
 
-@st.cache_data(ttl=60)
 def cached_game_backtest(box, game_odds):
     """Same precompute-first pattern as cached_player_backtest above - see its
-    docstring for why."""
+    docstring for why this isn't @st.cache_data either."""
     _, cached = db.load_model_cache("game_backtest")
     if cached is not None:
         return cached
@@ -1568,7 +1573,6 @@ def compute_tail_calibration(box, players):
     return model.fit_tail_calibration(box, players=players)
 
 
-@st.cache_data(ttl=21600)
 def cached_tail_calibration(box, players):
     """Wrapper around compute_tail_calibration() - re-runs the full walk-forward
     backtest across every saved box score (20s+) to get enough synthetic quantile
@@ -1578,10 +1582,9 @@ def cached_tail_calibration(box, players):
     tail-overconfidence gap).
 
     Reads auto.py's morning job's precomputed result from model_cache first (see
-    db.py and cached_player_backtest's own docstring for why), falling back to
-    computing it live only if that hasn't happened yet. The 6h ttl here is just a
-    safety net in case model_cache is ever stale for an unusually long time - in the
-    normal case this is refreshed daily by the morning job, well under 6h old."""
+    db.py and cached_player_backtest's own docstring for why, including why this
+    isn't @st.cache_data), falling back to computing it live only if that hasn't
+    happened yet."""
     _, cached = db.load_model_cache("tail_calibration")
     if cached is not None:
         return cached
@@ -1598,7 +1601,6 @@ def compute_player_projections(box, roster, players):
                                  players=players)
 
 
-@st.cache_data(ttl=60)
 def cached_player_projections(box, roster, players):
     """Wrapper around compute_player_projections() - a full walk-forward recompute
     over every saved box score for every player on tonight's roster, the single
@@ -1613,30 +1615,23 @@ def cached_player_projections(box, roster, players):
     recompute. If even one requested player_id is missing from it (a prop posted for
     someone after the morning job ran, or the job hasn't run yet today), this falls
     back to computing the full requested roster live - the original behavior, kept as
-    a safety net so a late-posted prop is never silently missing or stale."""
-    import time as _time
-    _t0 = _time.time()
-    debug = {"started_at": db.now_utc()}
+    a safety net so a late-posted prop is never silently missing or stale.
+
+    Deliberately NOT @st.cache_data - see cached_player_backtest's docstring.
+    Confirmed live on Streamlit Cloud (2026-11-05) via a temporary debug probe: this
+    function's own body was already finishing in well under a second on a cache hit
+    (the db.load_model_cache() read + pandas filter below really is cheap), yet the
+    page was still visibly stuck on "Running compute_picks(...)" for 40-60s - proving
+    the cost was Streamlit's OWN pre-call hashing of the `box` argument (82k+ rows),
+    paid before this function's body even starts, not anything happening inside it."""
     _, cached = db.load_model_cache("player_projections")
     if cached:
         cached_df = pd.DataFrame(cached)
         need = set(roster["player_id"])
         have = set(cached_df["player_id"])
-        debug.update(outcome="hit" if need.issubset(have) else "miss_coverage",
-                     need=len(need), have=len(have),
-                     need_dtype=str(roster["player_id"].dtype),
-                     have_dtype=str(cached_df["player_id"].dtype),
-                     missing=sorted(str(x) for x in (need - have))[:10])
         if need.issubset(have):
-            debug["elapsed_s"] = round(_time.time() - _t0, 2)
-            db.save_model_cache("projections_debug", debug)
             return cached_df[cached_df["player_id"].isin(need)].reset_index(drop=True)
-    else:
-        debug.update(outcome="miss_no_row")
-    result = compute_player_projections(box, roster, players)
-    debug["elapsed_s"] = round(_time.time() - _t0, 2)
-    db.save_model_cache("projections_debug", debug)
-    return result
+    return compute_player_projections(box, roster, players)
 
 
 @st.cache_data(ttl=60)
