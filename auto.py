@@ -107,6 +107,10 @@ def morning():
         box_scores.cmd_grade()
     except SystemExit as e:  # the scripts exit with a message on errors
         log(f"Stopped: {e}")
+    except Exception as e:  # e.g. a bad fallback-source row poisoning the DB
+                            # connection - never take the rest of the morning job
+                            # (grading, model_cache precompute) down over this
+        log(f"Box score pull/grade failed (non-fatal): {e}")
     try:
         injuries.cmd_pull()
     except Exception as e:  # unofficial endpoint, no SLA - never take the morning job down
