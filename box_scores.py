@@ -269,6 +269,12 @@ def _highlightly_matches_for_et_date(date_str, key):
         matches.extend(r.json().get("data", []))
     out = []
     for m in matches:
+        if m.get("league") != "NBA":
+            continue  # this endpoint mixes in NCAA games with no league param to
+                      # exclude them - confirmed live (e.g. 2026-11-07: 92 NCAA
+                      # matches to 8 real NBA ones) - without this, college players
+                      # under random college abbreviations got saved straight into
+                      # box_scores as if they were NBA games
         if m.get("state", {}).get("description") != "Finished":
             continue
         et_date = pd.to_datetime(m["date"], utc=True).tz_convert(ET).strftime("%Y-%m-%d")
