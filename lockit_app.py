@@ -3578,7 +3578,16 @@ def page_players():
                                                                   # every game the missing
                                                                   # player(s) actually played
                 team_roster = team_games_box.drop_duplicates("player_id")
-                missing_names = team_roster[team_roster["player_id"].isin(missing_ids)]["player_name"].tolist()
+                # Game-set selection doesn't depend on which stat is asked for (just which
+                # games qualify), so probe once with any always-present column ("minutes")
+                # to find which subset of missing_ids the real data can actually support -
+                # the "who" text below must describe that subset, not the full list, or it
+                # would claim a comparison based on teammates the numbers don't reflect.
+                _, _, _, _, used_ids = real_split_with_without(
+                    games_all, team_games_box, missing_ids, "minutes")
+                missing_names = team_roster[team_roster["player_id"].isin(used_ids)]["player_name"].tolist()
+                if not missing_names:
+                    missing_names = team_roster[team_roster["player_id"].isin(missing_ids)]["player_name"].tolist()
                 if len(missing_names) == 1:
                     who, verb, pronoun = missing_names[0], "stays", "his"
                 elif len(missing_names) == 2:
@@ -3599,7 +3608,7 @@ def page_players():
                 for stat_lbl2, mstat2 in MODEL_STAT_FOR_LABEL.items():
                     if mstat2 not in set(his_picks["stat"]):
                         continue
-                    with_mean, with_n, without_mean, without_n = real_split_with_without(
+                    with_mean, with_n, without_mean, without_n, _ = real_split_with_without(
                         games_all, team_games_box, missing_ids, mstat2)
                     if with_mean is None and without_mean is None:
                         continue
@@ -3944,24 +3953,64 @@ def real_split_with_without(games_all, team_games_box, missing_ids, stat_col):
     same games, which was clearly higher. A plain average doesn't have that failure
     mode and is honest about being exactly what it is.
 
-    Returns (with_mean, with_n, without_mean, without_n). A side's mean is None if it
-    has fewer than model.MIN_HISTORY qualifying games - same sample-size bar used
-    everywhere else, not a guess from a handful of games."""
+    missing_ids doesn't need to have all been out together in the same historical
+    game for this to find a comparison. Requiring the exact full combination to
+    recur would almost never have enough history once several teammates are out at
+    once - confirmed on real data (Cleveland, 2026-11-14: 7 teammates confirmed out
+    at once, a combination with essentially zero precedent in these two seasons'
+    worth of games, even though most of those 7 have each been out plenty of times
+    individually). So this ranks missing_ids by each one's OWN individually-measured
+    effect on THIS player's real minutes (not by the missing teammate's own minutes
+    - confirmed on real data that the obvious-looking proxy is actively misleading:
+    for Cleveland/Thomas Bryant, James Harden has the biggest minutes of anyone
+    confirmed out, but games Harden misses alone actually average 3.8 FEWER minutes
+    for Bryant, not more - a confound, not a real effect - while Evan Mobley, a
+    center Bryant actually backs up, is worth +7.2 minutes alone despite logging
+    fewer career minutes than Harden). Tries the full group ranked by that measured
+    effect, then progressively drops whichever remaining teammate's own effect is
+    smallest, keeping the largest prefix whose "all of them missing" bucket still
+    clears MIN_HISTORY on both sides - the real comparison the data can actually
+    support, never silently nothing just because the exact full combination has no
+    precedent, and never led by a teammate whose own absence doesn't actually move
+    this particular player.
+
+    Returns (with_mean, with_n, without_mean, without_n, used_ids). A side's mean is
+    None if even the single most-important teammate's split doesn't clear
+    model.MIN_HISTORY on both sides - same sample-size bar used everywhere else, not
+    a guess from a handful of games. used_ids is the actual (possibly narrowed)
+    subset the returned numbers are based on, in impact order - callers that show
+    missing players' names to the user must build that text from used_ids, not the
+    original missing_ids, so the label always matches what the numbers represent."""
     this_season = season_of(datetime.now(ET))
     last_start = int(this_season.split("-")[0]) - 1
     last_season = f"{last_start}-{str(last_start + 1)[2:]}"
     recent = games_all[games_all["season"].isin([this_season, last_season])]
 
-    games_missing_played = set(team_games_box[team_games_box["player_id"].isin(missing_ids)]["game_id"])
-    with_g = recent[recent["game_id"].isin(games_missing_played)]
-    without_g = recent[~recent["game_id"].isin(games_missing_played)]
+    def own_effect(pid):
+        # This one candidate's own measured effect on the TARGET player's minutes -
+        # not the candidate's own playing time, which is a confound (see docstring).
+        played = set(team_games_box[team_games_box["player_id"] == pid]["game_id"])
+        with_g = recent[recent["game_id"].isin(played)]
+        without_g = recent[~recent["game_id"].isin(played)]
+        if len(with_g) < model.MIN_HISTORY or len(without_g) < model.MIN_HISTORY:
+            return 0.0  # not enough solo history to judge - treat as neutral, drop first
+        return float(without_g["minutes"].mean()) - float(with_g["minutes"].mean())
+
+    ranked = sorted(missing_ids, key=own_effect, reverse=True)
 
     def summarize(g):
         return (float(g[stat_col].mean()) if len(g) >= model.MIN_HISTORY else None), len(g)
 
-    with_mean, with_n = summarize(with_g)
-    without_mean, without_n = summarize(without_g)
-    return with_mean, with_n, without_mean, without_n
+    for n in range(len(ranked), 0, -1):
+        subset = ranked[:n]
+        games_missing_played = set(team_games_box[team_games_box["player_id"].isin(subset)]["game_id"])
+        with_g = recent[recent["game_id"].isin(games_missing_played)]
+        without_g = recent[~recent["game_id"].isin(games_missing_played)]
+        with_mean, with_n = summarize(with_g)
+        without_mean, without_n = summarize(without_g)
+        if with_mean is not None and without_mean is not None:
+            return with_mean, with_n, without_mean, without_n, subset
+    return None, 0, None, 0, []
 
 
 def team_split_with_without(tg_all, team, team_player_box, missing_ids):
@@ -4069,7 +4118,7 @@ def apply_injury_adjustment(proj, roster, box, injuries):
                 continue
             games_all = team_box[team_box["player_id"] == pid]
             for stat in model.STATS:
-                with_mean, with_n, without_mean, without_n = real_split_with_without(
+                with_mean, with_n, without_mean, without_n, _ = real_split_with_without(
                     games_all, team_box, missing_ids, stat)
                 if with_mean is None or without_mean is None or with_mean == without_mean:
                     continue
