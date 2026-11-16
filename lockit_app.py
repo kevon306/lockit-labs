@@ -6,6 +6,7 @@ Press Control+C in the terminal to stop it.
 """
 
 import inspect
+import itertools
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -3959,56 +3960,71 @@ def real_split_with_without(games_all, team_games_box, missing_ids, stat_col):
     once - confirmed on real data (Cleveland, 2026-11-14: 7 teammates confirmed out
     at once, a combination with essentially zero precedent in these two seasons'
     worth of games, even though most of those 7 have each been out plenty of times
-    individually). So this ranks missing_ids by each one's OWN individually-measured
-    effect on THIS player's real minutes (not by the missing teammate's own minutes
-    - confirmed on real data that the obvious-looking proxy is actively misleading:
-    for Cleveland/Thomas Bryant, James Harden has the biggest minutes of anyone
-    confirmed out, but games Harden misses alone actually average 3.8 FEWER minutes
-    for Bryant, not more - a confound, not a real effect - while Evan Mobley, a
-    center Bryant actually backs up, is worth +7.2 minutes alone despite logging
-    fewer career minutes than Harden). Tries the full group ranked by that measured
-    effect, then progressively drops whichever remaining teammate's own effect is
-    smallest, keeping the largest prefix whose "all of them missing" bucket still
-    clears MIN_HISTORY on both sides - the real comparison the data can actually
-    support, never silently nothing just because the exact full combination has no
-    precedent, and never led by a teammate whose own absence doesn't actually move
-    this particular player.
+    individually). So this doesn't require the exact full combination - it searches
+    every subset of missing_ids, largest first, and uses whichever subset of the
+    largest size that actually has a real, usable comparison.
+
+    "Usable" means both MIN_HISTORY (enough real games on both sides) AND
+    MIN_CURRENT_SEASON_GAMES real games in the "without" bucket from THIS season
+    specifically, not just a blended this+last-season total - clearing MIN_HISTORY
+    alone isn't enough, confirmed on real data (Memphis, 2026-11-16): Cam Spencer's
+    real "without GG Jackson, Scotty Pippen Jr., Ty Jerome, and Quinten Post" bucket
+    had 20 real games, comfortably clearing MIN_HISTORY, but EVERY one of them was
+    from last season, before his role this season existed - the gap it found was
+    "rookie-year Cam Spencer vs. now", not a real effect of those four teammates.
+
+    An earlier version of this ranked missing_ids by each candidate's own measured
+    effect and only ever dropped from the bottom of that ranking - which gets stuck
+    when the TOP-ranked candidate specifically fails the this-season check, since it
+    never backs off to try a different single candidate instead (confirmed on real
+    data: Cleveland/Thomas Bryant - Evan Mobley ranks highest by raw effect on
+    Bryant's minutes, but his own "without" bucket only has 2 real games from this
+    season, just under the bar, and the old code never tried Sam Merrill or
+    Nae'Qwan Tomlin alone instead, even though each of those clears every bar on
+    their own). Searching every subset at each size, rather than only the top-
+    ranked prefix, finds that fallback. Among subsets that are usable at the
+    largest size any of them clears, the one with the most real "without" games
+    wins - simply more real data to stand on, not a different model.
 
     Returns (with_mean, with_n, without_mean, without_n, used_ids). A side's mean is
-    None if even the single most-important teammate's split doesn't clear
-    model.MIN_HISTORY on both sides - same sample-size bar used everywhere else, not
-    a guess from a handful of games. used_ids is the actual (possibly narrowed)
-    subset the returned numbers are based on, in impact order - callers that show
-    missing players' names to the user must build that text from used_ids, not the
-    original missing_ids, so the label always matches what the numbers represent."""
+    None if no non-empty subset of missing_ids - all the way down to each one alone
+    - has a usable comparison. used_ids is the actual (possibly narrowed) subset the
+    returned numbers are based on - callers that show missing players' names to the
+    user must build that text from used_ids, not the original missing_ids, so the
+    label always matches what the numbers represent."""
+    MIN_CURRENT_SEASON_GAMES = 3  # see docstring - without this, a "without" bucket
+                                  # that's just old games from before this player's
+                                  # current role existed can look like plenty of
+                                  # real history while actually being none
     this_season = season_of(datetime.now(ET))
     last_start = int(this_season.split("-")[0]) - 1
     last_season = f"{last_start}-{str(last_start + 1)[2:]}"
     recent = games_all[games_all["season"].isin([this_season, last_season])]
+    is_current = (recent["season"] == this_season).to_numpy()
 
-    def own_effect(pid):
-        # This one candidate's own measured effect on the TARGET player's minutes -
-        # not the candidate's own playing time, which is a confound (see docstring).
-        played = set(team_games_box[team_games_box["player_id"] == pid]["game_id"])
-        with_g = recent[recent["game_id"].isin(played)]
-        without_g = recent[~recent["game_id"].isin(played)]
-        if len(with_g) < model.MIN_HISTORY or len(without_g) < model.MIN_HISTORY:
-            return 0.0  # not enough solo history to judge - treat as neutral, drop first
-        return float(without_g["minutes"].mean()) - float(with_g["minutes"].mean())
+    played_by_id = {pid: set(team_games_box.loc[team_games_box["player_id"] == pid, "game_id"])
+                    for pid in missing_ids}
 
-    ranked = sorted(missing_ids, key=own_effect, reverse=True)
+    def summarize(mask):
+        n = int(mask.sum())
+        return (float(recent.loc[mask, stat_col].mean()) if n >= model.MIN_HISTORY else None), n
 
-    def summarize(g):
-        return (float(g[stat_col].mean()) if len(g) >= model.MIN_HISTORY else None), len(g)
-
-    for n in range(len(ranked), 0, -1):
-        subset = ranked[:n]
-        games_missing_played = set(team_games_box[team_games_box["player_id"].isin(subset)]["game_id"])
-        with_g = recent[recent["game_id"].isin(games_missing_played)]
-        without_g = recent[~recent["game_id"].isin(games_missing_played)]
-        with_mean, with_n = summarize(with_g)
-        without_mean, without_n = summarize(without_g)
-        if with_mean is not None and without_mean is not None:
+    for n in range(len(missing_ids), 0, -1):
+        best = None  # (without_n, with_mean, with_n, without_mean, without_n, subset)
+        for combo in itertools.combinations(missing_ids, n):
+            played = set().union(*(played_by_id[pid] for pid in combo))
+            without_mask = ~recent["game_id"].isin(played).to_numpy()
+            with_mask = ~without_mask
+            without_mean, without_n = summarize(without_mask)
+            with_mean, with_n = summarize(with_mask)
+            if with_mean is None or without_mean is None:
+                continue
+            if int((without_mask & is_current).sum()) < MIN_CURRENT_SEASON_GAMES:
+                continue
+            if best is None or without_n > best[0]:
+                best = (without_n, with_mean, with_n, without_mean, without_n, list(combo))
+        if best is not None:
+            _, with_mean, with_n, without_mean, without_n, subset = best
             return with_mean, with_n, without_mean, without_n, subset
     return None, 0, None, 0, []
 
